@@ -82,6 +82,15 @@ CREATE TABLE IF NOT EXISTS chat_cmds(
     count    INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cmds_uniq ON chat_cmds(chat_id, cmd);
+CREATE TABLE IF NOT EXISTS answers(
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner      TEXT NOT NULL,            -- 'trig' | 'cmd'
+    owner_id   INTEGER NOT NULL,
+    text       TEXT,                     -- текст ответа / подпись к медиа
+    file_path  TEXT,                     -- медиа-вариант: файл в config.TRIG_DIR
+    media_type TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_answers_owner ON answers(owner, owner_id);
 CREATE TABLE IF NOT EXISTS msg_stats(
     chat_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
@@ -310,6 +319,19 @@ async def _migrate() -> None:
                SELECT chat_id, sender_id, NULL, title, 'anon' FROM anon_wl"""
         )
         await _db.execute("INSERT INTO kv (k, v) VALUES ('mig_anon_to_wl', '1')")
+
+    # ответы триггеров и счётчиков переехали в answers: теперь их может быть несколько
+    cur = await _db.execute("SELECT v FROM kv WHERE k = 'mig_answers'")
+    if await cur.fetchone() is None:
+        await _db.execute(
+            """INSERT INTO answers (owner, owner_id, text, file_path, media_type)
+               SELECT 'trig', id, text, file_path, media_type FROM triggers"""
+        )
+        await _db.execute(
+            """INSERT INTO answers (owner, owner_id, text, file_path, media_type)
+               SELECT 'cmd', id, template, NULL, NULL FROM chat_cmds"""
+        )
+        await _db.execute("INSERT INTO kv (k, v) VALUES ('mig_answers', '1')")
 
     # внешние ссылки стали включёнными по умолчанию — доводим существующие чаты
     cur = await _db.execute("SELECT v FROM kv WHERE k = 'mig_extlinks_on'")
@@ -898,24 +920,90 @@ async def report_wl_allowed(chat_id: int, user_id: int, username: str | None) ->
 
 # ---------- триггеры ----------
 
-async def trig_add(chat_id: int, phrase: str, text: str | None,
-                   file_path: str | None = None, media_type: str | None = None) -> None:
-    await _db.execute(
-        "INSERT INTO triggers (chat_id, phrase, text, file_path, media_type) VALUES (?, ?, ?, ?, ?)",
-        (chat_id, phrase.lower(), text, file_path, media_type),
+# ---------- варианты ответов (общие для триггеров и счётчиков) ----------
+#
+# Ответов у одного объекта может быть несколько — бот берёт случайный. Колонки
+# text/file_path/media_type в triggers и template в chat_cmds остались от старой
+# схемы и больше не читаются: источник правды — answers.
+
+async def ans_add(owner: str, owner_id: int, text: str | None,
+                  file_path: str | None = None, media_type: str | None = None) -> int:
+    cur = await _db.execute(
+        "INSERT INTO answers (owner, owner_id, text, file_path, media_type) VALUES (?,?,?,?,?)",
+        (owner, owner_id, text, file_path, media_type),
     )
     await _db.commit()
+    return cur.lastrowid
 
 
-async def trig_remove(row_id: int) -> None:
-    """Удаляем запись вместе с файлом медиа, чтобы папка не копила мусор."""
-    cur = await _db.execute("SELECT file_path FROM triggers WHERE id = ?", (row_id,))
-    row = await cur.fetchone()
+async def ans_list(owner: str, owner_id: int) -> list[aiosqlite.Row]:
+    cur = await _db.execute(
+        "SELECT * FROM answers WHERE owner = ? AND owner_id = ? ORDER BY id", (owner, owner_id)
+    )
+    return await cur.fetchall()
+
+
+async def ans_pick(owner: str, owner_id: int) -> aiosqlite.Row | None:
+    """Случайный вариант ответа. Выбор делает SQLite — не тянем весь список."""
+    cur = await _db.execute(
+        "SELECT * FROM answers WHERE owner = ? AND owner_id = ? ORDER BY RANDOM() LIMIT 1",
+        (owner, owner_id),
+    )
+    return await cur.fetchone()
+
+
+async def ans_stats(owner: str, owner_ids: list[int]) -> dict[int, tuple[int, int]]:
+    """{owner_id: (сколько вариантов, из них с медиа)} — одним запросом на страницу."""
+    if not owner_ids:
+        return {}
+    marks = ",".join("?" * len(owner_ids))
+    cur = await _db.execute(
+        f"""SELECT owner_id, COUNT(*) AS n,
+                   SUM(CASE WHEN file_path IS NOT NULL THEN 1 ELSE 0 END) AS media
+            FROM answers WHERE owner = ? AND owner_id IN ({marks})
+            GROUP BY owner_id""",
+        (owner, *owner_ids),
+    )
+    return {r["owner_id"]: (r["n"], r["media"] or 0) for r in await cur.fetchall()}
+
+
+async def ans_get(row_id: int) -> aiosqlite.Row | None:
+    cur = await _db.execute("SELECT * FROM answers WHERE id = ?", (row_id,))
+    return await cur.fetchone()
+
+
+async def ans_remove(row_id: int) -> None:
+    """Удаляем вариант вместе с его файлом, чтобы папка не копила мусор."""
+    row = await ans_get(row_id)
     if row and row["file_path"]:
         try:
             os.remove(row["file_path"])
         except OSError:
             pass
+    await _db.execute("DELETE FROM answers WHERE id = ?", (row_id,))
+    await _db.commit()
+
+
+async def ans_clear(owner: str, owner_id: int) -> None:
+    for r in await ans_list(owner, owner_id):
+        await ans_remove(r["id"])
+
+
+async def trig_add(chat_id: int, phrase: str, text: str | None,
+                   file_path: str | None = None, media_type: str | None = None) -> int:
+    cur = await _db.execute(
+        "INSERT INTO triggers (chat_id, phrase, text, file_path, media_type) VALUES (?, ?, ?, ?, ?)",
+        (chat_id, phrase.lower(), text, file_path, media_type),
+    )
+    await _db.commit()
+    rid = cur.lastrowid
+    await ans_add("trig", rid, text, file_path, media_type)
+    return rid
+
+
+async def trig_remove(row_id: int) -> None:
+    """Удаляем триггер вместе со всеми его вариантами и их файлами."""
+    await ans_clear("trig", row_id)
     await _db.execute("DELETE FROM triggers WHERE id = ?", (row_id,))
     await _db.commit()
 
@@ -933,7 +1021,9 @@ async def trig_set(row_id: int, field: str, value) -> None:
 
 
 async def trig_list(chat_id: int) -> list[aiosqlite.Row]:
-    cur = await _db.execute("SELECT * FROM triggers WHERE chat_id = ? ORDER BY id", (chat_id,))
+    cur = await _db.execute(
+        "SELECT * FROM triggers WHERE chat_id = ? ORDER BY phrase", (chat_id,)
+    )
     return await cur.fetchall()
 
 
@@ -942,24 +1032,26 @@ async def trig_list(chat_id: int) -> list[aiosqlite.Row]:
 async def cmd_add(chat_id: int, cmd: str, template: str, cooldown: int) -> bool:
     """Создать команду. False — если такая в этом чате уже есть."""
     try:
-        await _db.execute(
+        cur = await _db.execute(
             "INSERT INTO chat_cmds (chat_id, cmd, template, cooldown) VALUES (?, ?, ?, ?)",
             (chat_id, cmd.lower(), template, cooldown),
         )
     except aiosqlite.IntegrityError:
         return False
     await _db.commit()
+    await ans_add("cmd", cur.lastrowid, template)
     return True
 
 
 async def cmd_remove(row_id: int) -> None:
+    await ans_clear("cmd", row_id)
     await _db.execute("DELETE FROM chat_cmds WHERE id = ?", (row_id,))
     await _db.commit()
 
 
 async def cmd_list(chat_id: int) -> list[aiosqlite.Row]:
     cur = await _db.execute(
-        "SELECT * FROM chat_cmds WHERE chat_id = ? ORDER BY id", (chat_id,)
+        "SELECT * FROM chat_cmds WHERE chat_id = ? ORDER BY cmd", (chat_id,)
     )
     return await cur.fetchall()
 

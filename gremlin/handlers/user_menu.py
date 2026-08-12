@@ -32,12 +32,11 @@ class Input(StatesGroup):
     access = State()      # ждём id/@username для доступа к боту
     cmd_name = State()      # ждём команду счётчика
     cmd_template = State()  # ждём заготовку ответа
-    cmd_edit = State()      # ждём новую заготовку
     digest_to = State()     # ждём id получателя недельной сводки
     inline_wl = State()     # ждём @username разрешённого инлайн-бота
     link_wl = State()       # ждём чат/канал для вайтлиста ссылок
     trig_edit_phrase = State()  # ждём новую фразу триггера
-    trig_edit_reply = State()   # ждём новый ответ триггера
+    ans_new = State()           # ждём новый вариант ответа (триггер/счётчик)
 
 
 _HOME_TEXT = "<b>🧌 Gremlin</b>\n\nМодерация и мониторинг чатов."
@@ -347,15 +346,14 @@ async def _render_widget(b: InlineKeyboardBuilder, cid: int, widget: str, s) -> 
             b.row(*row)
 
     elif widget == "trigs":
+        n = len(await db.trig_list(cid))
+        b.row(_btn(f"📋 Список триггеров: {n}", f"u:tgl:{cid}:0"))
         b.row(_btn("➕ Добавить триггер", f"u:tga:{cid}"))
-        for r in await db.trig_list(cid):
-            kind = "💬" if not r["file_path"] else "🖼"
-            b.row(_btn(f"{kind} {r['phrase'][:30]}", f"u:tgv:{cid}:{r['id']}"))
 
     elif widget == "cmds":
+        n = len(await db.cmd_list(cid))
+        b.row(_btn(f"📋 Список счётчиков: {n}", f"u:cml:{cid}:0"))
         b.row(_btn("➕ Добавить счётчик", f"u:cma:{cid}"))
-        for r in await db.cmd_list(cid):
-            b.row(_btn(f"{r['cmd']} · [{r['count']}]", f"u:cmv:{cid}:{r['id']}"))
 
 
 # уровни вайтлиста без «полного игнора» — он тумблер над всеми остальными
@@ -412,6 +410,156 @@ async def view_wl_entry(cid: int, row_id: int) -> tuple[str, InlineKeyboardMarku
     b.row(_btn("🗑 Убрать из вайтлиста", f"u:wld:{cid}:{row_id}"))
     b.row(_btn("⬅️ Назад", f"u:s:{cid}:wl"))
     return text, b.as_markup()
+
+
+# ---------- варианты ответов (триггеры и счётчики) ----------
+#
+# Ответов у объекта может быть несколько, бот берёт случайный. Владельца в
+# callback пишем одной буквой: t — триггер, c — счётчик (лимит 64 байта).
+
+ANS_OWNER = {"t": "trig", "c": "cmd"}
+ANS_LIMIT = 60   # ответов бывает много: списки-рулетки вроде !судимости
+
+
+def _ans_line(a) -> str:
+    """Одна строка варианта в человеческом виде."""
+    if a["file_path"]:
+        s = f"🖼 медиа ({a['media_type']})"
+        return s + (f" · подпись: <code>{utils.esc(a['text'])}</code>" if a["text"] else "")
+    return f"💬 <code>{utils.esc(a['text'] or '')}</code>"
+
+
+def _ans_preview(answers: list) -> str:
+    if not answers:
+        return "<i>пусто — бот промолчит</i>"
+    if len(answers) == 1:
+        return _ans_line(answers[0])
+    n = len(answers)
+    word = "варианта" if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14) else "вариантов"
+    return f"<b>{n}</b> {word}, бот берёт случайный"
+
+
+def _ans_back(cid: int, code: str, oid: int) -> str:
+    return f"u:tgv:{cid}:{oid}" if code == "t" else f"u:cmv:{cid}:{oid}"
+
+
+async def view_answers(cid: int, code: str, oid: int,
+                       page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    owner = ANS_OWNER[code]
+    rows = await db.ans_list(owner, oid)
+    chunk, page, pages = _page_slice(rows, page)
+    title = "🎯 Триггер" if code == "t" else "🔢 Счётчик"
+    lines = [
+        f"<b>{title} · варианты ответа</b>\n",
+        "Вариантов несколько — бот отвечает случайным. "
+        + ("Можно текст, медиа или медиа с подписью."
+           if code == "t" else "Только текст: число в скобках дописывается само."),
+        f"\nВсего: <b>{len(rows)}</b> из {ANS_LIMIT}"
+        + (f" · страница {page + 1} из {pages}" if pages > 1 else ""),
+        "",
+    ]
+    if not rows:
+        lines.append("Пусто — добавьте хотя бы один, иначе бот не ответит.")
+    start = page * LIST_PER_PAGE
+    for i, a in enumerate(chunk, start + 1):
+        lines.append(f"{i}. {_ans_line(a)}")
+
+    b = InlineKeyboardBuilder()
+    row = []
+    for i, a in enumerate(chunk, start + 1):
+        row.append(_btn(f"❌ {i}", f"u:and:{cid}:{code}:{oid}:{a['id']}"))
+        if len(row) == 4:
+            b.row(*row)
+            row = []
+    if row:
+        b.row(*row)
+    if pages > 1:                      # у вариантов свой префикс, общий _pager не подходит
+        prev_p = page - 1 if page else pages - 1
+        next_p = page + 1 if page + 1 < pages else 0
+        b.row(
+            _btn("◀", f"u:an:{cid}:{code}:{oid}:{prev_p}"),
+            _btn(f"{page + 1}/{pages}", f"u:an:{cid}:{code}:{oid}:{page}"),
+            _btn("▶", f"u:an:{cid}:{code}:{oid}:{next_p}"),
+        )
+    b.row(_btn("➕ Добавить вариант", f"u:ana:{cid}:{code}:{oid}"))
+    b.row(_btn("⬅️ Назад", _ans_back(cid, code, oid)))
+    return "\n".join(lines), b.as_markup()
+
+
+LIST_PER_PAGE = 10
+
+
+def _pager(b: InlineKeyboardBuilder, cid: int, prefix: str, page: int, pages: int) -> None:
+    """Ряд навигации ◀ 2/5 ▶ по кругу. Одна страница — ряда нет."""
+    if pages < 2:
+        return
+    prev_p = page - 1 if page else pages - 1
+    next_p = page + 1 if page + 1 < pages else 0
+    b.row(
+        _btn("◀", f"{prefix}:{cid}:{prev_p}"),
+        _btn(f"{page + 1}/{pages}", f"{prefix}:{cid}:{page}"),
+        _btn("▶", f"{prefix}:{cid}:{next_p}"),
+    )
+
+
+def _page_slice(rows: list, page: int) -> tuple[list, int, int]:
+    pages = max(1, -(-len(rows) // LIST_PER_PAGE))
+    page = max(0, min(page, pages - 1))
+    start = page * LIST_PER_PAGE
+    return rows[start:start + LIST_PER_PAGE], page, pages
+
+
+async def view_cmds(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """Счётчики отдельной страницей: в разделе их лимит 30, все кнопки не влезали."""
+    rows = await db.cmd_list(cid)
+    chunk, page, pages = _page_slice(rows, page)
+    head = f"<b>🔢 Счётчики</b>\n\nВсего: <b>{len(rows)}</b> из {config.CMD_LIMIT}"
+    if pages > 1:
+        head += f" · страница {page + 1} из {pages}"
+    lines = [head, "", "Нажмите на счётчик, чтобы посмотреть и настроить его."]
+    if not rows:
+        lines.append("\nПока ни одного.")
+    b = InlineKeyboardBuilder()
+    row = []
+    for r in chunk:
+        row.append(_btn(f"{r['cmd'][:16]} [{r['count']}]", f"u:cmv:{cid}:{r['id']}"))
+        if len(row) == 2:
+            b.row(*row)
+            row = []
+    if row:
+        b.row(*row)
+    _pager(b, cid, "u:cml", page, pages)
+    b.row(_btn("➕ Добавить счётчик", f"u:cma:{cid}"))
+    b.row(_btn("⬅️ Назад", f"u:s:{cid}:cmds"))
+    return "\n".join(lines), b.as_markup()
+
+
+async def view_trigs(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    rows = await db.trig_list(cid)
+    chunk, page, pages = _page_slice(rows, page)
+    head = f"<b>🎯 Триггеры</b>\n\nВсего: <b>{len(rows)}</b> из {config.TRIG_LIMIT}"
+    if pages > 1:
+        head += f" · страница {page + 1} из {pages}"
+    lines = [head, "", "💬 текст · 🖼 медиа · 🎲 несколько вариантов. Нажмите, чтобы настроить."]
+    if not rows:
+        lines.append("\nПока ни одного.")
+    b = InlineKeyboardBuilder()
+    stats = await db.ans_stats("trig", [r["id"] for r in chunk])
+    row = []
+    for r in chunk:
+        total, media = stats.get(r["id"], (0, 0))
+        # 🎲 — несколько вариантов, дальше по содержимому единственного
+        kind = "🎲" if total > 1 else ("🖼" if media else "💬")
+        row.append(_btn(f"{kind} {r['phrase'][:18]}", f"u:tgv:{cid}:{r['id']}"))
+        if len(row) == 2:
+            b.row(*row)
+            row = []
+    if row:
+        b.row(*row)
+    _pager(b, cid, "u:tgl", page, pages)
+    b.row(_btn("➕ Добавить триггер", f"u:tga:{cid}"))
+    b.row(_btn("⬅️ Назад", f"u:s:{cid}:triggers"))
+    return "\n".join(lines), b.as_markup()
 
 
 WORDS_PER_PAGE = 12
@@ -809,7 +957,7 @@ async def cb_trig_add(cb: CallbackQuery, state: FSMContext) -> None:
         cb, state, Input.trig_phrase,
         "<b>🎯 Новый триггер</b>\n\nПришлите ключевую фразу (от 3 символов). "
         "Бот будет искать её внутри сообщений.",
-        f"u:s:{cid}:triggers", cid=cid,
+        f"u:tgl:{cid}:0", cid=cid,
     )
 
 
@@ -838,7 +986,7 @@ async def trig_reply_input(message: Message, state: FSMContext, bot: Bot) -> Non
     data = await state.get_data()
     cid, phrase = data["cid"], data["phrase"]
     if (message.text or "").strip() == "/cancel":
-        await _done(message, bot, state, await view_section(cid, "triggers"))
+        await _done(message, bot, state, await view_trigs(cid, 0))
         return
     if message.text:
         await db.trig_add(cid, phrase, message.text)
@@ -859,7 +1007,7 @@ async def trig_reply_input(message: Message, state: FSMContext, bot: Bot) -> Non
         # добавили триггер — значит хотят, чтобы он работал; иначе «добавил, а тишина»
         await db.set_setting(cid, "trig_on", 1)
         note = "✅ Триггер добавлен, раздел включён.\n\n"
-    await _done(message, bot, state, await view_section(cid, "triggers"), note)
+    await _done(message, bot, state, await view_trigs(cid, 0), note)
 
 
 # ---------- недельная сводка ----------
@@ -946,16 +1094,17 @@ async def view_cmd(cid: int, rid: int) -> tuple[str, InlineKeyboardMarkup]:
     r = await db.cmd_get(rid)
     b = InlineKeyboardBuilder()
     if r is None:
-        b.button(text="⬅️ Назад", callback_data=f"u:s:{cid}:cmds")
+        b.button(text="⬅️ Назад", callback_data=f"u:cml:{cid}:0")
         return "Счётчик не найден.", b.as_markup()
     cd = f"{r['cooldown']} сек" if r["cooldown"] else "без кулдауна"
+    answers = await db.ans_list("cmd", rid)
     text = (
         f"<b>🔢 {utils.esc(r['cmd'])}</b>\n\n"
-        f"Ответ: <code>{utils.esc(r['template'])} [{r['count']}]</code>\n"
+        f"Ответ: {_ans_preview(answers)} <i>+ [{r['count']}]</i>\n"
         f"Кулдаун: <b>{cd}</b>\n"
         f"Вызовов: <b>{r['count']}</b>"
     )
-    b.row(_btn("✏️ Изменить заготовку", f"u:cme:{cid}:{rid}"))
+    b.row(_btn(f"🎲 Варианты ответа: {len(answers)}", f"u:an:{cid}:c:{rid}:0"))
     values = list(config.CMD_COOLDOWN_PRESETS)
     b.row(
         _btn("◀", f"u:cmc:{cid}:{rid}:-"),
@@ -964,8 +1113,102 @@ async def view_cmd(cid: int, rid: int) -> tuple[str, InlineKeyboardMarkup]:
     )
     b.row(_btn("🔄 Сбросить счётчик", f"u:cmr:{cid}:{rid}"))
     b.row(_btn("❌ Удалить счётчик", f"u:cmd:{cid}:{rid}"))
-    b.row(_btn("⬅️ Назад", f"u:s:{cid}:cmds"))
+    b.row(_btn("⬅️ Назад", f"u:cml:{cid}:0"))
     return text, b.as_markup()
+
+
+@router.callback_query(F.data.startswith("u:an:"))
+async def cb_answers(cb: CallbackQuery, state: FSMContext) -> None:
+    _, _, cid, code, oid, page = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid) or code not in ANS_OWNER:
+        return
+    await state.clear()
+    text, kb = await view_answers(cid, code, int(oid), int(page))
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:and:"))
+async def cb_answer_del(cb: CallbackQuery) -> None:
+    _, _, cid, code, oid, aid = cb.data.split(":")
+    cid, oid = int(cid), int(oid)
+    if not await _guard(cb, cid) or code not in ANS_OWNER:
+        return
+    await db.ans_remove(int(aid))
+    text, kb = await view_answers(cid, code, oid, 0)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer("Вариант удалён")
+
+
+@router.callback_query(F.data.startswith("u:ana:"))
+async def cb_answer_add(cb: CallbackQuery, state: FSMContext) -> None:
+    _, _, cid, code, oid = cb.data.split(":")
+    cid, oid = int(cid), int(oid)
+    if not await _guard(cb, cid) or code not in ANS_OWNER:
+        return
+    if len(await db.ans_list(ANS_OWNER[code], oid)) >= ANS_LIMIT:
+        await cb.answer(f"Лимит {ANS_LIMIT} вариантов.", show_alert=True)
+        return
+    hint = ("Пришлите текст, медиа или медиа с подписью."
+            if code == "t" else "Пришлите текст ответа. Число в скобках бот допишет сам.")
+    await _ask(
+        cb, state, Input.ans_new,
+        f"<b>🎲 Новый вариант ответа</b>\n\n{hint}",
+        f"u:an:{cid}:{code}:{oid}:0", cid=cid, code=code, oid=oid,
+    )
+
+
+@router.message(StateFilter(Input.ans_new))
+async def ans_new_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    cid, code, oid = data["cid"], data["code"], data["oid"]
+    text = (message.text or message.caption or "").strip()
+    if text == "/cancel":
+        await _done(message, bot, state, await view_answers(cid, code, oid, 0))
+        return
+
+    media = triggers.extract_media(message) if code == "t" else None
+    if media is None and not text:
+        hint = ("⚠️ Нужен текст или медиа." if code == "t"
+                else "⚠️ Нужен текст: у счётчиков ответы только текстовые.")
+        await _retry(message, bot, state, f"<b>🎲 Новый вариант ответа</b>\n\n{hint}")
+        return
+
+    path = None
+    if media is not None:
+        try:
+            path = await triggers.save_media(bot, media.file_id, cid, media.kind)
+        except Exception:
+            await _retry(message, bot, state,
+                         "<b>🎲 Новый вариант ответа</b>\n\n⚠️ Не смог скачать файл, попробуйте ещё раз.")
+            return
+    await db.ans_add(ANS_OWNER[code], oid, text or None, path, media.kind if media else None)
+    await _done(message, bot, state, await view_answers(cid, code, oid, 0), "✅ Вариант добавлен.\n\n")
+
+
+@router.callback_query(F.data.startswith("u:cml:"))
+async def cb_cmds_page(cb: CallbackQuery, state: FSMContext) -> None:
+    _, _, cid, page = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    await state.clear()
+    text, kb = await view_cmds(cid, int(page))
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:tgl:"))
+async def cb_trigs_page(cb: CallbackQuery, state: FSMContext) -> None:
+    _, _, cid, page = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    await state.clear()
+    text, kb = await view_trigs(cid, int(page))
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
 
 
 @router.callback_query(F.data.startswith("u:cma:"))
@@ -980,7 +1223,7 @@ async def cb_cmd_add(cb: CallbackQuery, state: FSMContext) -> None:
         cb, state, Input.cmd_name,
         "<b>🔢 Новый счётчик</b>\n\nПришлите команду, например <code>!черви</code>.\n"
         "Забудете <code>!</code> — допишу сам.",
-        f"u:s:{cid}:cmds", cid=cid,
+        f"u:cml:{cid}:0", cid=cid,
     )
 
 
@@ -993,7 +1236,7 @@ async def cmd_name_input(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
     cid = data["cid"]
     if text == "/cancel":
-        await _done(message, bot, state, await view_section(cid, "cmds"))
+        await _done(message, bot, state, await view_cmds(cid, 0))
         return
     if not text.startswith("!"):
         text = "!" + text
@@ -1023,7 +1266,7 @@ async def cmd_template_input(message: Message, state: FSMContext, bot: Bot) -> N
     data = await state.get_data()
     cid = data["cid"]
     if text == "/cancel":
-        await _done(message, bot, state, await view_section(cid, "cmds"))
+        await _done(message, bot, state, await view_cmds(cid, 0))
         return
     if not text:
         await _retry(message, bot, state, _CMD_NAME_HEAD + "⚠️ Нужен текст заготовки.")
@@ -1033,7 +1276,7 @@ async def cmd_template_input(message: Message, state: FSMContext, bot: Bot) -> N
     if not (await db.get_settings(cid)).cmds_on:
         await db.set_setting(cid, "cmds_on", 1)
         note = "✅ Счётчик создан, раздел включён.\n\n"
-    await _done(message, bot, state, await view_section(cid, "cmds"), note)
+    await _done(message, bot, state, await view_cmds(cid, 0), note)
 
 
 @router.callback_query(F.data.startswith("u:cmv:"))
@@ -1082,39 +1325,6 @@ async def cb_cmd_reset(cb: CallbackQuery) -> None:
     await cb.answer("Счётчик сброшен")
 
 
-@router.callback_query(F.data.startswith("u:cme:"))
-async def cb_cmd_edit(cb: CallbackQuery, state: FSMContext) -> None:
-    _, _, cid, rid = cb.data.split(":")
-    cid, rid = int(cid), int(rid)
-    if not await _guard(cb, cid):
-        return
-    r = await db.cmd_get(rid)
-    if r is None:
-        await cb.answer("Счётчик не найден.", show_alert=True)
-        return
-    await _ask(
-        cb, state, Input.cmd_edit,
-        f"<b>🔢 {utils.esc(r['cmd'])}</b>\n\nПришлите новую заготовку.\n"
-        f"Сейчас: <code>{utils.esc(r['template'])}</code>",
-        f"u:cmv:{cid}:{rid}", cid=cid, rid=rid,
-    )
-
-
-@router.message(StateFilter(Input.cmd_edit))
-async def cmd_edit_input(message: Message, state: FSMContext, bot: Bot) -> None:
-    text = (message.text or "").strip()
-    data = await state.get_data()
-    cid, rid = data["cid"], data["rid"]
-    if text == "/cancel":
-        await _done(message, bot, state, await view_cmd(cid, rid))
-        return
-    if not text:
-        await _retry(message, bot, state, "⚠️ Нужен текст заготовки.")
-        return
-    await db.cmd_set(rid, "template", text)
-    await _done(message, bot, state, await view_cmd(cid, rid), "✅ Обновлено.\n\n")
-
-
 @router.callback_query(F.data.startswith("u:cmd:"))
 async def cb_cmd_del(cb: CallbackQuery) -> None:
     _, _, cid, rid = cb.data.split(":")
@@ -1122,7 +1332,8 @@ async def cb_cmd_del(cb: CallbackQuery) -> None:
     if not await _guard(cb, cid):
         return
     await db.cmd_remove(int(rid))
-    await _rerender(cb, cid, "cmds")
+    text, kb = await view_cmds(cid, 0)
+    await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer("Удалено")
 
 
@@ -1133,7 +1344,8 @@ async def cb_trig_del(cb: CallbackQuery) -> None:
     if not await _guard(cb, cid):
         return
     await db.trig_remove(int(rid))
-    await _rerender(cb, cid, "triggers")
+    text, kb = await view_trigs(cid, 0)
+    await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer("Удалено")
 
 
@@ -1448,31 +1660,25 @@ async def view_trig(cid: int, rid: int) -> tuple[str, InlineKeyboardMarkup]:
     r = await db.trig_get(rid)
     b = InlineKeyboardBuilder()
     if r is None:
-        b.button(text="⬅️ Назад", callback_data=f"u:s:{cid}:triggers")
+        b.button(text="⬅️ Назад", callback_data=f"u:tgl:{cid}:0")
         return "Триггер не найден.", b.as_markup()
     cd = f"{r['cooldown']} сек" if r["cooldown"] else "без кулдауна"
-    if r["file_path"]:
-        kind = triggers.MEDIA_KINDS.get(r["media_type"], ("", "", False))
-        answer = f"🖼 медиа ({r['media_type']})"
-        if r["text"]:
-            answer += f" с подписью: <code>{utils.esc(r['text'])}</code>"
-    else:
-        answer = f"💬 <code>{utils.esc(r['text'] or '')}</code>"
+    answers = await db.ans_list("trig", rid)
     text = (
         f"<b>🎯 Триггер</b>\n\n"
         f"Фраза: <code>{utils.esc(r['phrase'])}</code>\n"
-        f"Ответ: {answer}\n"
+        f"Ответ: {_ans_preview(answers)}\n"
         f"Кулдаун: <b>{cd}</b>"
     )
     b.row(_btn("✏️ Изменить фразу", f"u:tgp:{cid}:{rid}"))
-    b.row(_btn("✏️ Изменить ответ", f"u:tgr:{cid}:{rid}"))
+    b.row(_btn(f"🎲 Варианты ответа: {len(answers)}", f"u:an:{cid}:t:{rid}:0"))
     b.row(
         _btn("◀", f"u:tgc:{cid}:{rid}:-"),
         _btn(f"⏱ {cd}", f"u:tgc:{cid}:{rid}:+"),
         _btn("▶", f"u:tgc:{cid}:{rid}:+"),
     )
     b.row(_btn("❌ Удалить триггер", f"u:tgd:{cid}:{rid}"))
-    b.row(_btn("⬅️ Назад", f"u:s:{cid}:triggers"))
+    b.row(_btn("⬅️ Назад", f"u:tgl:{cid}:0"))
     return text, b.as_markup()
 
 
@@ -1542,53 +1748,6 @@ async def trig_edit_phrase_input(message: Message, state: FSMContext, bot: Bot) 
         return
     await db.trig_set(rid, "phrase", text.lower())
     await _done(message, bot, state, await view_trig(cid, rid), "✅ Фраза обновлена.\n\n")
-
-
-@router.callback_query(F.data.startswith("u:tgr:"))
-async def cb_trig_edit_reply(cb: CallbackQuery, state: FSMContext) -> None:
-    _, _, cid, rid = cb.data.split(":")
-    cid, rid = int(cid), int(rid)
-    if not await _guard(cb, cid):
-        return
-    await _ask(
-        cb, state, Input.trig_edit_reply,
-        "<b>🎯 Триггер</b>\n\nПришлите новый ответ бота — текст или медиа "
-        "(фото, стикер, гифка, видео, войс).",
-        f"u:tgv:{cid}:{rid}", cid=cid, rid=rid,
-    )
-
-
-@router.message(StateFilter(Input.trig_edit_reply))
-async def trig_edit_reply_input(message: Message, state: FSMContext, bot: Bot) -> None:
-    data = await state.get_data()
-    cid, rid = data["cid"], data["rid"]
-    if (message.text or "").strip() == "/cancel":
-        await _done(message, bot, state, await view_trig(cid, rid))
-        return
-    old = await db.trig_get(rid)
-    if message.text:
-        await db.trig_set(rid, "text", message.text)
-        await db.trig_set(rid, "file_path", None)
-        await db.trig_set(rid, "media_type", None)
-    else:
-        media = triggers.extract_media(message)
-        if media is None:
-            await _retry(
-                message, bot, state,
-                "<b>🎯 Триггер</b>\n\n⚠️ Не понял. Пришлите текст или медиа.",
-            )
-            return
-        path = await triggers.save_media(bot, media.file_id, cid, media.kind)
-        await db.trig_set(rid, "file_path", path)
-        await db.trig_set(rid, "media_type", media.kind)
-        await db.trig_set(rid, "text", message.caption or None)
-    # старый файл больше не нужен
-    if old and old["file_path"]:
-        try:
-            os.remove(old["file_path"])
-        except OSError:
-            pass
-    await _done(message, bot, state, await view_trig(cid, rid), "✅ Ответ обновлён.\n\n")
 
 
 # ---------- разрешённые для ссылок чаты и каналы ----------

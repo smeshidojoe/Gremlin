@@ -56,16 +56,26 @@ async def save_media(bot: Bot, file_id: str, chat_id: int, kind: str) -> str:
 
 
 async def send(message: Message, row) -> None:
-    """Ответить на сообщение содержимым триггера (текст или медиа с диска)."""
-    if not row["file_path"]:
-        await message.reply(row["text"])
+    """Ответить триггером. Вариантов может быть несколько — берём случайный."""
+    from .. import db
+    ans = await db.ans_pick("trig", row["id"])
+    if ans is None:
+        logger.warning("trigger %s has no answers", row["id"])
         return
-    kind = row["media_type"]
-    if kind not in MEDIA_KINDS or not os.path.exists(row["file_path"]):
-        logger.warning("trigger media missing: %s", row["file_path"])
+    await send_answer(message, ans)
+
+
+async def send_answer(message: Message, ans) -> None:
+    """Отправить один вариант ответа: текст или медиа с диска."""
+    if not ans["file_path"]:
+        await message.reply(ans["text"])
+        return
+    kind = ans["media_type"]
+    if kind not in MEDIA_KINDS or not os.path.exists(ans["file_path"]):
+        logger.warning("trigger media missing: %s", ans["file_path"])
         return
     _ext, method, has_caption = MEDIA_KINDS[kind]
     kwargs = {"reply_to_message_id": message.message_id}
-    if has_caption and row["text"]:
-        kwargs["caption"] = row["text"]
-    await getattr(message, method)(FSInputFile(row["file_path"]), **kwargs)
+    if has_caption and ans["text"]:
+        kwargs["caption"] = ans["text"]
+    await getattr(message, method)(FSInputFile(ans["file_path"]), **kwargs)

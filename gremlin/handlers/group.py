@@ -159,8 +159,11 @@ async def chat_command(message: Message) -> None:
         return  # кулдаун — молчим, вызов не засчитываем
     _cmd_fired[row["id"]] = now
     count = await db.cmd_bump(row["id"])
+    ans = await db.ans_pick("cmd", row["id"])   # вариантов может быть несколько
+    if ans is None:
+        return
     try:
-        await message.reply(f"{utils.esc(row['template'])} [{count}]")
+        await message.reply(f"{utils.esc(ans['text'])} [{count}]")
     except Exception:
         logger.warning("counter %s failed in %s", row["id"], message.chat.id, exc_info=True)
 

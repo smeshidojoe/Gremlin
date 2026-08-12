@@ -1,0 +1,550 @@
+"""Групповой пайплайн: команды !mute/!ban/!warn, капча и автомодерация всех сообщений."""
+import asyncio
+import logging
+import time
+
+from aiogram import Bot, F, Router
+from aiogram.filters import Command
+from aiogram.types import CallbackQuery, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+from .. import config, db, utils
+from ..services import adm_cache, filters, moderation, triggers, watch
+
+logger = logging.getLogger("gremlin.group")
+
+router = Router()
+
+
+async def _registered(message: Message) -> bool:
+    """Чат зарегистрирован = бота позвал кто-то из допущенных. Остальные игнорируем."""
+    return await db.get_chat(message.chat.id) is not None
+
+
+def ts_of(obj) -> float | None:
+    """Unix-время события. edit_date приходит числом, date — datetime."""
+    stamp = getattr(obj, "edit_date", None) or getattr(obj, "date", None)
+    if stamp is None:
+        return None
+    return stamp if isinstance(stamp, (int, float)) else stamp.timestamp()
+
+
+def stale(obj) -> bool:
+    """Сообщение из бэклога: бот лежал, а мы разгребаем накопившееся.
+
+    На такие бот не отвечает и не наказывает — иначе после запуска в чат
+    прилетает пачка запоздалых реакций. Счётчики при этом всё равно считаются.
+    """
+    ts = ts_of(obj)
+    return ts is not None and time.time() - ts > config.MSG_MAX_AGE
+
+
+# фильтры роутера: вся групповая логика работает только в «своих» чатах
+router.message.filter(F.chat.type.in_({"group", "supergroup"}), _registered)
+router.edited_message.filter(F.chat.type.in_({"group", "supergroup"}), _registered)
+
+# ждут прохождения капчи: (chat_id, user_id) -> message_id капчи
+_captcha_pending: dict[tuple[int, int], int] = {}
+# кулдаун команд чата: id команды -> monotonic последнего ответа
+_cmd_fired: dict[int, float] = {}
+# последнее приветствие в чате (удаляем при новом входе, чтобы не спамить)
+_last_welcome: dict[int, int] = {}
+# кулдаун триггеров: (chat_id, trigger_id) -> monotonic
+_trig_fired: dict[tuple[int, int], float] = {}
+
+
+@router.message(Command("start", "menu", "admin", ignore_mention=True))
+async def ignore_bot_commands(message: Message) -> None:
+    """В группе на /start и прочие личные команды бот не отвечает — меню только в личке."""
+    return
+
+
+# ---------- команды админов чата: !mute !ban ----------
+
+async def _is_chat_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
+    return user_id in await adm_cache.chat_admin_ids(bot, chat_id)
+
+
+def _manual_card_text(kind: str, chat_title: str | None, target, reason: str,
+                      until: int | None, by) -> str:
+    who = utils.mention(target.id, target.full_name, target.username)
+    admin = utils.mention(by.id, by.full_name, by.username)
+    lines = [
+        f"{moderation.KIND_EMOJI[kind]} <b>{moderation.KIND_LABEL[kind]}</b> · {utils.esc(chat_title)}",
+        f"👤 {who} (<code>{target.id}</code>)",
+        f"📎 Причина: {utils.esc(reason)}",
+    ]
+    if kind == "mute":
+        lines.append(f"⏰ До: {utils.fmt_ts(until)}")
+    lines.append(f"👮 Кем: {admin}")
+    return "\n".join(lines)
+
+
+async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
+    """Общая логика !mute / !ban."""
+    if stale(message):
+        return  # команда из бэклога — админ уже всё разрулил сам
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply("Команда работает ответом на сообщение нарушителя.")
+        return
+    if not await _is_chat_admin(bot, message.chat.id, message.from_user.id):
+        return  # молча игнорим не-админов
+    target = message.reply_to_message.from_user
+    if target.id == bot.id or await _is_chat_admin(bot, message.chat.id, target.id):
+        await message.reply("Этого юзера наказать нельзя.")
+        return
+
+    parts = (message.text or "").split()[1:]
+    mute_min = 0  # навсегда
+    if kind == "mute" and parts:
+        parsed = utils.parse_duration(parts[0])
+        if parsed is not None:
+            mute_min = parsed
+            parts = parts[1:]
+    reason = " ".join(parts) or "без причины"
+
+    pid = await moderation.apply_punishment(
+        bot, message.chat.id, target, kind, mute_min, reason, message.from_user.id
+    )
+    if pid is None:
+        await message.reply("Не получилось — проверь права бота.")
+        return
+    until = utils.until_ts(mute_min) if kind == "mute" else None
+    dur = f" на {utils.fmt_minutes(mute_min)}" if kind == "mute" else ""
+    await message.reply(
+        f"{moderation.KIND_EMOJI[kind]} {utils.mention(target.id, target.full_name, target.username)} "
+        f"получил {moderation.KIND_LABEL[kind].lower()}{dur}. Причина: {utils.esc(reason)}"
+    )
+    bit = config.BIT_BAN if kind == "ban" else config.BIT_MUTE
+    card = _manual_card_text(kind, message.chat.title, target, reason, until, message.from_user)
+    await moderation.send_card(bot, message.chat.id, bit, card, pid, kind)
+    await db.add_event(
+        message.chat.id, "manual",
+        f"{kind}: {target.full_name} ({target.id}) — {reason} | by {message.from_user.id}",
+    )
+
+
+@router.message(F.text.regexp(r"^!(mute|мут)(\s|$)"))
+async def cmd_mute(message: Message, bot: Bot) -> None:
+    await _manual_punish(message, bot, "mute")
+
+
+@router.message(F.text.regexp(r"^!(ban|бан)(\s|$)"))
+async def cmd_ban(message: Message, bot: Bot) -> None:
+    await _manual_punish(message, bot, "ban")
+
+
+@router.message(F.text.startswith("!"))
+async def chat_command(message: Message) -> None:
+    """Счётчики: команда в чате -> ответ по заготовке + счётчик вызовов.
+
+    Стоит выше системных !mute/!ban — но те перехватываются раньше по своим
+    регуляркам, а сюда попадает всё остальное с «!».
+    """
+    s = await db.get_settings(message.chat.id)
+    if not s.cmds_on:
+        return
+    word = (message.text or "").split(maxsplit=1)[0].lower()
+    row = await db.cmd_find(message.chat.id, word)
+    if row is None:
+        return
+    # вызов из бэклога: счётчик растёт, но в чат ничего не шлём — иначе после
+    # запуска бот вывалил бы пачку запоздалых ответов
+    if stale(message):
+        await db.cmd_bump(row["id"])
+        return
+
+    now = time.monotonic()
+    if row["cooldown"] and now - _cmd_fired.get(row["id"], 0) < row["cooldown"]:
+        return  # кулдаун — молчим, вызов не засчитываем
+    _cmd_fired[row["id"]] = now
+    count = await db.cmd_bump(row["id"])
+    try:
+        await message.reply(f"{utils.esc(row['template'])} [{count}]")
+    except Exception:
+        logger.warning("counter %s failed in %s", row["id"], message.chat.id, exc_info=True)
+
+
+async def fire_trigger(bot: Bot, message: Message, s) -> None:
+    """Ответить триггером, если фраза совпала. Работает для всех, включая админов."""
+    if not s.trig_on or message.edit_date is not None or stale(message):
+        return
+    low = (message.text or message.caption or "").lower()
+    if not low:
+        return
+    now = time.monotonic()
+    for t in await db.trig_list(message.chat.id):
+        if t["phrase"] not in low:
+            continue
+        key = (message.chat.id, t["id"])
+        if t["cooldown"] and now - _trig_fired.get(key, 0) < t["cooldown"]:
+            return  # кулдаун — молчим
+        _trig_fired[key] = now
+        try:
+            await triggers.send(message, t)
+        except Exception:
+            logger.warning("trigger %s failed in %s", t["id"], message.chat.id, exc_info=True)
+        return  # один триггер на сообщение
+
+
+# ---------- капча новичкам ----------
+
+async def _captcha_timeout(bot: Bot, chat_id: int, user_id: int, timeout: int, msg_id: int) -> None:
+    await asyncio.sleep(timeout)
+    if _captcha_pending.pop((chat_id, user_id), None) is None:
+        return  # уже прошёл
+    try:
+        await bot.delete_message(chat_id, msg_id)
+    except Exception:
+        pass
+    try:  # кик с возможностью вернуться (ban+unban)
+        await bot.ban_chat_member(chat_id, user_id)
+        await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+    except Exception:
+        logger.warning("captcha kick failed in %s", chat_id, exc_info=True)
+    await db.add_event(chat_id, "captcha", f"не прошёл капчу, кик: {user_id}")
+
+
+@router.callback_query(F.data.startswith("capt:"))
+async def captcha_pass(cb: CallbackQuery, bot: Bot) -> None:
+    _, chat_id, user_id = cb.data.split(":")
+    chat_id, user_id = int(chat_id), int(user_id)
+    if cb.from_user.id != user_id:
+        await cb.answer("Это капча не для тебя.", show_alert=True)
+        return
+    _captcha_pending.pop((chat_id, user_id), None)
+    try:
+        await bot.restrict_chat_member(chat_id, user_id, permissions=moderation.UNMUTE_PERMS)
+    except Exception:
+        logger.warning("captcha unmute failed in %s", chat_id, exc_info=True)
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+    await cb.answer("Добро пожаловать!")
+    await db.add_event(chat_id, "captcha", f"прошёл капчу: {user_id}")
+
+
+# ---------- сервисные сообщения (вход/выход) ----------
+
+@router.message(F.new_chat_members)
+async def on_join(message: Message, bot: Bot) -> None:
+    if stale(message):
+        return  # новичок зашёл, пока бот лежал — встречать поздно
+    s = await db.get_settings(message.chat.id)
+    for user in message.new_chat_members or []:
+        adm_cache.invalidate_member(message.chat.id, user.id)
+        if not user.is_bot:
+            await db.add_event(message.chat.id, "join", f"{user.full_name} ({user.id})")
+    if s.welcome_on and s.welcome_text:
+        humans = [u for u in message.new_chat_members or [] if not u.is_bot]
+        if humans:
+            names = ", ".join(
+                utils.mention(u.id, u.first_name, u.username) for u in humans
+            )
+            old = _last_welcome.pop(message.chat.id, None)
+            if old:
+                try:
+                    await bot.delete_message(message.chat.id, old)
+                except Exception:
+                    pass
+            try:
+                sent = await message.answer(s.welcome_text.replace("{name}", names))
+                _last_welcome[message.chat.id] = sent.message_id
+            except Exception:
+                logger.warning("welcome failed in %s", message.chat.id, exc_info=True)
+    if s.watch_on:
+        admins = await adm_cache.chat_admin_ids(bot, message.chat.id)
+        adder = message.from_user
+        adder_is_admin = adder is not None and (
+            adder.id in admins or adder.id in config.ADMIN_IDS
+        )
+        for user in message.new_chat_members or []:
+            # чужие боты: банить, если добавил не-админ
+            if user.is_bot and user.id != bot.id:
+                if s.watch_bots and not adder_is_admin:
+                    try:
+                        await bot.ban_chat_member(message.chat.id, user.id)
+                    except Exception:
+                        logger.warning("bot ban failed in %s", message.chat.id, exc_info=True)
+                        continue
+                    pid = await db.add_punishment(
+                        message.chat.id, user.id, user.username, user.full_name,
+                        "ban", "чужой бот добавлен не-админом", None, None,
+                    )
+                    card = (
+                        f"⛔ <b>Бан бота</b> · {utils.esc(message.chat.title)}\n"
+                        f"🤖 @{user.username or user.id}\n"
+                        f"📎 Причина: добавлен не-админом\n"
+                        f"🤖 Кем: Gremlin (автомод)"
+                    )
+                    await db.add_event(message.chat.id, "watch", f"бан бота @{user.username} ({user.id})")
+                    await moderation.send_card(bot, message.chat.id, config.BIT_WATCH, card, pid, "ban")
+                continue
+            # профиль новичка-человека
+            if not user.is_bot and user.id not in admins and user.id not in config.ADMIN_IDS:
+                scopes = await db.wl_scopes_for(message.chat.id, user.id, user.username)
+                if not scopes & {"all", "watch"}:
+                    await watch.check_user(bot, message.chat, user, s)
+    if s.captcha_on:
+        admins = await adm_cache.chat_admin_ids(bot, message.chat.id)
+        for user in message.new_chat_members or []:
+            if user.is_bot or user.id in admins or user.id in config.ADMIN_IDS:
+                continue
+            scopes = await db.wl_scopes_for(message.chat.id, user.id, user.username)
+            if "all" in scopes:
+                continue
+            try:
+                await bot.restrict_chat_member(
+                    message.chat.id, user.id, permissions=moderation.MUTE_PERMS
+                )
+            except Exception:
+                logger.warning("captcha restrict failed in %s", message.chat.id, exc_info=True)
+                continue
+            b = InlineKeyboardBuilder()
+            b.button(text="✅ Я не бот", callback_data=f"capt:{message.chat.id}:{user.id}")
+            sent = await message.answer(
+                f"👋 {utils.mention(user.id, user.full_name, user.username)}, подтверди, "
+                f"что ты человек — нажми кнопку за {s.captcha_timeout} сек, иначе кик.",
+                reply_markup=b.as_markup(),
+            )
+            _captcha_pending[(message.chat.id, user.id)] = sent.message_id
+            asyncio.create_task(
+                _captcha_timeout(bot, message.chat.id, user.id, s.captcha_timeout, sent.message_id)
+            )
+    if s.service_join:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+
+@router.message(F.left_chat_member)
+async def on_leave(message: Message, bot: Bot) -> None:
+    if stale(message):
+        return
+    u = message.left_chat_member
+    if u:
+        adm_cache.invalidate_member(message.chat.id, u.id)
+    if u and not u.is_bot:
+        await db.add_event(message.chat.id, "leave", f"{u.full_name} ({u.id})")
+    s = await db.get_settings(message.chat.id)
+    if s.service_leave:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+
+@router.message(
+    F.pinned_message | F.new_chat_title | F.new_chat_photo | F.delete_chat_photo
+    | F.group_chat_created | F.supergroup_chat_created | F.message_auto_delete_timer_changed
+)
+async def on_service_other(message: Message) -> None:
+    """Прочие служебные: закреп, смена названия/фото и т.п."""
+    if stale(message):
+        return
+    s = await db.get_settings(message.chat.id)
+    if s.service_other:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+
+# ---------- автомодерация (catch-all, регистрируется последним) ----------
+
+@router.message()
+@router.edited_message()
+async def moderate(message: Message, bot: Bot) -> None:
+    chat = message.chat
+
+    user = message.from_user
+
+    # статистику ведём и по бэклогу: сообщения-то были
+    if user is not None and not user.is_bot and message.edit_date is None:
+        await db.msg_inc(chat.id, user.id, user.username, user.first_name)
+
+    # а вот модерировать задним числом не надо — админы уже всё разрулили
+    if stale(message):
+        return
+
+    s = await db.get_settings(chat.id)
+
+    # --- сообщения от имени канала/группы (sender_chat) ---
+    if message.sender_chat is not None:
+        # анонимный админ этого же чата — ок; автопересылка из привязанного канала — ок
+        if message.sender_chat.id == chat.id or message.is_automatic_forward:
+            return
+        sender_scopes = await db.wl_scopes_for(
+            chat.id, message.sender_chat.id, message.sender_chat.username
+        )
+        if not s.anon_on or sender_scopes & {"all", "anon"}:
+            return
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        try:
+            await bot.ban_chat_sender_chat(chat.id, message.sender_chat.id)
+        except Exception:
+            logger.warning("ban_chat_sender_chat failed in %s", chat.id, exc_info=True)
+            return
+        title = message.sender_chat.title or str(message.sender_chat.id)
+        pid = await db.add_punishment(
+            chat.id, message.sender_chat.id, message.sender_chat.username, title,
+            "banchan", "сообщение от имени канала/группы", None, None,
+        )
+        card = (
+            f"📛 <b>Бан отправителя-канала</b> · {utils.esc(chat.title)}\n"
+            f"📢 {utils.esc(title)} (<code>{message.sender_chat.id}</code>)\n"
+            f"📎 Причина: сообщение от имени канала/группы\n"
+            f"🤖 Кем: Gremlin (автомод)"
+        )
+        await db.add_event(chat.id, "anon", f"banchan: {title} ({message.sender_chat.id})")
+        await moderation.send_card(bot, chat.id, config.BIT_ANON, card, pid, "banchan")
+        return
+
+    if user is None or user.is_bot and user.id == bot.id:
+        return
+
+    # Ниже — только модерация, и от неё освобождены владелец бота, админы чата
+    # и вайтлист. Но триггеры — развлекательная штука, они должны работать
+    # для всех, поэтому перед выходом всё равно даём им сработать.
+    if user.id in config.ADMIN_IDS:
+        await fire_trigger(bot, message, s)
+        return
+    if user.id in await adm_cache.chat_admin_ids(bot, chat.id):
+        await fire_trigger(bot, message, s)
+        return
+    scopes = await db.wl_scopes_for(chat.id, user.id, user.username)
+    if "all" in scopes:
+        await fire_trigger(bot, message, s)
+        return
+
+    # --- медиа-фильтры (удаление без наказания) ---
+    if s.media_on and s.media_mask:
+        for bit, attr, _label in config.MEDIA_BITS:
+            if s.media_mask & bit and getattr(message, attr, None) is not None:
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+                return
+
+    # --- инлайн-боты (via_bot) ---
+    if (s.inline_on and message.via_bot is not None and "inline" not in scopes
+            and not await db.inline_wl_allowed(
+                chat.id, message.via_bot.username, message.via_bot.id)):
+        await moderation.violation(
+            bot, message, config.BIT_INLINE, "инлайн-бот",
+            s.inline_punish, s.inline_mute_min, f"@{message.via_bot.username}",
+        )
+        return
+
+    # --- пересылки из каналов ---
+    if s.forwards_on and message.forward_origin is not None and "links" not in scopes:
+        origin = message.forward_origin
+        origin_chat = getattr(origin, "chat", None)
+        if origin_chat is not None and origin_chat.type == "channel":
+            origin_scopes = await db.wl_scopes_for(
+                chat.id, origin_chat.id, origin_chat.username
+            )
+            if not origin_scopes & {"all", "anon", "links"}:
+                await moderation.violation(
+                    bot, message, config.BIT_LINKS, "пересылка из канала",
+                    s.links_punish, s.links_mute_min, utils.esc(origin_chat.title or ""),
+                )
+                return
+
+    # «свои» цели: этот чат (по нику и по t.me/c/<id>), привязанный канал, сам бот
+    own_names, own_ids = set(), set()
+    if s.links_on or s.extlinks_on:
+        me = await bot.me()
+        own_names = {me.username, chat.username}
+        own_ids = {chat.id}
+        linked_id, linked_name = await adm_cache.linked_chat(bot, chat.id)
+        if linked_id:
+            own_ids.add(linked_id)
+        if linked_name:
+            own_names.add(linked_name)
+        for r in await db.wl_list(chat.id):    # разрешённые каналы — тоже свои
+            if r["user_id"] and r["scope"] in ("all", "anon", "links"):
+                own_ids.add(r["user_id"])
+        for r in await db.link_wl_list(chat.id):   # свой список разрешённых ссылок
+            if r["target_id"]:
+                own_ids.add(r["target_id"])
+            if r["username"]:
+                own_names.add(r["username"])
+
+    # --- ссылки на чужие тг-чаты/каналы ---
+    if s.links_on and "links" not in scopes:
+        links = [
+            l for l in filters.find_tg_links(message)
+            if not filters.link_allowed(l, own_names, own_ids)
+        ]
+        if links:
+            await moderation.violation(
+                bot, message, config.BIT_LINKS, "ссылка на сторонний чат",
+                s.links_punish, s.links_mute_min, links[0],
+            )
+            return
+        # опционально: @упоминания каналов/групп (упоминания людей всегда ок)
+        if s.mentions_check:
+            known = {u.lower() for u in own_names if u}
+            for uname in filters.mentions_in(message):
+                if uname.lower() in known:
+                    continue
+                ctype = await adm_cache.username_chat_type(bot, uname)
+                if ctype in ("channel", "supergroup", "group"):
+                    await moderation.violation(
+                        bot, message, config.BIT_LINKS, "упоминание стороннего чата",
+                        s.links_punish, s.links_mute_min, f"@{uname}",
+                    )
+                    return
+
+    # --- внешние ссылки (любые сайты) ---
+    if s.extlinks_on and "links" not in scopes:
+        ext = [
+            l for l in filters.find_ext_links(message)
+            if not filters.link_allowed(l, own_names, own_ids)
+        ]
+        if ext:
+            await moderation.violation(
+                bot, message, config.BIT_LINKS, "внешняя ссылка",
+                s.links_punish, s.links_mute_min, ext[0],
+            )
+            return
+
+    # --- стоп-слова ---
+    text = message.text or message.caption or ""
+    if s.words_on and text and "words" not in scopes:
+        word = await filters.match_stopword(chat.id, text)
+        # words_guests: фильтр только для тех, кто в чате не состоит (комментаторы
+        # под постами привязанного канала). Проверяем после поиска слова —
+        # запрос к API нужен лишь когда слово реально нашлось.
+        if word and s.words_guests and await adm_cache.is_member(bot, chat.id, user.id):
+            word = None
+        if word:
+            await moderation.violation(
+                bot, message, config.BIT_WORDS, "стоп-слово",
+                s.words_punish, s.words_mute_min, word,
+            )
+            return
+
+    # --- антифлуд (только новые сообщения, не редактирования) ---
+    if s.flood_on and message.edit_date is None and "flood" not in scopes:
+        if filters.flood_hit(chat.id, user.id, s.flood_msgs, s.flood_window):
+            await moderation.violation(
+                bot, message, config.BIT_FLOOD, "флуд",
+                "mute", s.flood_mute_min,
+                f"{s.flood_msgs} сообщений за {s.flood_window} сек",
+            )
+            return
+
+    # --- наблюдение за профилями (специфичные правила уже отработали) ---
+    if s.watch_on and "watch" not in scopes:
+        await watch.check_user(bot, chat, user, s, message)
+
+    # --- триггеры (последними: на удалённое модерацией не отвечаем) ---
+    await fire_trigger(bot, message, s)

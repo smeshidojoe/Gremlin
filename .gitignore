@@ -1,0 +1,50 @@
+# секреты и локальные настройки
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# бэкапы версий бота
+backup_v1/
+backup_*/
+
+# базы и их WAL-файлы
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.db
+*.db-shm
+*.db-wal
+*.session
+*.session-journal
+
+# данные бота: скачанные медиа триггеров и т.п.
+data/
+
+# логи и отчёты
+*.log
+report_*.html
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# мусор от слияний и правок
+*.orig
+*.rej
+*.bak
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

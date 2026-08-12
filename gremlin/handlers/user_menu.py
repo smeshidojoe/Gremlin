@@ -1,0 +1,1790 @@
+"""Личное меню владельца чатов: настройка всех функций. Всё в одном сообщении."""
+import asyncio
+import logging
+import os
+
+from aiogram import Bot, F, Router
+from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+    Message, ReplyKeyboardRemove, WebAppInfo,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+from .. import config, db, schema, utils
+from ..services import filters as flt, resolve, triggers
+
+logger = logging.getLogger("gremlin.user_menu")
+
+router = Router()
+router.message.filter(F.chat.type == "private")
+
+
+class Input(StatesGroup):
+    wl_target = State()   # ждём id/@username для вайтлиста
+    words = State()       # ждём стоп-слова
+    welcome = State()     # ждём текст приветствия
+    trig_phrase = State() # ждём фразу триггера
+    trig_reply = State()  # ждём ответ триггера (текст/медиа)
+    pick_log = State()    # ждём выбор лог-чата (нативный пикер)
+    access = State()      # ждём id/@username для доступа к боту
+    cmd_name = State()      # ждём команду счётчика
+    cmd_template = State()  # ждём заготовку ответа
+    cmd_edit = State()      # ждём новую заготовку
+    digest_to = State()     # ждём id получателя недельной сводки
+    inline_wl = State()     # ждём @username разрешённого инлайн-бота
+    link_wl = State()       # ждём чат/канал для вайтлиста ссылок
+    trig_edit_phrase = State()  # ждём новую фразу триггера
+    trig_edit_reply = State()   # ждём новый ответ триггера
+
+
+_HOME_TEXT = "<b>🧌 Gremlin</b>\n\nМодерация и мониторинг чатов."
+
+# ---------- вьюхи (текст + клавиатура) ----------
+
+_ADD_RIGHTS = "delete_messages+restrict_members+invite_users+pin_messages+manage_chat"
+
+# имена системных команд бота — занимать их пользовательскими нельзя
+_RESERVED_CMDS = {
+    "mute", "мут", "ban", "бан", "warn", "варн", "пред", "unwarn", "снятьварн",
+    "report", "репорт", "жалоба", "unmute", "размут", "unban", "разбан",
+}
+
+
+async def view_home(user_id: int, bot: Bot) -> tuple[str, InlineKeyboardMarkup]:
+    """Единое меню — одинаковое для всех допущенных."""
+    b = InlineKeyboardBuilder()
+    b.button(text="💬 Чаты", callback_data="u:chats")
+    if config.WEBAPP_URL:
+        b.button(text="🖥 Открыть в приложении", web_app=WebAppInfo(url=config.WEBAPP_URL))
+    b.button(text="📜 Лог событий", callback_data="a:log")
+    b.button(text="🐞 Ошибки", callback_data="a:errors")
+    b.button(text="⚙️ Состояние", callback_data="a:health")
+    if user_id in config.ADMIN_IDS:
+        # управление доступом — граница доверия, только владелец бота
+        b.button(text="👥 Доступ к боту", callback_data="u:acc")
+    b.button(text="✖️ Закрыть", callback_data="u:close")
+    b.adjust(1, 1, 2, 1, 1, 1)
+    return _HOME_TEXT, b.as_markup()
+
+
+async def view_chats(bot: Bot) -> tuple[str, InlineKeyboardMarkup]:
+    """Рабочие чаты бота (лог-чаты сюда не попадают — они внутри своих чатов)."""
+    me = await bot.me()
+    chats = await db.moderated_chats()
+    b = InlineKeyboardBuilder()
+    if chats:
+        text = f"<b>💬 Чаты</b> ({len(chats)})\n\nВыберите чат — откроются его данные и настройки."
+        for c in chats:
+            b.button(text=c["title"] or str(c["chat_id"]), callback_data=f"u:c:{c['chat_id']}")
+    else:
+        text = "<b>💬 Чаты</b>\n\nПока пусто. Добавьте бота в чат администратором."
+    b.button(
+        text="➕ Добавить в чат",
+        url=f"https://t.me/{me.username}?startgroup=true&admin={_ADD_RIGHTS}",
+    )
+    b.button(text="⬅️ Назад", callback_data="u:home")
+    b.adjust(1)
+    return text, b.as_markup()
+
+
+async def view_access() -> tuple[str, InlineKeyboardMarkup]:
+    """Кому разрешено пользоваться ботом (только для владельца бота)."""
+    rows = await db.access_list()
+    b = InlineKeyboardBuilder()
+    text = (
+        "<b>👥 Доступ к боту</b>\n\n"
+        "Здесь список тех, кому разрешено настраивать боты и чаты. "
+        "Добавляйте по числовому id или @username.\n"
+        f"Записей: <b>{len(rows)}</b>"
+    )
+    b.button(text="➕ Добавить", callback_data="u:acca")
+    for r in rows:
+        who = await db.user_label(r["user_id"], r["username"])
+        b.button(text=f"❌ {who}", callback_data=f"u:accd:{r['id']}")
+    b.button(text="⬅️ Назад", callback_data="u:home")
+    b.adjust(1)
+    return text, b.as_markup()
+
+
+async def _log_chat_label(log_chat_id: int | None) -> str:
+    """«Название (id)» — название берём из базы чатов, если бот там же."""
+    if not log_chat_id:
+        return "<b>не задан</b>"
+    ch = await db.get_chat(log_chat_id)
+    if ch and ch["title"]:
+        return f"{utils.esc(ch['title'])} (<code>{log_chat_id}</code>)"
+    return f"<code>{log_chat_id}</code>"
+
+
+async def view_chat(cid: int, viewer_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Мини-дашборд чата: данные + сводка настроек + кнопки разделов."""
+    ch = await db.get_chat(cid)
+    s = await db.get_settings(cid)
+    st = await db.chat_stats(cid)
+    pun = await db.active_punishments_count(cid)
+    marks = [f"{'✅' if getattr(s, key) else '🚫'} {lbl}" for key, lbl in schema.OVERVIEW]
+    half = (len(marks) + 1) // 2
+    text = (
+        f"<b>⚙️ {utils.esc(ch['title'] if ch else str(cid))}</b>\n"
+        f"<code>{cid}</code>\n\n"
+        f"💬 Сообщений: сегодня <b>{st['d1']}</b> · за 7д <b>{st['d7']}</b>\n"
+        f"👥 За 7д: пришло <b>{st['joins']}</b> · ушло <b>{st['leaves']}</b>\n"
+        f"🔨 Наказаний: активных <b>{pun}</b> · за 7д <b>{st['pun7']}</b>\n"
+        f"🪪 Лог-чат: {await _log_chat_label(s.log_chat_id)}\n\n"
+        f"{' · '.join(marks[:half])}\n{' · '.join(marks[half:])}"
+    )
+    b = InlineKeyboardBuilder()
+    b.button(text="🤖 Инлайн-боты", callback_data=f"u:s:{cid}:inline")
+    b.button(text="🔗 Ссылки", callback_data=f"u:s:{cid}:links")
+    b.button(text="📛 Анонимы", callback_data=f"u:s:{cid}:anon")
+    b.button(text="🧨 Стоп-слова", callback_data=f"u:s:{cid}:words")
+    b.button(text="🌊 Антифлуд", callback_data=f"u:s:{cid}:flood")
+    b.button(text="🤖 Капча", callback_data=f"u:s:{cid}:captcha")
+    b.button(text="👁 Наблюдение", callback_data=f"u:s:{cid}:watch")
+    b.button(text="👋 Приветствие", callback_data=f"u:s:{cid}:welcome")
+    b.button(text="🖼 Медиа-фильтры", callback_data=f"u:s:{cid}:media")
+    b.button(text="🎯 Триггеры", callback_data=f"u:s:{cid}:triggers")
+    b.button(text="🔢 Счётчики", callback_data=f"u:s:{cid}:cmds")
+    from ..services import digest as _dg
+    if _dg.tracked_chat() == cid:          # подробная статистика — только этот чат
+        b.button(text="📊 Недельная сводка", callback_data=f"u:s:{cid}:digest")
+    b.button(text="🧹 Системные", callback_data=f"u:s:{cid}:service")
+    b.button(text="🕊 Вайтлист", callback_data=f"u:s:{cid}:wl")
+    b.button(text="🪪 Карточки и лог", callback_data=f"u:s:{cid}:cards")
+    b.button(text="🚫 Наказания", callback_data=f"u:p:{cid}:0")
+    b.button(text="📈 Статистика", callback_data=f"u:st:{cid}")
+    b.button(text="📜 Лог чата", callback_data=f"a:clog:{cid}")
+    log_ch = await db.get_chat(s.log_chat_id) if s.log_chat_id else None
+    log_name = (log_ch["title"] if log_ch and log_ch["title"]
+                else (str(s.log_chat_id) if s.log_chat_id else "не задан"))
+    b.button(text=f"📍 Лог-чат: {log_name}", callback_data=f"u:logsel:{cid}")
+    b.button(text="🚪 Убрать бота из чата", callback_data=f"a:leave:{cid}")
+    b.button(text="⬅️ Назад", callback_data="u:chats")
+    b.adjust(2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1)
+    return text, b.as_markup()
+
+
+def _btn(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+# ---------- ввод внутри одного сообщения ----------
+#
+# Все «добавь что-нибудь» работают одинаково: вопрос подменяет текст текущего меню,
+# ответ юзера удаляется, на его месте снова меню. Переписка не растёт.
+
+async def _ask(cb: CallbackQuery, state: FSMContext, st, prompt: str,
+               back: str, **data) -> None:
+    """Задать вопрос прямо в открытом меню и запомнить, какое сообщение править."""
+    await state.set_state(st)
+    await state.update_data(msg_id=cb.message.message_id, back=back, **data)
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Отмена", callback_data=back)
+    await cb.message.edit_text(prompt, reply_markup=b.as_markup())
+    await cb.answer()
+
+
+async def _edit_menu(message: Message, bot: Bot, state: FSMContext,
+                     text: str, kb: InlineKeyboardMarkup | None) -> None:
+    """Убрать сообщение юзера и перерисовать меню на прежнем месте."""
+    data = await state.get_data()
+    msg_id = data.get("msg_id")
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    if msg_id:
+        try:
+            await bot.edit_message_text(
+                text, chat_id=message.chat.id, message_id=msg_id, reply_markup=kb
+            )
+            return
+        except Exception:
+            pass  # сообщение удалили/устарело — покажем новым
+    await message.answer(text, reply_markup=kb)
+
+
+async def _retry(message: Message, bot: Bot, state: FSMContext, prompt: str) -> None:
+    """Ввод не подошёл — оставляем вопрос на месте с пометкой."""
+    data = await state.get_data()
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Отмена", callback_data=data.get("back", "u:home"))
+    await _edit_menu(message, bot, state, prompt, b.as_markup())
+
+
+async def _done(message: Message, bot: Bot, state: FSMContext,
+                view: tuple[str, InlineKeyboardMarkup], note: str = "") -> None:
+    """Завершить ввод: показать раздел на месте и сбросить состояние."""
+    await _edit_menu(message, bot, state, note + view[0], view[1])
+    await state.clear()
+
+
+def _digest_state() -> str:
+    """Строка о состоянии базы статистики — сколько участников и когда обновляли."""
+    from ..services import digest
+    d = digest.collect(config.STATS_DB)
+    if d is None:
+        return "\n\n⚠️ База статистики не найдена."
+    full = d.get("days", 7) >= 7
+    silent_label = "молчали всю неделю" if full else "пока не писали на этой неделе"
+    return (
+        f"\n\n👥 Участников сейчас: <b>{d['members']}</b> · "
+        f"{silent_label}: <b>{len(d['silent'])}</b>\n"
+        f"<i>неделя {d.get('period', '—')} · данные обновлены: {d['updated']}</i>"
+    )
+
+
+async def view_section(cid: int, sec: str) -> tuple[str, InlineKeyboardMarkup]:
+    section = schema.SECTION_BY_KEY.get(sec)
+    if section is None:
+        b = InlineKeyboardBuilder()
+        b.row(_btn("⬅️ Назад", f"u:c:{cid}"))
+        return f"Неизвестный раздел: {sec}", b.as_markup()
+
+    s = await db.get_settings(cid)
+    ch = await db.get_chat(cid)
+    title = utils.esc(ch["title"] if ch else str(cid))
+    b = InlineKeyboardBuilder()
+
+    # --- заголовок + пояснение + статусные строки из схемы ---
+    lines = [f"<b>{section.title}</b> · {title}\n", section.intro, ""]
+    for f in section.fields:
+        if not schema.visible(f, s):
+            continue
+        lines.append(f"{f.label}: <b>{schema.value_label(f, getattr(s, f.key))}</b>")
+    text = "\n".join(lines).rstrip()
+    if sec == "digest":
+        text += await asyncio.to_thread(_digest_state)
+
+    # --- кнопки полей: тумблеры отдельными рядами, селекторы рядом ◀ знач ▶ ---
+    for f in section.fields:
+        if not schema.visible(f, s):
+            continue
+        if f.kind == "toggle":
+            b.row(_btn(f"{schema.value_label(f, getattr(s, f.key))} · {f.label}",
+                       f"u:t:{cid}:{f.key}"))
+        else:
+            b.row(
+                _btn("◀", f"u:y:{cid}:{f.key}:-"),
+                _btn(f"{f.label}: {schema.value_label(f, getattr(s, f.key))}",
+                     f"u:y:{cid}:{f.key}:+"),
+                _btn("▶", f"u:y:{cid}:{f.key}:+"),
+            )
+
+    # --- кастомные виджеты (списки / выбор лог-чата / биты карточек) ---
+    for w in section.widgets:
+        await _render_widget(b, cid, w, s)
+
+    b.row(_btn("⬅️ Назад", f"u:c:{cid}"))
+    return text, b.as_markup()
+
+
+async def _render_widget(b: InlineKeyboardBuilder, cid: int, widget: str, s) -> None:
+    """Списочные части разделов, которые не сводятся к простому полю."""
+    if widget == "anon":
+        allowed = [r for r in await db.wl_list(cid) if r["scope"] in ("all", "anon")]
+        b.row(_btn(f"🕊 Разрешённые отправители: {len(allowed)}", f"u:s:{cid}:wl"))
+
+    elif widget == "link_wl":
+        n = len(await db.link_wl_list(cid))
+        b.row(_btn(f"🔓 Разрешённые чаты и каналы: {n}", f"u:lw:{cid}"))
+
+    elif widget == "inline_wl":
+        b.row(_btn("➕ Разрешить бота", f"u:ila:{cid}"))
+        for r in await db.inline_wl_list(cid):
+            b.row(_btn(f"❌ @{r['username']}", f"u:ild:{cid}:{r['id']}"))
+
+    elif widget == "words":
+        n = len(await db.words_list(cid))
+        b.row(_btn(f"📝 Список слов: {n}", f"u:wd:{cid}:0"))
+        b.row(_btn("➕ Добавить слова", f"u:wda:{cid}"))
+
+    elif widget == "wl":
+        b.row(_btn("➕ Добавить", f"u:wla:{cid}"))
+        for e in await db.wl_entries(cid):
+            who = e["title"] or await db.user_label(e["user_id"], e["username"])
+            b.row(_btn(f"👤 {who} · {_wl_scopes_label(e['scopes'])}",
+                       f"u:wle:{cid}:{e['row_id']}"))
+
+    elif widget == "logsel":
+        log_str = str(s.log_chat_id) if s.log_chat_id else "не задан"
+        b.row(_btn(f"📍 Лог-чат: {log_str}", f"u:logsel:{cid}"))
+
+    elif widget == "cardbits":
+        row = []
+        for bit, label in config.CARD_BITS:
+            on = bool(s.card_mask & bit)
+            row.append(_btn(f"{'✅' if on else '🚫'} {label}", f"u:cb:{cid}:{bit}"))
+            if len(row) == 2:
+                b.row(*row)
+                row = []
+        if row:
+            b.row(*row)
+
+    elif widget == "welcome_text":
+        mark = "задано" if s.welcome_text else "не задано"
+        b.row(_btn(f"✏️ Текст приветствия ({mark})", f"u:wtxt:{cid}"))
+
+    elif widget == "digest_to":
+        who = await db.user_label(s.digest_to) if s.digest_to else "не задан"
+        b.row(_btn(f"👤 Получатель: {who}", f"u:dig:{cid}"))
+        if s.digest_to:
+            b.row(_btn("📤 Обновить сводку сейчас", f"u:dignow:{cid}"))
+            b.row(_btn("🚫 Убрать получателя", f"u:digoff:{cid}"))
+
+    elif widget == "mediabits":
+        row = []
+        for bit, _key, label in config.MEDIA_BITS:
+            on = bool(s.media_mask & bit)
+            row.append(_btn(f"{'🗑' if on else '▫️'} {label}", f"u:mb:{cid}:{bit}"))
+            if len(row) == 2:
+                b.row(*row)
+                row = []
+        if row:
+            b.row(*row)
+
+    elif widget == "trigs":
+        b.row(_btn("➕ Добавить триггер", f"u:tga:{cid}"))
+        for r in await db.trig_list(cid):
+            kind = "💬" if not r["file_path"] else "🖼"
+            b.row(_btn(f"{kind} {r['phrase'][:30]}", f"u:tgv:{cid}:{r['id']}"))
+
+    elif widget == "cmds":
+        b.row(_btn("➕ Добавить счётчик", f"u:cma:{cid}"))
+        for r in await db.cmd_list(cid):
+            b.row(_btn(f"{r['cmd']} · [{r['count']}]", f"u:cmv:{cid}:{r['id']}"))
+
+
+# уровни вайтлиста без «полного игнора» — он тумблер над всеми остальными
+WL_PARTS = tuple(s for s in config.WL_SCOPES if s != "all")
+
+
+def _wl_effective(scopes: set[str]) -> set[str]:
+    """Что реально отмечено галочками: «полный игнор» зажигает все."""
+    return set(WL_PARTS) if "all" in scopes else {s for s in scopes if s in WL_PARTS}
+
+
+def _wl_scopes_label(scopes: set[str]) -> str:
+    if "all" in scopes:
+        return "полный игнор"
+    on = _wl_effective(scopes)
+    if len(on) == 1:
+        return config.WL_SCOPE_LABELS[next(iter(on))]
+    return f"{len(on)} из {len(WL_PARTS)}"
+
+
+def _wl_pack(on: set[str]) -> set[str]:
+    """Набор галочек -> строки в базе. Все отмечены — храним одним 'all'."""
+    if on >= set(WL_PARTS):
+        return {"all"}
+    return set(on)
+
+
+async def view_wl_entry(cid: int, row_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    """Карточка записи вайтлиста: галочками отмечаем, что для неё не проверять."""
+    e = await db.wl_entry(cid, row_id)
+    if e is None:
+        return None
+    who = e["title"] or await db.user_label(e["user_id"], e["username"])
+    ident = f"<code>{e['user_id']}</code>" if e["user_id"] else f"@{utils.esc(e['username'])}"
+    on = _wl_effective(e["scopes"])
+    text = (
+        f"<b>🕊 {utils.esc(who)}</b> · {ident}\n\n"
+        "Отмеченное для него не проверяется. «Полный игнор» включает всё сразу; "
+        "снимите с него галочку у любого пункта — останутся только выбранные.\n"
+        f"Сейчас: <b>{_wl_scopes_label(e['scopes'])}</b>"
+    )
+    b = InlineKeyboardBuilder()
+    b.row(_btn(f"{'✅' if 'all' in e['scopes'] else '☐'} {config.WL_SCOPE_LABELS['all']}",
+               f"u:wlt:{cid}:{row_id}:all"))
+    row = []
+    for scope in WL_PARTS:
+        mark = "✅" if scope in on else "☐"
+        row.append(_btn(f"{mark} {config.WL_SCOPE_LABELS[scope]}", f"u:wlt:{cid}:{row_id}:{scope}"))
+        if len(row) == 2:
+            b.row(*row)
+            row = []
+    if row:
+        b.row(*row)
+    b.row(_btn("🗑 Убрать из вайтлиста", f"u:wld:{cid}:{row_id}"))
+    b.row(_btn("⬅️ Назад", f"u:s:{cid}:wl"))
+    return text, b.as_markup()
+
+
+WORDS_PER_PAGE = 12
+
+
+def _word_label(word: str, mode: str) -> str:
+    return f"{word}{'*' if mode == 'stem' else ''}"
+
+
+async def view_words(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """Стоп-слова отдельной страницей: в разделе список не помещался.
+
+    Слова показываем текстом (там видно целиком), кнопки — только для удаления,
+    по номеру из этого же списка.
+    """
+    rows = await db.words_list(cid)
+    pages = max(1, -(-len(rows) // WORDS_PER_PAGE))
+    page = max(0, min(page, pages - 1))
+    start = page * WORDS_PER_PAGE
+    chunk = rows[start:start + WORDS_PER_PAGE]
+
+    lines = [
+        "<b>🧨 Список стоп-слов</b>\n",
+        "Слово со звёздочкой ловит любые окончания. Кнопка с номером удаляет слово.",
+        f"\nВсего: <b>{len(rows)}</b>" + (f" · страница {page + 1} из {pages}" if pages > 1 else ""),
+        "",
+    ]
+    b = InlineKeyboardBuilder()
+    if not rows:
+        lines.append("Пусто — ни одного слова.")
+    for i, r in enumerate(chunk, start + 1):
+        lines.append(f"{i}. <code>{utils.esc(_word_label(r['word'], r['mode']))}</code>")
+
+    row = []
+    for i, r in enumerate(chunk, start + 1):
+        label = _word_label(r["word"], r["mode"])
+        row.append(_btn(f"❌ {i}. {label[:18]}", f"u:wdd:{cid}:{page}:{r['id']}"))
+        if len(row) == 2:
+            b.row(*row)
+            row = []
+    if row:
+        b.row(*row)
+
+    if pages > 1:
+        nav = [
+            _btn("⬅️", f"u:wd:{cid}:{page - 1}" if page else f"u:wd:{cid}:{pages - 1}"),
+            _btn(f"{page + 1}/{pages}", f"u:wd:{cid}:{page}"),
+            _btn("➡️", f"u:wd:{cid}:{page + 1}" if page + 1 < pages else f"u:wd:{cid}:0"),
+        ]
+        b.row(*nav)
+    b.row(_btn("➕ Добавить слова", f"u:wda:{cid}"))
+    if rows:
+        b.row(_btn("🗑 Очистить список", f"u:wdc:{cid}"))
+    b.row(_btn("⬅️ Назад", f"u:s:{cid}:words"))
+    return "\n".join(lines), b.as_markup()
+
+
+async def view_punishments(cid: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    per = 8
+    total = await db.active_punishments_count(cid)
+    rows = await db.active_punishments(cid, limit=per, offset=page * per)
+    ch = await db.get_chat(cid)
+    title = utils.esc(ch["title"] if ch else str(cid))
+    lines = [f"<b>🚫 Активные наказания</b> · {title}\n"]
+    b = InlineKeyboardBuilder()
+    if not rows:
+        lines.append("Пусто — все чисты.")
+    for r in rows:
+        who = r["name"] or await db.user_label(r["user_id"], r["username"])
+        lines.append(
+            f"• {utils.esc(who)} — <b>{r['kind']}</b> до {utils.fmt_ts(r['until_ts'])}\n"
+            f"  причина: {utils.esc(r['reason'] or '—')}"
+        )
+        b.button(text=f"🔓 Снять: {who}", callback_data=f"u:pu:{cid}:{r['id']}")
+    b.adjust(1)
+    nav = []
+    if page > 0:
+        nav.append(("⬅️ Раньше", f"u:p:{cid}:{page - 1}"))
+    if (page + 1) * per < total:
+        nav.append(("Позже ➡️", f"u:p:{cid}:{page + 1}"))
+    if nav:
+        b.row(*[_btn(t, d) for t, d in nav])
+    b.row(_btn("⬅️ Назад", f"u:c:{cid}"))
+    return "\n".join(lines), b.as_markup()
+
+
+# ---------- входные точки ----------
+
+async def _drop_reply_kb(message: Message) -> None:
+    """Снять «залипшую» reply-клавиатуру пикера, если юзер бросил выбор чата.
+    Убрать её можно только вместе с сообщением — шлём пустышку и сразу удаляем."""
+    try:
+        m = await message.answer("⌛", reply_markup=ReplyKeyboardRemove())
+        await m.delete()
+    except Exception:
+        pass
+
+
+@router.message(CommandStart())
+@router.message(Command("menu"))
+async def cmd_menu(message: Message, state: FSMContext, bot: Bot) -> None:
+    if await db.is_bot_banned(message.from_user.id):
+        return
+    # клавиатуру пикера снимаем только если она реально могла остаться —
+    # иначе на каждый /start мелькала бы пустышка
+    if await state.get_state() == Input.pick_log.state:
+        await _drop_reply_kb(message)
+    await state.clear()
+    text, kb = await view_home(message.from_user.id, bot)
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "u:home")
+@router.callback_query(F.data == "a:home")  # алиас: админ-разделы возвращают сюда же
+async def cb_home(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    was_picking = await state.get_state() in (Input.pick_log.state,)
+    await state.clear()
+    if was_picking:
+        await _drop_reply_kb(cb.message)
+    text, kb = await view_home(cb.from_user.id, bot)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "u:chats")
+async def cb_chats(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    was_picking = await state.get_state() in (Input.pick_log.state,)
+    await state.clear()
+    if was_picking:
+        await _drop_reply_kb(cb.message)
+    text, kb = await view_chats(bot)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "u:close")
+async def cb_close(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    try:
+        await cb.message.delete()
+    except Exception:
+        # старше 48 часов Telegram удалять не даёт — просто гасим меню
+        try:
+            await cb.message.edit_text("Меню закрыто.", reply_markup=None)
+        except Exception:
+            pass
+    await cb.answer()
+
+
+# ---------- доступ к боту (только владелец бота) ----------
+
+@router.callback_query(F.data == "u:acc")
+async def cb_access(cb: CallbackQuery, state: FSMContext) -> None:
+    if cb.from_user.id not in config.ADMIN_IDS:
+        await cb.answer("Нет доступа.", show_alert=True)
+        return
+    await state.clear()
+    text, kb = await view_access()
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "u:acca")
+async def cb_access_add(cb: CallbackQuery, state: FSMContext) -> None:
+    if cb.from_user.id not in config.ADMIN_IDS:
+        await cb.answer("Нет доступа.", show_alert=True)
+        return
+    await _ask(
+        cb, state, Input.access,
+        "<b>👥 Доступ к боту</b>\n\nПришлите числовой <b>id</b> или <b>@username</b> "
+        "того, кому открыть доступ.",
+        "u:acc",
+    )
+
+
+@router.message(StateFilter(Input.access))
+async def access_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        await _done(message, bot, state, await view_access())
+        return
+    user_id, username = None, None
+    if text.lstrip("-").isdigit():
+        user_id = int(text)
+    elif text.startswith("@") and len(text) > 3:
+        username = text
+        user_id, _ = await resolve.by_username(bot, text)   # закрепляем id, если нашли
+    else:
+        await _retry(message, bot, state,
+                     "<b>👥 Доступ к боту</b>\n\n⚠️ Нужен числовой id или @username.")
+        return
+    await db.access_add(user_id, username)
+    note = "✅ Добавлено.\n\n" if user_id else "✅ Добавлено (id узнать не вышло — сверяю по нику).\n\n"
+    await _done(message, bot, state, await view_access(), note)
+
+
+@router.callback_query(F.data.startswith("u:accd:"))
+async def cb_access_del(cb: CallbackQuery) -> None:
+    if cb.from_user.id not in config.ADMIN_IDS:
+        await cb.answer("Нет доступа.", show_alert=True)
+        return
+    await db.access_remove(int(cb.data.split(":")[2]))
+    text, kb = await view_access()
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer("Удалено")
+
+
+async def _guard(cb: CallbackQuery, cid: int) -> bool:
+    """Доступ к боту уже проверен мидлварью — все допущенные равны в правах."""
+    return True
+
+
+@router.callback_query(F.data.startswith("u:c:"))
+async def cb_chat(cb: CallbackQuery, state: FSMContext) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    await state.clear()
+    text, kb = await view_chat(cid, cb.from_user.id)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:s:"))
+async def cb_section(cb: CallbackQuery, state: FSMContext) -> None:
+    _, _, cid, sec = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    await state.clear()
+    if sec == "digest":
+        from ..services import digest
+        if digest.tracked_chat() != cid:
+            await cb.answer(
+                "Подробная статистика ведётся только для профильного чата. "
+                "Здесь доступна базовая — раздел «📈 Статистика».",
+                show_alert=True,
+            )
+            return
+        # состав чата знает только юзербот — обновляем перед показом,
+        # иначе в молчунах будут давно вышедшие
+        from .. import userbot
+        await cb.answer("Обновляю состав…")
+        await userbot.refresh_members()
+    text, kb = await view_section(cid, sec)
+    await cb.message.edit_text(text, reply_markup=kb)
+    if sec != "digest":
+        await cb.answer()
+
+
+# ---------- переключатели и селекторы ----------
+
+async def _rerender(cb: CallbackQuery, cid: int, sec: str) -> None:
+    if sec == "chat":
+        text, kb = await view_chat(cid, cb.from_user.id)
+    else:
+        text, kb = await view_section(cid, sec)
+    await cb.message.edit_text(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("u:t:"))
+async def cb_toggle(cb: CallbackQuery) -> None:
+    _, _, cid, field = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    if field not in schema.TOGGLE_FIELDS:
+        await cb.answer("?", show_alert=True)
+        return
+    s = await db.get_settings(cid)
+    new = 0 if getattr(s, field) else 1
+    await db.set_setting(cid, field, new)
+    await _rerender(cb, cid, schema.FIELD_SECTION[field])
+    await cb.answer("Включено" if new else "Выключено")
+
+
+@router.callback_query(F.data.startswith("u:y:"))
+async def cb_cycle(cb: CallbackQuery) -> None:
+    _, _, cid, field, direction = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    values = schema.CYCLE_FIELDS.get(field)
+    if not values:
+        await cb.answer("?", show_alert=True)
+        return
+    s = await db.get_settings(cid)
+    cur = getattr(s, field)
+    try:
+        idx = values.index(cur)
+    except ValueError:
+        idx = 0
+    idx = (idx + (1 if direction == "+" else -1)) % len(values)
+    await db.set_setting(cid, field, values[idx])
+    await _rerender(cb, cid, schema.FIELD_SECTION[field])
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:cb:"))
+async def cb_card_bit(cb: CallbackQuery) -> None:
+    _, _, cid, bit = cb.data.split(":")
+    cid, bit = int(cid), int(bit)
+    if not await _guard(cb, cid):
+        return
+    s = await db.get_settings(cid)
+    await db.set_setting(cid, "card_mask", s.card_mask ^ bit)
+    await _rerender(cb, cid, "cards")
+    await cb.answer()
+
+
+# ---------- медиа-биты ----------
+
+@router.callback_query(F.data.startswith("u:mb:"))
+async def cb_media_bit(cb: CallbackQuery) -> None:
+    _, _, cid, bit = cb.data.split(":")
+    cid, bit = int(cid), int(bit)
+    if not await _guard(cb, cid):
+        return
+    s = await db.get_settings(cid)
+    await db.set_setting(cid, "media_mask", s.media_mask ^ bit)
+    await _rerender(cb, cid, "media")
+    await cb.answer()
+
+
+# ---------- статистика чата ----------
+
+@router.callback_query(F.data.startswith("u:st:"))
+async def cb_stats(cb: CallbackQuery) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    st = await db.chat_stats(cid)
+    ch = await db.get_chat(cid)
+    lines = [
+        f"<b>📈 Статистика</b> · {utils.esc(ch['title'] if ch else str(cid))}\n",
+        f"💬 Сообщений: сегодня <b>{st['d1']}</b> · за 7д <b>{st['d7']}</b> · всего <b>{st['total']}</b>",
+        f"👥 За 7 дней: пришло <b>{st['joins']}</b> · ушло <b>{st['leaves']}</b>",
+        f"🔨 Наказаний за 7д: <b>{st['pun7']}</b>",
+    ]
+    if st["top"]:
+        lines.append("\n<b>🏆 Топ за неделю:</b>")
+        for i, (uid, cnt) in enumerate(st["top"], 1):
+            u = await db.get_user(uid)
+            # имя + ник, если знаем; голый id — только пока юзер ни разу не писал
+            name = (u["first_name"] if u else None) or ""
+            uname = f"@{u['username']}" if u and u["username"] else ""
+            who = " ".join(x for x in (name, uname) if x) or str(uid)
+            lines.append(f"{i}. {utils.esc(who)} — {cnt}")
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Назад", callback_data=f"u:c:{cid}")
+    await cb.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
+    await cb.answer()
+
+
+# ---------- приветствие и правила (FSM) ----------
+
+@router.callback_query(F.data.startswith("u:wtxt:"))
+async def cb_welcome_text(cb: CallbackQuery, state: FSMContext) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    s = await db.get_settings(cid)
+    cur = f"\n\nСейчас:\n{utils.esc(s.welcome_text)}" if s.welcome_text else ""
+    await _ask(
+        cb, state, Input.welcome,
+        "<b>👋 Текст приветствия</b>\n\nПришлите текст. <code>{name}</code> заменится "
+        "на имя новичка.\nУбрать приветствие — пришлите <code>-</code>." + cur,
+        f"u:s:{cid}:welcome", cid=cid,
+    )
+
+
+@router.message(StateFilter(Input.welcome))
+async def welcome_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    cid = data["cid"]
+    if text != "/cancel":
+        await db.set_setting(cid, "welcome_text", None if text == "-" else text)
+    await _done(message, bot, state, await view_section(cid, "welcome"))
+
+
+
+
+# ---------- триггеры (FSM: фраза -> ответ) ----------
+
+@router.callback_query(F.data.startswith("u:tga:"))
+async def cb_trig_add(cb: CallbackQuery, state: FSMContext) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    if len(await db.trig_list(cid)) >= config.TRIG_LIMIT:
+        await cb.answer(f"Лимит {config.TRIG_LIMIT} триггеров.", show_alert=True)
+        return
+    await _ask(
+        cb, state, Input.trig_phrase,
+        "<b>🎯 Новый триггер</b>\n\nПришлите ключевую фразу (от 3 символов). "
+        "Бот будет искать её внутри сообщений.",
+        f"u:s:{cid}:triggers", cid=cid,
+    )
+
+
+@router.message(StateFilter(Input.trig_phrase))
+async def trig_phrase_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    if text == "/cancel":
+        await _done(message, bot, state, await view_section(data["cid"], "triggers"))
+        return
+    if len(text) < 3:
+        await _retry(message, bot, state,
+                     "<b>🎯 Новый триггер</b>\n\n⚠️ Слишком коротко — нужно от 3 символов.")
+        return
+    await state.set_state(Input.trig_reply)
+    await state.update_data(phrase=text.lower())
+    await _retry(
+        message, bot, state,
+        f"<b>🎯 Новый триггер</b>\n\nФраза: <code>{utils.esc(text)}</code>\n\n"
+        "Теперь пришлите ответ бота — текст или медиа (фото, стикер, гифка, видео, войс).",
+    )
+
+
+@router.message(StateFilter(Input.trig_reply))
+async def trig_reply_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    cid, phrase = data["cid"], data["phrase"]
+    if (message.text or "").strip() == "/cancel":
+        await _done(message, bot, state, await view_section(cid, "triggers"))
+        return
+    if message.text:
+        await db.trig_add(cid, phrase, message.text)
+    else:
+        media = triggers.extract_media(message)
+        if media is None:
+            await _retry(
+                message, bot, state,
+                "<b>🎯 Новый триггер</b>\n\n⚠️ Не понял. Пришлите текст или медиа "
+                "(фото, стикер, гифка, видео, войс).",
+            )
+            return
+        # файл скачиваем сразу — триггер не зависит от сохранности этой переписки
+        path = await triggers.save_media(bot, media.file_id, cid, media.kind)
+        await db.trig_add(cid, phrase, message.caption or None, path, media.kind)
+    note = "✅ Триггер добавлен.\n\n"
+    if not (await db.get_settings(cid)).trig_on:
+        # добавили триггер — значит хотят, чтобы он работал; иначе «добавил, а тишина»
+        await db.set_setting(cid, "trig_on", 1)
+        note = "✅ Триггер добавлен, раздел включён.\n\n"
+    await _done(message, bot, state, await view_section(cid, "triggers"), note)
+
+
+# ---------- недельная сводка ----------
+
+@router.callback_query(F.data.startswith("u:dig:"))
+async def cb_digest_to(cb: CallbackQuery, state: FSMContext) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    await _ask(
+        cb, state, Input.digest_to,
+        "<b>📊 Получатель сводки</b>\n\nПришлите числовой <b>id</b> того, кому слать "
+        "недельную сводку. Он должен хотя бы раз написать боту в личку, иначе "
+        "доставить не выйдет.",
+        f"u:s:{cid}:digest", cid=cid,
+    )
+
+
+@router.message(StateFilter(Input.digest_to))
+async def digest_to_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    cid = data["cid"]
+    if text == "/cancel":
+        await _done(message, bot, state, await view_section(cid, "digest"))
+        return
+    if not text.lstrip("-").isdigit():
+        await _retry(message, bot, state,
+                     "<b>📊 Получатель сводки</b>\n\n⚠️ Нужен числовой id.")
+        return
+    await db.set_setting(cid, "digest_to", int(text))
+    await _done(message, bot, state, await view_section(cid, "digest"), "✅ Получатель задан.\n\n")
+
+
+@router.callback_query(F.data.startswith("u:digoff:"))
+async def cb_digest_off(cb: CallbackQuery) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    await db.set_setting(cid, "digest_to", 0)
+    await _rerender(cb, cid, "digest")
+    await cb.answer("Получатель убран")
+
+
+@router.callback_query(F.data.startswith("u:dignow:"))
+async def cb_digest_now(cb: CallbackQuery, bot: Bot) -> None:
+    from ..services import digest
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    if digest.tracked_chat() != cid:
+        await cb.answer("Сводка ведётся только для профильного чата.", show_alert=True)
+        return
+    s = await db.get_settings(cid)
+    ok = await digest.send_digest(bot, cid, s.digest_to)
+    await cb.answer("Отправлено" if ok else "Не вышло: нет базы статистики или юзер недоступен",
+                    show_alert=not ok)
+
+
+@router.callback_query(F.data.startswith("d:file:"))
+async def cb_digest_file(cb: CallbackQuery, bot: Bot) -> None:
+    """Кнопка под сводкой: собрать и прислать полный HTML-отчёт."""
+    from ..services import digest
+    import asyncio
+    cid = int(cb.data.split(":")[2])
+    if digest.tracked_chat() != cid:
+        await cb.answer("Отчёт есть только по профильному чату.", show_alert=True)
+        return
+    await cb.answer("Собираю отчёт…")
+    try:
+        data = await asyncio.to_thread(digest.build_html, config.STATS_DB)
+    except Exception as e:
+        await cb.message.answer(f"Не удалось собрать отчёт: {e}")
+        return
+    await cb.message.answer_document(
+        BufferedInputFile(data, filename="chat_report.html"),
+        caption="Полный отчёт по чату",
+    )
+
+
+# ---------- счётчики (создание и правка) ----------
+
+async def view_cmd(cid: int, rid: int) -> tuple[str, InlineKeyboardMarkup]:
+    r = await db.cmd_get(rid)
+    b = InlineKeyboardBuilder()
+    if r is None:
+        b.button(text="⬅️ Назад", callback_data=f"u:s:{cid}:cmds")
+        return "Счётчик не найден.", b.as_markup()
+    cd = f"{r['cooldown']} сек" if r["cooldown"] else "без кулдауна"
+    text = (
+        f"<b>🔢 {utils.esc(r['cmd'])}</b>\n\n"
+        f"Ответ: <code>{utils.esc(r['template'])} [{r['count']}]</code>\n"
+        f"Кулдаун: <b>{cd}</b>\n"
+        f"Вызовов: <b>{r['count']}</b>"
+    )
+    b.row(_btn("✏️ Изменить заготовку", f"u:cme:{cid}:{rid}"))
+    values = list(config.CMD_COOLDOWN_PRESETS)
+    b.row(
+        _btn("◀", f"u:cmc:{cid}:{rid}:-"),
+        _btn(f"⏱ {cd}", f"u:cmc:{cid}:{rid}:+"),
+        _btn("▶", f"u:cmc:{cid}:{rid}:+"),
+    )
+    b.row(_btn("🔄 Сбросить счётчик", f"u:cmr:{cid}:{rid}"))
+    b.row(_btn("❌ Удалить счётчик", f"u:cmd:{cid}:{rid}"))
+    b.row(_btn("⬅️ Назад", f"u:s:{cid}:cmds"))
+    return text, b.as_markup()
+
+
+@router.callback_query(F.data.startswith("u:cma:"))
+async def cb_cmd_add(cb: CallbackQuery, state: FSMContext) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    if len(await db.cmd_list(cid)) >= config.CMD_LIMIT:
+        await cb.answer(f"Лимит {config.CMD_LIMIT} счётчиков.", show_alert=True)
+        return
+    await _ask(
+        cb, state, Input.cmd_name,
+        "<b>🔢 Новый счётчик</b>\n\nПришлите команду, например <code>!черви</code>.\n"
+        "Забудете <code>!</code> — допишу сам.",
+        f"u:s:{cid}:cmds", cid=cid,
+    )
+
+
+_CMD_NAME_HEAD = "<b>🔢 Новый счётчик</b>\n\n"
+
+
+@router.message(StateFilter(Input.cmd_name))
+async def cmd_name_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    text = (message.text or "").strip().lower()
+    data = await state.get_data()
+    cid = data["cid"]
+    if text == "/cancel":
+        await _done(message, bot, state, await view_section(cid, "cmds"))
+        return
+    if not text.startswith("!"):
+        text = "!" + text
+    if len(text) < 2 or " " in text:
+        await _retry(message, bot, state, _CMD_NAME_HEAD + "⚠️ Команда должна быть одним словом.")
+        return
+    if text.lstrip("!") in _RESERVED_CMDS:
+        await _retry(message, bot, state,
+                     _CMD_NAME_HEAD + "⚠️ Это системная команда бота, её занять нельзя.")
+        return
+    if await db.cmd_find(cid, text):
+        await _retry(message, bot, state, _CMD_NAME_HEAD + "⚠️ Такой счётчик уже есть.")
+        return
+    await state.set_state(Input.cmd_template)
+    await state.update_data(cmd=text)
+    await _retry(
+        message, bot, state,
+        f"{_CMD_NAME_HEAD}Команда: <code>{utils.esc(text)}</code>\n\n"
+        "Теперь пришлите заготовку ответа. Например <code>кузнечики</code> — бот будет "
+        "отвечать «кузнечики [1]», «кузнечики [2]»… Счётчик в скобках дописывается сам.",
+    )
+
+
+@router.message(StateFilter(Input.cmd_template))
+async def cmd_template_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    cid = data["cid"]
+    if text == "/cancel":
+        await _done(message, bot, state, await view_section(cid, "cmds"))
+        return
+    if not text:
+        await _retry(message, bot, state, _CMD_NAME_HEAD + "⚠️ Нужен текст заготовки.")
+        return
+    await db.cmd_add(cid, data["cmd"], text, 30)
+    note = "✅ Счётчик создан.\n\n"
+    if not (await db.get_settings(cid)).cmds_on:
+        await db.set_setting(cid, "cmds_on", 1)
+        note = "✅ Счётчик создан, раздел включён.\n\n"
+    await _done(message, bot, state, await view_section(cid, "cmds"), note)
+
+
+@router.callback_query(F.data.startswith("u:cmv:"))
+async def cb_cmd_view(cb: CallbackQuery, state: FSMContext) -> None:
+    _, _, cid, rid = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    await state.clear()
+    text, kb = await view_cmd(cid, int(rid))
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:cmc:"))
+async def cb_cmd_cooldown(cb: CallbackQuery) -> None:
+    _, _, cid, rid, direction = cb.data.split(":")
+    cid, rid = int(cid), int(rid)
+    if not await _guard(cb, cid):
+        return
+    r = await db.cmd_get(rid)
+    if r is None:
+        await cb.answer("Счётчик не найден.", show_alert=True)
+        return
+    values = list(config.CMD_COOLDOWN_PRESETS)
+    try:
+        idx = values.index(r["cooldown"])
+    except ValueError:
+        idx = 0
+    idx = (idx + (1 if direction == "+" else -1)) % len(values)
+    await db.cmd_set(rid, "cooldown", values[idx])
+    text, kb = await view_cmd(cid, rid)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:cmr:"))
+async def cb_cmd_reset(cb: CallbackQuery) -> None:
+    _, _, cid, rid = cb.data.split(":")
+    cid, rid = int(cid), int(rid)
+    if not await _guard(cb, cid):
+        return
+    await db.cmd_set(rid, "count", 0)
+    text, kb = await view_cmd(cid, rid)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer("Счётчик сброшен")
+
+
+@router.callback_query(F.data.startswith("u:cme:"))
+async def cb_cmd_edit(cb: CallbackQuery, state: FSMContext) -> None:
+    _, _, cid, rid = cb.data.split(":")
+    cid, rid = int(cid), int(rid)
+    if not await _guard(cb, cid):
+        return
+    r = await db.cmd_get(rid)
+    if r is None:
+        await cb.answer("Счётчик не найден.", show_alert=True)
+        return
+    await _ask(
+        cb, state, Input.cmd_edit,
+        f"<b>🔢 {utils.esc(r['cmd'])}</b>\n\nПришлите новую заготовку.\n"
+        f"Сейчас: <code>{utils.esc(r['template'])}</code>",
+        f"u:cmv:{cid}:{rid}", cid=cid, rid=rid,
+    )
+
+
+@router.message(StateFilter(Input.cmd_edit))
+async def cmd_edit_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    cid, rid = data["cid"], data["rid"]
+    if text == "/cancel":
+        await _done(message, bot, state, await view_cmd(cid, rid))
+        return
+    if not text:
+        await _retry(message, bot, state, "⚠️ Нужен текст заготовки.")
+        return
+    await db.cmd_set(rid, "template", text)
+    await _done(message, bot, state, await view_cmd(cid, rid), "✅ Обновлено.\n\n")
+
+
+@router.callback_query(F.data.startswith("u:cmd:"))
+async def cb_cmd_del(cb: CallbackQuery) -> None:
+    _, _, cid, rid = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    await db.cmd_remove(int(rid))
+    await _rerender(cb, cid, "cmds")
+    await cb.answer("Удалено")
+
+
+@router.callback_query(F.data.startswith("u:tgd:"))
+async def cb_trig_del(cb: CallbackQuery) -> None:
+    _, _, cid, rid = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    await db.trig_remove(int(rid))
+    await _rerender(cb, cid, "triggers")
+    await cb.answer("Удалено")
+
+
+# ---------- выбор лог-чата: нативный пикер Telegram (request_chat) ----------
+
+@router.callback_query(F.data.startswith("u:logsel:"))
+async def cb_log_select(cb: CallbackQuery, state: FSMContext) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    # вопрос — в самом меню; отдельным сообщением идёт только носитель reply-кнопки
+    # (request_chat живёт лишь на reply-клавиатуре), его потом удаляем
+    await _ask(
+        cb, state, Input.pick_log,
+        "<b>📍 Лог-чат</b>\n\nНажмите кнопку «Выбрать чат» внизу экрана. Если бота "
+        "в чате нет — Telegram предложит добавить.\n"
+        "Убрать лог-чат — пришлите <code>-</code>.",
+        f"u:s:{cid}:cards", cid=cid,
+    )
+    kb_msg = await cb.message.answer("👇", reply_markup=utils.request_chat_kb())
+    await state.update_data(kb_msg_id=kb_msg.message_id)
+
+
+async def _finish_log_pick(message: Message, bot: Bot, state: FSMContext,
+                           cid: int, note: str) -> None:
+    """Убрать носитель клавиатуры и вернуть раздел на место."""
+    data = await state.get_data()
+    kb_msg_id = data.get("kb_msg_id")
+    if kb_msg_id:
+        try:
+            await bot.delete_message(message.chat.id, kb_msg_id)
+        except Exception:
+            pass
+    # снять саму клавиатуру у клиента
+    try:
+        tmp = await message.answer("⌛", reply_markup=ReplyKeyboardRemove())
+        await tmp.delete()
+    except Exception:
+        pass
+    await _done(message, bot, state, await view_section(cid, "cards"), note)
+
+
+@router.message(StateFilter(Input.pick_log), F.chat_shared)
+async def log_chat_shared(message: Message, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    cid = data["cid"]
+    await db.set_setting(cid, "log_chat_id", message.chat_shared.chat_id)
+    await db.add_event(cid, "bot", f"лог-чат установлен: {message.chat_shared.chat_id}")
+    await _finish_log_pick(message, bot, state, cid, "✅ Лог-чат обновлён.\n\n")
+
+
+@router.message(StateFilter(Input.pick_log))
+async def log_pick_text(message: Message, state: FSMContext, bot: Bot) -> None:
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    cid = data["cid"]
+    if text == "-":
+        await db.set_setting(cid, "log_chat_id", None)
+        await _finish_log_pick(message, bot, state, cid, "✅ Лог-чат убран.\n\n")
+    elif text == "/cancel":
+        await _finish_log_pick(message, bot, state, cid, "")
+    else:
+        try:
+            await message.delete()   # прочее просто убираем, вопрос остаётся на месте
+        except Exception:
+            pass
+
+
+# ---------- наказания ----------
+
+@router.callback_query(F.data.startswith("u:p:"))
+async def cb_punishments(cb: CallbackQuery) -> None:
+    _, _, cid, page = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    text, kb = await view_punishments(cid, int(page))
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:pu:"))
+async def cb_lift(cb: CallbackQuery, bot: Bot) -> None:
+    from ..services import moderation
+    _, _, cid, pid = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    ok, msg, link = await moderation.lift_punishment(bot, int(pid))
+    text, kb = await view_punishments(cid, 0)
+    # ссылку дописываем в это же сообщение — до следующего перехода по меню
+    await cb.message.edit_text(text + moderation.unban_note(link), reply_markup=kb,
+                               disable_web_page_preview=True)
+    await cb.answer(msg, show_alert=not ok)
+
+
+# ---------- удаление из списков ----------
+
+@router.callback_query(F.data.startswith("u:wld:"))
+async def cb_wl_del(cb: CallbackQuery) -> None:
+    """Убрать объект из вайтлиста целиком — со всеми его уровнями."""
+    _, _, cid, rid = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    e = await db.wl_entry(cid, int(rid))
+    if e is not None:
+        await db.wl_set_scopes(cid, e["user_id"], e["username"], e["title"], set())
+    await _rerender(cb, cid, "wl")
+    await cb.answer("Удалено")
+
+
+@router.callback_query(F.data.startswith("u:wle:"))
+async def cb_wl_entry(cb: CallbackQuery, state: FSMContext) -> None:
+    _, _, cid, rid = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    await state.clear()
+    view = await view_wl_entry(cid, int(rid))
+    if view is None:
+        await _rerender(cb, cid, "wl")
+        await cb.answer("Запись не найдена", show_alert=True)
+        return
+    await cb.message.edit_text(view[0], reply_markup=view[1])
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:wlt:"))
+async def cb_wl_toggle(cb: CallbackQuery, bot: Bot) -> None:
+    """Галочка уровня. «Полный игнор» — тумблер над всеми остальными."""
+    from ..services import moderation
+    _, _, cid, rid, scope = cb.data.split(":")
+    cid, rid = int(cid), int(rid)
+    if not await _guard(cb, cid):
+        return
+    e = await db.wl_entry(cid, rid)
+    if e is None:
+        await _rerender(cb, cid, "wl")
+        await cb.answer("Запись не найдена", show_alert=True)
+        return
+
+    on = _wl_effective(e["scopes"])
+    if scope == "all":
+        on = set() if "all" in e["scopes"] else set(WL_PARTS)
+    elif scope in on:
+        on.discard(scope)                 # снимаем галочку, в т.ч. «раскрывая» полный игнор
+    else:
+        on.add(scope)
+
+    await db.wl_set_scopes(cid, e["user_id"], e["username"], e["title"], _wl_pack(on))
+    if not on:                            # ни одной галочки — записи больше нет
+        await _rerender(cb, cid, "wl")
+        await cb.answer("Убран из вайтлиста")
+        return
+
+    note = ""
+    if e["user_id"] and "anon" in on:     # разрешили анонимные — снимаем старый бан канала
+        p = await db.active_punishment_of(cid, e["user_id"], "banchan")
+        if p is not None:
+            ok, msg, _ = await moderation.lift_punishment(bot, p["id"])
+            note = " · бан канала снят" if ok else f" · бан снять не вышло: {msg}"
+            if ok:
+                await db.add_event(
+                    cid, "anon", f"разбан канала по вайтлисту: {e['title'] or e['user_id']}"
+                )
+    # уровни перезаписаны — у строк новые id, запись ищем по самому объекту
+    fresh = await db.wl_entry_by_key(cid, e["user_id"], e["username"])
+    view = await view_wl_entry(cid, fresh["row_id"]) if fresh else None
+    if view is None:
+        await _rerender(cb, cid, "wl")
+    else:
+        await cb.message.edit_text(view[0], reply_markup=view[1])
+    await cb.answer((config.WL_SCOPE_LABELS[scope] + (" ✅" if scope in on or (
+        scope == "all" and on == set(WL_PARTS)) else " ☐")) + note)
+
+
+@router.callback_query(F.data.startswith("u:wd:"))
+async def cb_words_page(cb: CallbackQuery) -> None:
+    _, _, cid, page = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    text, kb = await view_words(cid, int(page))
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:wdd:"))
+async def cb_word_del(cb: CallbackQuery) -> None:
+    _, _, cid, page, rid = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    await db.words_remove(int(rid))
+    flt.invalidate_words(cid)
+    text, kb = await view_words(cid, int(page))
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer("Удалено")
+
+
+@router.callback_query(F.data.startswith("u:wdc:"))
+async def cb_words_clear_ask(cb: CallbackQuery) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    n = len(await db.words_list(cid))
+    b = InlineKeyboardBuilder()
+    b.row(_btn(f"🗑 Да, удалить {n}", f"u:wdcy:{cid}"))
+    b.row(_btn("⬅️ Отмена", f"u:wd:{cid}:0"))
+    await cb.message.edit_text(
+        f"<b>🧨 Очистить список?</b>\n\nБудет удалено слов: <b>{n}</b>. Отменить нельзя.",
+        reply_markup=b.as_markup(),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:wdcy:"))
+async def cb_words_clear(cb: CallbackQuery) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    n = await db.words_clear(cid)
+    flt.invalidate_words(cid)
+    text, kb = await view_words(cid, 0)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer(f"Удалено: {n}")
+
+
+
+
+# ---------- добавление: вайтлист (FSM) ----------
+
+@router.callback_query(F.data.startswith("u:wla:"))
+async def cb_wl_add(cb: CallbackQuery, state: FSMContext) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    await _ask(
+        cb, state, Input.wl_target,
+        "<b>🕊 Вайтлист</b>\n\nПришлите <b>id</b> или <b>@username</b> — юзера либо канала. "
+        "Можно просто переслать сюда его сообщение.",
+        f"u:s:{cid}:wl", cid=cid,
+    )
+
+
+@router.message(StateFilter(Input.wl_target))
+async def wl_target_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    from ..services import moderation
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    cid = data["cid"]
+    if text == "/cancel":
+        await _done(message, bot, state, await view_section(cid, "wl"))
+        return
+
+    user_id, username, title = None, None, None
+    origin = message.forward_origin
+    origin_chat = getattr(origin, "chat", None) if origin else None
+    origin_user = getattr(origin, "sender_user", None) if origin else None
+    if origin_chat is not None:                    # переслали пост канала
+        user_id, username, title = origin_chat.id, origin_chat.username, origin_chat.title
+    elif origin_user is not None:                  # переслали сообщение человека
+        user_id, username = origin_user.id, origin_user.first_name and origin_user.username
+        title = origin_user.first_name
+    elif text.lstrip("-").isdigit():
+        user_id = int(text)
+        for probe in db.id_variants(user_id):      # канал — подтянем название
+            try:
+                ch = await bot.get_chat(probe)
+                if getattr(ch, "title", None):
+                    user_id, title, username = probe, ch.title, ch.username
+                    break
+            except Exception:
+                continue
+    elif text.startswith("@") and len(text) > 3:
+        username = text
+        # ник могут сменить — сразу закрепляем постоянный id, если удаётся узнать
+        user_id, title = await resolve.by_username(bot, text)
+    else:
+        await _retry(message, bot, state,
+                     "<b>🕊 Вайтлист</b>\n\n⚠️ Нужен id, @username или пересланное сообщение.")
+        return
+
+    uname = (username or None) and username.lower().lstrip("@")
+    exists = await db.wl_entry_by_key(cid, user_id, uname)
+    if exists is None:
+        # заводим сразу с полным игнором и открываем карточку: там галочками
+        # снимают лишнее. Так не нужен отдельный шаг выбора одного уровня.
+        await db.wl_set_scopes(cid, user_id, uname, title, {"all"})
+        exists = await db.wl_entry_by_key(cid, user_id, uname)
+        note = "✅ Добавлен с полным игнором. Снимите лишние галочки.\n\n"
+        if user_id:                     # был забанен как анонимный отправитель — снимаем
+            p = await db.active_punishment_of(cid, user_id, "banchan")
+            if p is not None:
+                ok, msg, _ = await moderation.lift_punishment(bot, p["id"])
+                note += ("✅ Бан канала снят.\n\n" if ok
+                         else f"⚠️ Бан канала снять не вышло: {msg}\n\n")
+                if ok:
+                    await db.add_event(
+                        cid, "anon", f"разбан канала по вайтлисту: {title or user_id}"
+                    )
+    else:
+        note = "ℹ️ Он уже в вайтлисте — вот его настройки.\n\n"
+    view = await view_wl_entry(cid, exists["row_id"])
+    await _done(message, bot, state, view, note)
+
+
+# ---------- карточка триггера ----------
+
+async def view_trig(cid: int, rid: int) -> tuple[str, InlineKeyboardMarkup]:
+    r = await db.trig_get(rid)
+    b = InlineKeyboardBuilder()
+    if r is None:
+        b.button(text="⬅️ Назад", callback_data=f"u:s:{cid}:triggers")
+        return "Триггер не найден.", b.as_markup()
+    cd = f"{r['cooldown']} сек" if r["cooldown"] else "без кулдауна"
+    if r["file_path"]:
+        kind = triggers.MEDIA_KINDS.get(r["media_type"], ("", "", False))
+        answer = f"🖼 медиа ({r['media_type']})"
+        if r["text"]:
+            answer += f" с подписью: <code>{utils.esc(r['text'])}</code>"
+    else:
+        answer = f"💬 <code>{utils.esc(r['text'] or '')}</code>"
+    text = (
+        f"<b>🎯 Триггер</b>\n\n"
+        f"Фраза: <code>{utils.esc(r['phrase'])}</code>\n"
+        f"Ответ: {answer}\n"
+        f"Кулдаун: <b>{cd}</b>"
+    )
+    b.row(_btn("✏️ Изменить фразу", f"u:tgp:{cid}:{rid}"))
+    b.row(_btn("✏️ Изменить ответ", f"u:tgr:{cid}:{rid}"))
+    b.row(
+        _btn("◀", f"u:tgc:{cid}:{rid}:-"),
+        _btn(f"⏱ {cd}", f"u:tgc:{cid}:{rid}:+"),
+        _btn("▶", f"u:tgc:{cid}:{rid}:+"),
+    )
+    b.row(_btn("❌ Удалить триггер", f"u:tgd:{cid}:{rid}"))
+    b.row(_btn("⬅️ Назад", f"u:s:{cid}:triggers"))
+    return text, b.as_markup()
+
+
+@router.callback_query(F.data.startswith("u:tgv:"))
+async def cb_trig_view(cb: CallbackQuery, state: FSMContext) -> None:
+    _, _, cid, rid = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    await state.clear()
+    text, kb = await view_trig(cid, int(rid))
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:tgc:"))
+async def cb_trig_cooldown(cb: CallbackQuery) -> None:
+    _, _, cid, rid, direction = cb.data.split(":")
+    cid, rid = int(cid), int(rid)
+    if not await _guard(cb, cid):
+        return
+    r = await db.trig_get(rid)
+    if r is None:
+        await cb.answer("Триггер не найден.", show_alert=True)
+        return
+    values = list(config.CMD_COOLDOWN_PRESETS)   # те же пресеты, что у счётчиков
+    try:
+        idx = values.index(r["cooldown"])
+    except ValueError:
+        idx = 0
+    idx = (idx + (1 if direction == "+" else -1)) % len(values)
+    await db.trig_set(rid, "cooldown", values[idx])
+    text, kb = await view_trig(cid, rid)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:tgp:"))
+async def cb_trig_edit_phrase(cb: CallbackQuery, state: FSMContext) -> None:
+    _, _, cid, rid = cb.data.split(":")
+    cid, rid = int(cid), int(rid)
+    if not await _guard(cb, cid):
+        return
+    r = await db.trig_get(rid)
+    if r is None:
+        await cb.answer("Триггер не найден.", show_alert=True)
+        return
+    await _ask(
+        cb, state, Input.trig_edit_phrase,
+        f"<b>🎯 Триггер</b>\n\nПришлите новую ключевую фразу (от 3 символов).\n"
+        f"Сейчас: <code>{utils.esc(r['phrase'])}</code>",
+        f"u:tgv:{cid}:{rid}", cid=cid, rid=rid,
+    )
+
+
+@router.message(StateFilter(Input.trig_edit_phrase))
+async def trig_edit_phrase_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    cid, rid = data["cid"], data["rid"]
+    if text == "/cancel":
+        await _done(message, bot, state, await view_trig(cid, rid))
+        return
+    if len(text) < 3:
+        await _retry(message, bot, state,
+                     "<b>🎯 Триггер</b>\n\n⚠️ Слишком коротко — нужно от 3 символов.")
+        return
+    await db.trig_set(rid, "phrase", text.lower())
+    await _done(message, bot, state, await view_trig(cid, rid), "✅ Фраза обновлена.\n\n")
+
+
+@router.callback_query(F.data.startswith("u:tgr:"))
+async def cb_trig_edit_reply(cb: CallbackQuery, state: FSMContext) -> None:
+    _, _, cid, rid = cb.data.split(":")
+    cid, rid = int(cid), int(rid)
+    if not await _guard(cb, cid):
+        return
+    await _ask(
+        cb, state, Input.trig_edit_reply,
+        "<b>🎯 Триггер</b>\n\nПришлите новый ответ бота — текст или медиа "
+        "(фото, стикер, гифка, видео, войс).",
+        f"u:tgv:{cid}:{rid}", cid=cid, rid=rid,
+    )
+
+
+@router.message(StateFilter(Input.trig_edit_reply))
+async def trig_edit_reply_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    cid, rid = data["cid"], data["rid"]
+    if (message.text or "").strip() == "/cancel":
+        await _done(message, bot, state, await view_trig(cid, rid))
+        return
+    old = await db.trig_get(rid)
+    if message.text:
+        await db.trig_set(rid, "text", message.text)
+        await db.trig_set(rid, "file_path", None)
+        await db.trig_set(rid, "media_type", None)
+    else:
+        media = triggers.extract_media(message)
+        if media is None:
+            await _retry(
+                message, bot, state,
+                "<b>🎯 Триггер</b>\n\n⚠️ Не понял. Пришлите текст или медиа.",
+            )
+            return
+        path = await triggers.save_media(bot, media.file_id, cid, media.kind)
+        await db.trig_set(rid, "file_path", path)
+        await db.trig_set(rid, "media_type", media.kind)
+        await db.trig_set(rid, "text", message.caption or None)
+    # старый файл больше не нужен
+    if old and old["file_path"]:
+        try:
+            os.remove(old["file_path"])
+        except OSError:
+            pass
+    await _done(message, bot, state, await view_trig(cid, rid), "✅ Ответ обновлён.\n\n")
+
+
+# ---------- разрешённые для ссылок чаты и каналы ----------
+
+async def view_link_wl(cid: int) -> tuple[str, InlineKeyboardMarkup]:
+    rows = await db.link_wl_list(cid)
+    b = InlineKeyboardBuilder()
+    text = (
+        "<b>🔓 Разрешённые чаты и каналы</b>\n\n"
+        "Ссылки на них бот не трогает. Этот чат и привязанный к нему канал "
+        "разрешены всегда — их добавлять не нужно.\n"
+        f"Записей: <b>{len(rows)}</b>"
+    )
+    b.row(_btn("➕ Добавить", f"u:lwa:{cid}"))
+    for r in rows:
+        label = r["title"] or (f"@{r['username']}" if r["username"] else str(r["target_id"]))
+        extra = f" ({r['target_id']})" if r["target_id"] and r["title"] else ""
+        b.row(_btn(f"❌ {label}{extra}", f"u:lwd:{cid}:{r['id']}"))
+    b.row(_btn("⬅️ Назад", f"u:s:{cid}:links"))
+    return text, b.as_markup()
+
+
+@router.callback_query(F.data.startswith("u:lw:"))
+async def cb_link_wl(cb: CallbackQuery, state: FSMContext) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    await state.clear()
+    text, kb = await view_link_wl(cid)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:lwa:"))
+async def cb_link_wl_add(cb: CallbackQuery, state: FSMContext) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    await _ask(
+        cb, state, Input.link_wl,
+        "<b>🔓 Разрешить чат или канал</b>\n\nПришлите <b>@username</b> или <b>id</b>. "
+        "Можно переслать сюда сообщение оттуда — тогда возьму и id, и название.",
+        f"u:lw:{cid}", cid=cid,
+    )
+
+
+@router.message(StateFilter(Input.link_wl))
+async def link_wl_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    cid = data["cid"]
+    if text == "/cancel":
+        await _done(message, bot, state, await view_link_wl(cid))
+        return
+
+    target_id, uname, title = None, None, None
+    origin = message.forward_origin
+    origin_chat = getattr(origin, "chat", None) if origin else None
+    if origin_chat is not None:
+        target_id, uname, title = origin_chat.id, origin_chat.username, origin_chat.title
+    elif text.lstrip("-").isdigit():
+        target_id = int(text)
+        for probe in db.id_variants(target_id):
+            try:
+                ch = await bot.get_chat(probe)
+                target_id, title, uname = probe, getattr(ch, "title", None), ch.username
+                break
+            except Exception:
+                continue
+    elif text.startswith("@") and len(text) > 3:
+        uname = text.lstrip("@")
+        target_id, title = await resolve.by_username(bot, text)
+    else:
+        await _retry(
+            message, bot, state,
+            "<b>🔓 Разрешить чат или канал</b>\n\n⚠️ Нужен @username, id или пересланное сообщение.",
+        )
+        return
+
+    await db.link_wl_add(cid, target_id, uname, title)
+    who = title or (f"@{uname}" if uname else str(target_id))
+    note = (f"✅ {utils.esc(who)} разрешён.\n\n" if target_id
+            else f"✅ {utils.esc(who)} разрешён (id не определился — сверяю по нику).\n\n")
+    await _done(message, bot, state, await view_link_wl(cid), note)
+
+
+@router.callback_query(F.data.startswith("u:lwd:"))
+async def cb_link_wl_del(cb: CallbackQuery) -> None:
+    _, _, cid, rid = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    await db.link_wl_remove(int(rid))
+    text, kb = await view_link_wl(cid)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer("Удалено")
+
+
+# ---------- разрешённые инлайн-боты ----------
+
+@router.callback_query(F.data.startswith("u:ila:"))
+async def cb_inline_wl_add(cb: CallbackQuery, state: FSMContext) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    await _ask(
+        cb, state, Input.inline_wl,
+        "<b>🤖 Разрешённый инлайн-бот</b>\n\nПришлите <b>@username</b> бота, вызовы "
+        "которого в этом чате трогать не надо (например <code>@gif</code>).\n"
+        "Можно и переслать сюда сообщение, отправленное через этого бота.",
+        f"u:s:{cid}:inline", cid=cid,
+    )
+
+
+@router.message(StateFilter(Input.inline_wl))
+async def inline_wl_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    cid = data["cid"]
+    if text == "/cancel":
+        await _done(message, bot, state, await view_section(cid, "inline"))
+        return
+
+    uname, bot_id = None, None
+    if message.via_bot is not None:            # переслали сообщение от инлайн-бота
+        uname, bot_id = message.via_bot.username, message.via_bot.id
+    elif text.startswith("@") and len(text) > 3:
+        uname = text.lstrip("@")
+        bot_id, _ = await resolve.by_username(bot, text)
+    if not uname:
+        await _retry(
+            message, bot, state,
+            "<b>🤖 Разрешённый инлайн-бот</b>\n\n⚠️ Нужен @username бота или сообщение, "
+            "отправленное через него.",
+        )
+        return
+    if await db.inline_wl_allowed(cid, uname, bot_id):
+        await _retry(message, bot, state,
+                     "<b>🤖 Разрешённый инлайн-бот</b>\n\n⚠️ Этот бот уже в списке.")
+        return
+    await db.inline_wl_add(cid, uname, bot_id)
+    await _done(message, bot, state, await view_section(cid, "inline"),
+                f"✅ @{utils.esc(uname)} разрешён.\n\n")
+
+
+@router.callback_query(F.data.startswith("u:ild:"))
+async def cb_inline_wl_del(cb: CallbackQuery) -> None:
+    _, _, cid, rid = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    await db.inline_wl_remove(int(rid))
+    await _rerender(cb, cid, "inline")
+    await cb.answer("Удалено")
+
+
+# ---------- добавление: стоп-слова (FSM) ----------
+
+@router.callback_query(F.data.startswith("u:wda:"))
+async def cb_words_add(cb: CallbackQuery, state: FSMContext) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    await _ask(
+        cb, state, Input.words,
+        "<b>🧨 Стоп-слова</b>\n\nПришлите слова через запятую или с новой строки.\n"
+        "<code>слово</code> — точное совпадение, <code>слово*</code> — с любыми окончаниями.",
+        f"u:wd:{cid}:0", cid=cid,
+    )
+
+
+@router.message(StateFilter(Input.words))
+async def words_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    cid = data["cid"]
+    if text == "/cancel":
+        await _done(message, bot, state, await view_words(cid, 0))
+        return
+    added, dupes = 0, 0
+    for raw in text.replace("\n", ",").split(","):
+        w = raw.strip().lower()
+        if not w:
+            continue
+        mode = "stem" if w.endswith("*") else "strict"
+        w = w.rstrip("*")
+        if w:
+            if await db.words_add(cid, w, mode):
+                added += 1
+            else:
+                dupes += 1
+    if not added and not dupes:
+        await _retry(message, bot, state, "<b>🧨 Стоп-слова</b>\n\n⚠️ Не нашёл ни одного слова.")
+        return
+    flt.invalidate_words(cid)
+    note = f"✅ Добавлено слов: {added}."
+    if dupes:
+        note += f" Уже были в списке: {dupes}."
+    await _done(message, bot, state, await view_words(cid, 0), note + "\n\n")

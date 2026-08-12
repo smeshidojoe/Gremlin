@@ -1,0 +1,36 @@
+services:
+  gremlin:
+    build: .
+    container_name: gremlin
+    restart: unless-stopped
+
+    # .env берётся прямо из папки проекта — правки токенов не требуют пересборки
+    env_file: .env
+
+    # пути внутри контейнера ведут в примонтированную ./data,
+    # поэтому база, сессия юзербота и медиа лежат у тебя на диске
+    environment:
+      DB_PATH: /app/data/gremlin.sqlite3
+      LOG_PATH: /app/data/bot.log
+      STATS_DB: /app/data/chat_stats.db
+      TRIG_DIR: /app/data/triggers
+      TG_SESSION: /app/data/audit_session
+
+    volumes:
+      - ./.env:/app/.env:ro     # только чтение: контейнер его не меняет
+      - ./data:/app/data        # база, сессия, медиа триггеров, логи
+
+    # потолок памяти. memswap = mem_limit означает «свопа нет»:
+    # иначе контейнер при утечке будет тихо свопиться вместо падения
+    mem_limit: 4g
+    memswap_limit: 4g
+
+    # mini app: раскомментируй, если задан WEBAPP_URL
+    # ports:
+    #   - "8080:8080"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

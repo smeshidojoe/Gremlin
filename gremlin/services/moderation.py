@@ -59,8 +59,56 @@ def card_kb(pid: int | None, kind: str,
     return b.as_markup()
 
 
+# подписи типов вложений для строки «Сообщение»
+_MEDIA_LABELS = {
+    "photo": "фото", "video": "видео", "animation": "гифка", "sticker": "стикер",
+    "voice": "голосовое", "video_note": "кружок", "audio": "аудио",
+    "document": "файл", "poll": "опрос", "contact": "контакт", "location": "геопозиция",
+}
+
+BODY_LIMIT = 1000     # карточка целиком не должна упереться в лимит Telegram
+
+
+def body_block(text: str | None, media: str | None = None) -> str:
+    """Хвост карточки с текстом сообщения нарушителя.
+
+    Показываем обычным текстом, без его форматирования: в логе нужна улика,
+    а не кликабельная спам-ссылка.
+    """
+    text = (text or "").strip()
+    if not text:
+        return f"\n\n💬 <b>Сообщение:</b> [{media} без текста]" if media else ""
+    head = f"💬 <b>Сообщение ({media}):</b>" if media else "💬 <b>Сообщение:</b>"
+    return f"\n\n{head}\n{utils.esc(utils.chunk(text, BODY_LIMIT))}"
+
+
+def _button_urls(message) -> list[str]:
+    """Ссылки с инлайн-кнопок под сообщением.
+
+    Реклама через инлайн-ботов часто приходит картинкой без подписи, а вся суть
+    висит на кнопке — без этого в карточке было бы «фото без текста».
+    """
+    markup = getattr(message, "reply_markup", None)
+    rows = getattr(markup, "inline_keyboard", None) or []
+    return [b.url for row in rows for b in row if getattr(b, "url", None)]
+
+
+def message_body(message) -> str:
+    """То же для сообщения aiogram: сам достанет текст, вложение и кнопки."""
+    if message is None:
+        return ""
+    media = next((label for attr, label in _MEDIA_LABELS.items()
+                  if getattr(message, attr, None) is not None), None)
+    block = body_block(message.text or message.caption, media)
+    urls = _button_urls(message)
+    if urls:
+        shown = ", ".join(utils.esc(u) for u in urls[:5])
+        block += f"\n🔘 <b>Кнопки:</b> {shown}"
+    return block
+
+
 def card_text(kind: str, chat_title: str | None, user_id: int, who: str,
-              reason: str, by: str, until: int | None = None) -> str:
+              reason: str, by: str, until: int | None = None, body: str = "") -> str:
     """Единая структура карточки для всех событий."""
     lines = [
         f"{KIND_EMOJI.get(kind, '•')} <b>{KIND_LABEL.get(kind, kind)}</b> · {utils.esc(chat_title)}",
@@ -70,7 +118,7 @@ def card_text(kind: str, chat_title: str | None, user_id: int, who: str,
     if kind == "mute":
         lines.append(f"⏰ До: {utils.fmt_ts(until)}")
     lines.append(f"👮 Кем: {by}")
-    return "\n".join(lines)
+    return "\n".join(lines) + body
 
 
 async def apply_punishment(bot: Bot, chat_id: int, user: User, kind: str,
@@ -202,6 +250,7 @@ async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
     """Полный цикл нарушения: удалить сообщение, наказать, карточка, логи."""
     chat = message.chat
     user = message.from_user
+    body = message_body(message)      # текст берём до удаления
     try:
         await message.delete()
     except Exception:
@@ -214,7 +263,7 @@ async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
     who = utils.mention(user.id, user.full_name, user.username)
     card = card_text(
         applied, chat.title, user.id, who, reason, "Gremlin (автомод)",
-        utils.until_ts(mute_min) if applied == "mute" else None,
+        utils.until_ts(mute_min) if applied == "mute" else None, body,
     )
     await db.add_event(
         chat.id, feature_label,

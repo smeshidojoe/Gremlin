@@ -45,12 +45,25 @@ router.edited_message.filter(F.chat.type.in_({"group", "supergroup"}), _register
 
 # ждут прохождения капчи: (chat_id, user_id) -> message_id капчи
 _captcha_pending: dict[tuple[int, int], int] = {}
-# кулдаун команд чата: id команды -> monotonic последнего ответа
-_cmd_fired: dict[int, float] = {}
+# кулдаун счётчиков: (id счётчика, user_id) -> monotonic последнего ответа.
+# Персонально: иначе один человек «съедал» паузу для всего чата.
+_cmd_fired: dict[tuple[int, int], float] = {}
+# кулдаун гостей: (chat_id, id счётчика) -> monotonic. Общий на всех гостей сразу.
+# Живёт в памяти: перезапуск его сбрасывает, но час паузы того не стоит хранить.
+_guest_cmd_fired: dict[tuple[int, int], float] = {}
 # последнее приветствие в чате (удаляем при новом входе, чтобы не спамить)
 _last_welcome: dict[int, int] = {}
 # кулдаун триггеров: (chat_id, trigger_id) -> monotonic
 _trig_fired: dict[tuple[int, int], float] = {}
+
+
+def _prune_cooldowns(now: float) -> None:
+    """Убрать протухшие записи, чтобы словари не росли бесконечно."""
+    day = 86400
+    for store in (_cmd_fired, _guest_cmd_fired):
+        if len(store) > 5000:
+            for key in [k for k, ts in store.items() if now - ts > day]:
+                del store[key]
 
 
 @router.message(Command("start", "menu", "admin", ignore_mention=True))
@@ -66,7 +79,7 @@ async def _is_chat_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
 
 
 def _manual_card_text(kind: str, chat_title: str | None, target, reason: str,
-                      until: int | None, by) -> str:
+                      until: int | None, by, body: str = "") -> str:
     who = utils.mention(target.id, target.full_name, target.username)
     admin = utils.mention(by.id, by.full_name, by.username)
     lines = [
@@ -77,7 +90,7 @@ def _manual_card_text(kind: str, chat_title: str | None, target, reason: str,
     if kind == "mute":
         lines.append(f"⏰ До: {utils.fmt_ts(until)}")
     lines.append(f"👮 Кем: {admin}")
-    return "\n".join(lines)
+    return "\n".join(lines) + body
 
 
 async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
@@ -116,7 +129,11 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
         f"получил {moderation.KIND_LABEL[kind].lower()}{dur}. Причина: {utils.esc(reason)}"
     )
     bit = config.BIT_BAN if kind == "ban" else config.BIT_MUTE
-    card = _manual_card_text(kind, message.chat.title, target, reason, until, message.from_user)
+    # в карточку кладём то сообщение, на которое ответил админ
+    card = _manual_card_text(
+        kind, message.chat.title, target, reason, until, message.from_user,
+        moderation.message_body(message.reply_to_message),
+    )
     await moderation.send_card(bot, message.chat.id, bit, card, pid, kind)
     await db.add_event(
         message.chat.id, "manual",
@@ -135,7 +152,7 @@ async def cmd_ban(message: Message, bot: Bot) -> None:
 
 
 @router.message(F.text.startswith("!"))
-async def chat_command(message: Message) -> None:
+async def chat_command(message: Message, bot: Bot) -> None:
     """Счётчики: команда в чате -> ответ по заготовке + счётчик вызовов.
 
     Стоит выше системных !mute/!ban — но те перехватываются раньше по своим
@@ -155,17 +172,45 @@ async def chat_command(message: Message) -> None:
         return
 
     now = time.monotonic()
-    if row["cooldown"] and now - _cmd_fired.get(row["id"], 0) < row["cooldown"]:
-        return  # кулдаун — молчим, вызов не засчитываем
-    _cmd_fired[row["id"]] = now
+    user = message.from_user
+    if user is None:
+        return
+    _prune_cooldowns(now)
+
+    # У участников кулдаун персональный: счётчик прирастает на единицу с человека
+    # за период, а не достаётся самому быстрому. У гостей (кто в чате не состоит)
+    # кулдаун на счётчик общий: вызвал один — команда закрыта для всех гостей.
+    guest_cd = s.cmds_guest_cd
+    is_guest = bool(guest_cd) and not await adm_cache.is_member(bot, message.chat.id, user.id)
+    if is_guest:
+        key, wait = (message.chat.id, row["id"]), guest_cd
+        store = _guest_cmd_fired
+    else:
+        key, wait = (row["id"], user.id), row["cooldown"]
+        store = _cmd_fired
+
+    if wait and now - store.get(key, 0) < wait:
+        # Сообщение убираем: иначе в чате копятся вызовы, на которые бот молчит.
+        try:
+            await message.delete()
+        except Exception:
+            pass          # нет прав на удаление — просто игнорируем вызов
+        return            # вызов не засчитываем
+    store[key] = now
     count = await db.cmd_bump(row["id"])
     ans = await db.ans_pick("cmd", row["id"])   # вариантов может быть несколько
     if ans is None:
         return
+    # Ответы хранятся с разметкой (html_text при вводе), поэтому не экранируем.
+    # Если разметка окажется битой, Telegram ругнётся — тогда шлём как есть текстом.
+    body = f"{ans['text']} [{count}]"
     try:
-        await message.reply(f"{utils.esc(ans['text'])} [{count}]")
+        await message.reply(body)
     except Exception:
-        logger.warning("counter %s failed in %s", row["id"], message.chat.id, exc_info=True)
+        try:
+            await message.reply(utils.esc(body), parse_mode=None)
+        except Exception:
+            logger.warning("counter %s failed in %s", row["id"], message.chat.id, exc_info=True)
 
 
 async def fire_trigger(bot: Bot, message: Message, s) -> None:
@@ -181,7 +226,7 @@ async def fire_trigger(bot: Bot, message: Message, s) -> None:
             continue
         key = (message.chat.id, t["id"])
         if t["cooldown"] and now - _trig_fired.get(key, 0) < t["cooldown"]:
-            return  # кулдаун — молчим
+            continue  # этот на кулдауне — пробуем следующий совпавший
         _trig_fired[key] = now
         try:
             await triggers.send(message, t)
@@ -298,8 +343,12 @@ async def on_join(message: Message, bot: Bot) -> None:
             if "all" in scopes:
                 continue
             try:
+                # Мут со сроком: снятие висит на задаче в памяти, и перезапуск бота
+                # во время капчи оставлял человека немым навсегда. Срок ставим с
+                # запасом — обычно мут снимает кнопка или кик по таймауту.
                 await bot.restrict_chat_member(
-                    message.chat.id, user.id, permissions=moderation.MUTE_PERMS
+                    message.chat.id, user.id, permissions=moderation.MUTE_PERMS,
+                    until_date=int(time.time()) + s.captcha_timeout + 60,
                 )
             except Exception:
                 logger.warning("captcha restrict failed in %s", message.chat.id, exc_info=True)
@@ -379,6 +428,7 @@ async def moderate(message: Message, bot: Bot) -> None:
         # анонимный админ этого же чата — ок; автопересылка из привязанного канала — ок
         if message.sender_chat.id == chat.id or message.is_automatic_forward:
             return
+        anon_body = moderation.message_body(message)   # текст берём до удаления
         sender_scopes = await db.wl_scopes_for(
             chat.id, message.sender_chat.id, message.sender_chat.username
         )
@@ -402,7 +452,7 @@ async def moderate(message: Message, bot: Bot) -> None:
             f"📛 <b>Бан отправителя-канала</b> · {utils.esc(chat.title)}\n"
             f"📢 {utils.esc(title)} (<code>{message.sender_chat.id}</code>)\n"
             f"📎 Причина: сообщение от имени канала/группы\n"
-            f"🤖 Кем: Gremlin (автомод)"
+            f"🤖 Кем: Gremlin (автомод)" + anon_body
         )
         await db.add_event(chat.id, "anon", f"banchan: {title} ({message.sender_chat.id})")
         await moderation.send_card(bot, chat.id, config.BIT_ANON, card, pid, "banchan")

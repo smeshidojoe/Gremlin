@@ -36,10 +36,10 @@ class TrackingMiddleware(BaseMiddleware):
                     if isinstance(event, CallbackQuery):
                         await event.answer("Доступ к боту закрыт.", show_alert=True)
                     return None
-                # список допуска: пустой = бот открыт всем (не мешаем первому запуску)
-                if await db.access_list() and not await db.access_allowed(
-                    user.id, user.username
-                ):
+                # Список допуска. Пустой = бот доступен только владельцам из
+                # ADMIN_IDS: раньше пустой список означал «открыт всем», и любой
+                # прохожий получал полное меню со всеми чатами.
+                if not await db.access_allowed(user.id, user.username):
                     if isinstance(event, CallbackQuery):
                         await event.answer("Доступ к боту закрыт.", show_alert=True)
                     elif isinstance(event, Message):

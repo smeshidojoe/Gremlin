@@ -132,6 +132,10 @@ async def _handle_bot_spam(bot: Bot, chat_id: int, message, sender) -> None:
     title = ch["title"] if ch else str(chat_id)
     bot_uname = getattr(sender, "username", None)
     why = ", ".join(reasons) or "сообщение стороннего бота"
+    # у Telethon свои объекты, поэтому текст и тип вложения достаём вручную
+    body = moderation.body_block(
+        getattr(message, "text", None), "медиа" if getattr(message, "media", None) else None
+    )
 
     # 1) убираем сообщение бота — руками основного бота, он админ
     try:
@@ -170,7 +174,7 @@ async def _handle_bot_spam(bot: Bot, chat_id: int, message, sender) -> None:
 
     await db.add_event(chat_id, "watch", f"спам-бот @{bot_uname} ({score}) — {why}")
     await moderation.send_card(
-        bot, chat_id, config.BIT_WATCH, "\n".join(lines),
+        bot, chat_id, config.BIT_WATCH, "\n".join(lines) + body,
         pid, "ban" if pid else "delete", caller[0] if caller else None,
     )
 
@@ -182,7 +186,6 @@ async def refresh_members(chat_id: int | None = None) -> int:
     Вышедших помечаем is_member=0 только после полного прохода, иначе на обрыве
     можно снять флаг у половины чата.
     """
-    global _client_ref
     client = _client_ref
     if client is None or not client.is_connected():
         return 0
@@ -250,7 +253,6 @@ async def start(bot: Bot) -> object | None:
     me = await client.get_me()
     logger.info("юзербот запущен: @%s (id=%s)", me.username, me.id)
     asyncio.create_task(_watchdog(client))
-    stats_chat = stats_collect.tracked_chat_id()
 
     @client.on(events.NewMessage())
     async def _on_message(event) -> None:
@@ -261,6 +263,7 @@ async def start(bot: Bot) -> object | None:
                 return
 
             # статистика: пишем только тот чат, по которому собрана база
+            stats_chat = stats_collect.tracked_chat_id()      # кэш на 5 минут внутри
             if stats_chat and chat_id == stats_chat and not getattr(sender, "bot", False):
                 await asyncio.to_thread(
                     stats_collect.record,

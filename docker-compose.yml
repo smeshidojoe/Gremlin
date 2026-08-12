@@ -14,6 +14,7 @@ services:
       LOG_PATH: /app/data/bot.log
       STATS_DB: /app/data/chat_stats.db
       TRIG_DIR: /app/data/triggers
+      BACKUP_DIR: /app/data/backups
       TG_SESSION: /app/data/audit_session
 
     volumes:
@@ -24,10 +25,6 @@ services:
     # иначе контейнер при утечке будет тихо свопиться вместо падения
     mem_limit: 4g
     memswap_limit: 4g
-
-    # mini app: раскомментируй, если задан WEBAPP_URL
-    # ports:
-    #   - "8080:8080"
 
     logging:
       driver: json-file

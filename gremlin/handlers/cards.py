@@ -11,6 +11,7 @@ router = Router()
 async def card_lift(cb: CallbackQuery, bot: Bot) -> None:
     from ..services import moderation
     pid = int(cb.data.split(":")[2])
+    p = await db.get_punishment(pid)             # чат берём до снятия, потом он нужен для лога
     ok, text, link = await moderation.lift_punishment(bot, pid)
     if not ok:
         await cb.answer(text, show_alert=True)
@@ -20,7 +21,10 @@ async def card_lift(cb: CallbackQuery, bot: Bot) -> None:
         cb.message.html_text + "\n\n✅ <b>Наказание снято</b>" + moderation.unban_note(link),
         reply_markup=None, disable_web_page_preview=True,
     )
-    await db.add_event(None, "card", f"снято наказание #{pid} юзером {cb.from_user.id}")
+    await db.add_event(
+        p["chat_id"] if p else None, "card",
+        f"снято наказание #{pid} юзером {cb.from_user.id}",
+    )
     await cb.answer("Снято")
 
 

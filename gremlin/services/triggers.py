@@ -3,6 +3,7 @@
 Файл скачивается один раз при создании триггера и лежит в config.TRIG_DIR —
 триггер не зависит от сохранности переписки, из которой его прислали.
 """
+import html
 import logging
 import os
 import uuid
@@ -66,9 +67,16 @@ async def send(message: Message, row) -> None:
 
 
 async def send_answer(message: Message, ans) -> None:
-    """Отправить один вариант ответа: текст или медиа с диска."""
+    """Отправить один вариант ответа: текст или медиа с диска.
+
+    Текст лежит с разметкой (жирный, курсив, ссылки — как их набрали в Telegram),
+    поэтому уходит как HTML. Битая разметка -> повтор обычным текстом.
+    """
     if not ans["file_path"]:
-        await message.reply(ans["text"])
+        try:
+            await message.reply(ans["text"])
+        except Exception:
+            await message.reply(html.escape(ans["text"] or ""), parse_mode=None)
         return
     kind = ans["media_type"]
     if kind not in MEDIA_KINDS or not os.path.exists(ans["file_path"]):
@@ -78,4 +86,10 @@ async def send_answer(message: Message, ans) -> None:
     kwargs = {"reply_to_message_id": message.message_id}
     if has_caption and ans["text"]:
         kwargs["caption"] = ans["text"]
-    await getattr(message, method)(FSInputFile(ans["file_path"]), **kwargs)
+    try:
+        await getattr(message, method)(FSInputFile(ans["file_path"]), **kwargs)
+    except Exception:
+        if "caption" in kwargs:               # подпись с битой разметкой
+            kwargs["caption"] = html.escape(ans["text"])
+            kwargs["parse_mode"] = None
+        await getattr(message, method)(FSInputFile(ans["file_path"]), **kwargs)

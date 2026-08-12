@@ -8,10 +8,9 @@ import logging
 import os
 import sqlite3
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from aiogram import Bot
-from aiogram.types import BufferedInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .. import config, db, utils

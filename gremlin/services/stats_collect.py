@@ -5,6 +5,7 @@
 """
 import logging
 import sqlite3
+import time
 from datetime import datetime, timezone
 
 from .. import config, utils
@@ -119,8 +120,27 @@ def save_members(rows: list[tuple], present: set[int]) -> None:
         con.close()
 
 
+_tracked_cache: tuple[float, int | None] = (0.0, None)
+TRACKED_TTL = 300
+
+
 def tracked_chat_id() -> int | None:
-    """chat_id, по которому собрана база (из meta). Нужен, чтобы писать только его."""
+    """chat_id, по которому собрана база (из meta). Нужен, чтобы писать только его.
+
+    Значение кэшируем на 5 минут: спрашивают на каждое сообщение, а меняется оно
+    разве что при подмене базы. Раньше читалось один раз при старте — появившаяся
+    позже база требовала перезапуска.
+    """
+    global _tracked_cache
+    now = time.monotonic()
+    if _tracked_cache[0] > now:
+        return _tracked_cache[1]
+    value = _read_tracked_chat_id()
+    _tracked_cache = (now + TRACKED_TTL, value)
+    return value
+
+
+def _read_tracked_chat_id() -> int | None:
     try:
         con = _con()
     except Exception:

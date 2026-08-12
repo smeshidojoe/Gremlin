@@ -1,5 +1,6 @@
 """Единая SQLite-база: чаты, настройки, вайтлисты, стоп-слова, наказания, события, юзеры."""
 import os
+import random
 import time
 from dataclasses import dataclass, fields
 
@@ -38,10 +39,6 @@ CREATE TABLE IF NOT EXISTS settings(
     flood_msgs      INTEGER NOT NULL DEFAULT 5,
     flood_window    INTEGER NOT NULL DEFAULT 10,
     flood_mute_min  INTEGER NOT NULL DEFAULT 10,
-    warns_on        INTEGER NOT NULL DEFAULT 0,
-    warns_limit     INTEGER NOT NULL DEFAULT 3,
-    warns_punish    TEXT    NOT NULL DEFAULT 'ban',
-    warns_mute_min  INTEGER NOT NULL DEFAULT 1440,
     captcha_on      INTEGER NOT NULL DEFAULT 0,
     captcha_timeout INTEGER NOT NULL DEFAULT 120,
     watch_on        INTEGER NOT NULL DEFAULT 0,
@@ -50,13 +47,12 @@ CREATE TABLE IF NOT EXISTS settings(
     watch_ban       INTEGER NOT NULL DEFAULT 80,
     welcome_on      INTEGER NOT NULL DEFAULT 0,
     welcome_text    TEXT,
-    rules_text      TEXT,
     media_on        INTEGER NOT NULL DEFAULT 0,
     media_mask      INTEGER NOT NULL DEFAULT 0,
     trig_on         INTEGER NOT NULL DEFAULT 0,
     cmds_on         INTEGER NOT NULL DEFAULT 0,
+    cmds_guest_cd   INTEGER NOT NULL DEFAULT 3600,
     digest_to       INTEGER NOT NULL DEFAULT 0,
-    report_restrict INTEGER NOT NULL DEFAULT 0,
     service_join    INTEGER NOT NULL DEFAULT 0,
     service_leave   INTEGER NOT NULL DEFAULT 0,
     service_other   INTEGER NOT NULL DEFAULT 0,
@@ -88,7 +84,8 @@ CREATE TABLE IF NOT EXISTS answers(
     owner_id   INTEGER NOT NULL,
     text       TEXT,                     -- текст ответа / подпись к медиа
     file_path  TEXT,                     -- медиа-вариант: файл в config.TRIG_DIR
-    media_type TEXT
+    media_type TEXT,
+    last_used  INTEGER NOT NULL DEFAULT 0   -- когда выпадал в последний раз
 );
 CREATE INDEX IF NOT EXISTS idx_answers_owner ON answers(owner, owner_id);
 CREATE TABLE IF NOT EXISTS msg_stats(
@@ -104,24 +101,11 @@ CREATE TABLE IF NOT EXISTS access(
     username TEXT,
     added    INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS report_wl(
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id  INTEGER NOT NULL,
-    user_id  INTEGER,
-    username TEXT
-);
 CREATE TABLE IF NOT EXISTS watch_profiles(
     chat_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
     sig     TEXT NOT NULL,          -- подпись профиля (имя|фамилия|username)
     flagged INTEGER NOT NULL DEFAULT 0,  -- карточка «подозрительный» уже отправлена
-    PRIMARY KEY (chat_id, user_id)
-);
-CREATE TABLE IF NOT EXISTS warns(
-    chat_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    count   INTEGER NOT NULL DEFAULT 0,
-    updated INTEGER NOT NULL,
     PRIMARY KEY (chat_id, user_id)
 );
 CREATE TABLE IF NOT EXISTS whitelist(
@@ -150,12 +134,6 @@ CREATE TABLE IF NOT EXISTS words(
     chat_id INTEGER NOT NULL,
     word    TEXT NOT NULL,
     mode    TEXT NOT NULL DEFAULT 'strict'
-);
-CREATE TABLE IF NOT EXISTS anon_wl(
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id   INTEGER NOT NULL,
-    sender_id INTEGER NOT NULL,
-    title     TEXT
 );
 CREATE TABLE IF NOT EXISTS punishments(
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -217,10 +195,6 @@ class Settings:
     flood_msgs: int = 5
     flood_window: int = 10
     flood_mute_min: int = 10
-    warns_on: int = 0
-    warns_limit: int = 3
-    warns_punish: str = "ban"
-    warns_mute_min: int = 1440
     captcha_on: int = 0
     captcha_timeout: int = 120
     watch_on: int = 0
@@ -229,13 +203,12 @@ class Settings:
     watch_ban: int = 80
     welcome_on: int = 0
     welcome_text: str | None = None
-    rules_text: str | None = None
     media_on: int = 0
     media_mask: int = 0
     trig_on: int = 0
     cmds_on: int = 0
+    cmds_guest_cd: int = 3600
     digest_to: int = 0
-    report_restrict: int = 0
     service_join: int = 0
     service_leave: int = 0
     service_other: int = 0
@@ -249,10 +222,6 @@ _SETTINGS_FIELDS = {f.name for f in fields(Settings)} - {"chat_id"}
 
 # колонки settings, которые могли отсутствовать в старых базах (имя -> DDL-хвост)
 _SETTINGS_MIGRATIONS = {
-    "warns_on": "INTEGER NOT NULL DEFAULT 0",
-    "warns_limit": "INTEGER NOT NULL DEFAULT 3",
-    "warns_punish": "TEXT NOT NULL DEFAULT 'ban'",
-    "warns_mute_min": "INTEGER NOT NULL DEFAULT 1440",
     "captcha_on": "INTEGER NOT NULL DEFAULT 0",
     "captcha_timeout": "INTEGER NOT NULL DEFAULT 120",
     "forwards_on": "INTEGER NOT NULL DEFAULT 0",
@@ -263,14 +232,13 @@ _SETTINGS_MIGRATIONS = {
     "watch_ban": "INTEGER NOT NULL DEFAULT 80",
     "welcome_on": "INTEGER NOT NULL DEFAULT 0",
     "welcome_text": "TEXT",
-    "rules_text": "TEXT",
     "media_on": "INTEGER NOT NULL DEFAULT 0",
     "media_mask": "INTEGER NOT NULL DEFAULT 0",
     "trig_on": "INTEGER NOT NULL DEFAULT 0",
     "cmds_on": "INTEGER NOT NULL DEFAULT 0",
     "digest_to": "INTEGER NOT NULL DEFAULT 0",
+    "cmds_guest_cd": "INTEGER NOT NULL DEFAULT 3600",
     "words_guests": "INTEGER NOT NULL DEFAULT 1",
-    "report_restrict": "INTEGER NOT NULL DEFAULT 0",
     "extlinks_on": "INTEGER NOT NULL DEFAULT 1",
     "service_join": "INTEGER NOT NULL DEFAULT 0",
     "service_leave": "INTEGER NOT NULL DEFAULT 0",
@@ -286,6 +254,7 @@ _TABLE_MIGRATIONS = {
     "triggers": {"file_path": "TEXT", "media_type": "TEXT",
                  "cooldown": "INTEGER NOT NULL DEFAULT 30"},
     "whitelist": {"title": "TEXT"},
+    "answers": {"last_used": "INTEGER NOT NULL DEFAULT 0"},
 }
 
 
@@ -311,14 +280,13 @@ async def _migrate() -> None:
         if await cur.fetchone() is None:
             await _db.execute(f"UPDATE settings SET card_mask = card_mask | {bit}")
             await _db.execute("INSERT INTO kv (k, v) VALUES (?, '1')", (flag,))
-    # старый отдельный список анонимов переезжает в общий вайтлист
-    cur = await _db.execute("SELECT v FROM kv WHERE k = 'mig_anon_to_wl'")
+    # таблицы удалённых функций: варны, список для жалоб, отдельный вайтлист анонимов
+    # (его содержимое давно переехало в общий whitelist)
+    cur = await _db.execute("SELECT v FROM kv WHERE k = 'mig_drop_dead'")
     if await cur.fetchone() is None:
-        await _db.execute(
-            """INSERT INTO whitelist (chat_id, user_id, username, title, scope)
-               SELECT chat_id, sender_id, NULL, title, 'anon' FROM anon_wl"""
-        )
-        await _db.execute("INSERT INTO kv (k, v) VALUES ('mig_anon_to_wl', '1')")
+        for dead in ("warns", "report_wl", "anon_wl"):
+            await _db.execute(f"DROP TABLE IF EXISTS {dead}")
+        await _db.execute("INSERT INTO kv (k, v) VALUES ('mig_drop_dead', '1')")
 
     # ответы триггеров и счётчиков переехали в answers: теперь их может быть несколько
     cur = await _db.execute("SELECT v FROM kv WHERE k = 'mig_answers'")
@@ -453,21 +421,6 @@ async def set_setting(chat_id: int, field: str, value) -> None:
 
 
 # ---------- вайтлист людей ----------
-
-async def wl_add(chat_id: int, user_id: int | None, username: str | None, scope: str,
-                 title: str | None = None) -> int:
-    cur = await _db.execute(
-        "INSERT INTO whitelist (chat_id, user_id, username, title, scope) VALUES (?, ?, ?, ?, ?)",
-        (chat_id, user_id, (username or None) and username.lower().lstrip("@"), title, scope),
-    )
-    await _db.commit()
-    return cur.lastrowid
-
-
-async def wl_remove(row_id: int) -> None:
-    await _db.execute("DELETE FROM whitelist WHERE id = ?", (row_id,))
-    await _db.commit()
-
 
 async def wl_list(chat_id: int) -> list[aiosqlite.Row]:
     cur = await _db.execute("SELECT * FROM whitelist WHERE chat_id = ? ORDER BY id", (chat_id,))
@@ -650,26 +603,6 @@ async def words_list(chat_id: int) -> list[aiosqlite.Row]:
     return await cur.fetchall()
 
 
-# ---------- вайтлист анонимных отправителей ----------
-
-async def anon_add(chat_id: int, sender_id: int, title: str | None) -> None:
-    await _db.execute(
-        "INSERT INTO anon_wl (chat_id, sender_id, title) VALUES (?, ?, ?)",
-        (chat_id, sender_id, title),
-    )
-    await _db.commit()
-
-
-async def anon_remove(row_id: int) -> None:
-    await _db.execute("DELETE FROM anon_wl WHERE id = ?", (row_id,))
-    await _db.commit()
-
-
-async def anon_list(chat_id: int) -> list[aiosqlite.Row]:
-    cur = await _db.execute("SELECT * FROM anon_wl WHERE chat_id = ? ORDER BY id", (chat_id,))
-    return await cur.fetchall()
-
-
 def id_variants(cid: int) -> tuple[int, ...]:
     """Один и тот же канал записывают по-разному: -1001389201023 и 1389201023.
     Сверяем оба варианта, чтобы вайтлист не молчал из-за формата."""
@@ -680,16 +613,6 @@ def id_variants(cid: int) -> tuple[int, ...]:
     elif cid > 0:
         out.add(int(f"-100{s}"))
     return tuple(out)
-
-
-async def anon_allowed(chat_id: int, sender_id: int) -> bool:
-    ids = id_variants(sender_id)
-    ph = ",".join("?" * len(ids))
-    cur = await _db.execute(
-        f"SELECT 1 FROM anon_wl WHERE chat_id = ? AND sender_id IN ({ph})",
-        (chat_id, *ids),
-    )
-    return await cur.fetchone() is not None
 
 
 # ---------- наказания ----------
@@ -843,81 +766,6 @@ async def is_bot_banned(user_id: int) -> bool:
     return bool(row and row["banned"])
 
 
-# ---------- варны ----------
-
-async def warn_inc(chat_id: int, user_id: int) -> int:
-    """Увеличить счётчик варнов, вернуть новое значение."""
-    await _db.execute(
-        """INSERT INTO warns (chat_id, user_id, count, updated) VALUES (?, ?, 1, ?)
-           ON CONFLICT(chat_id, user_id) DO UPDATE SET
-             count = warns.count + 1, updated = excluded.updated""",
-        (chat_id, user_id, _now()),
-    )
-    await _db.commit()
-    cur = await _db.execute(
-        "SELECT count FROM warns WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
-    )
-    return (await cur.fetchone())["count"]
-
-
-async def warn_dec(chat_id: int, user_id: int) -> int:
-    cur = await _db.execute(
-        "SELECT count FROM warns WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
-    )
-    row = await cur.fetchone()
-    new = max(0, (row["count"] if row else 0) - 1)
-    await _db.execute(
-        """INSERT INTO warns (chat_id, user_id, count, updated) VALUES (?, ?, ?, ?)
-           ON CONFLICT(chat_id, user_id) DO UPDATE SET count = ?, updated = ?""",
-        (chat_id, user_id, new, _now(), new, _now()),
-    )
-    await _db.commit()
-    return new
-
-
-async def warn_reset(chat_id: int, user_id: int) -> None:
-    await _db.execute(
-        "DELETE FROM warns WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
-    )
-    await _db.commit()
-
-
-async def warn_get(chat_id: int, user_id: int) -> int:
-    cur = await _db.execute(
-        "SELECT count FROM warns WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
-    )
-    row = await cur.fetchone()
-    return row["count"] if row else 0
-
-
-# ---------- список допущенных к жалобам ----------
-
-async def report_wl_add(chat_id: int, user_id: int | None, username: str | None) -> None:
-    await _db.execute(
-        "INSERT INTO report_wl (chat_id, user_id, username) VALUES (?, ?, ?)",
-        (chat_id, user_id, (username or None) and username.lower().lstrip("@")),
-    )
-    await _db.commit()
-
-
-async def report_wl_remove(row_id: int) -> None:
-    await _db.execute("DELETE FROM report_wl WHERE id = ?", (row_id,))
-    await _db.commit()
-
-
-async def report_wl_list(chat_id: int) -> list[aiosqlite.Row]:
-    cur = await _db.execute("SELECT * FROM report_wl WHERE chat_id = ? ORDER BY id", (chat_id,))
-    return await cur.fetchall()
-
-
-async def report_wl_allowed(chat_id: int, user_id: int, username: str | None) -> bool:
-    cur = await _db.execute(
-        "SELECT 1 FROM report_wl WHERE chat_id = ? AND (user_id = ? OR (username IS NOT NULL AND username = ?))",
-        (chat_id, user_id, (username or "").lower()),
-    )
-    return await cur.fetchone() is not None
-
-
 # ---------- триггеры ----------
 
 # ---------- варианты ответов (общие для триггеров и счётчиков) ----------
@@ -944,12 +792,37 @@ async def ans_list(owner: str, owner_id: int) -> list[aiosqlite.Row]:
 
 
 async def ans_pick(owner: str, owner_id: int) -> aiosqlite.Row | None:
-    """Случайный вариант ответа. Выбор делает SQLite — не тянем весь список."""
+    """Случайный вариант ответа — из тех, что давно не выпадали.
+
+    Чистый RANDOM повторяется: из 48 вариантов один и тот же легко выпадает
+    дважды подряд. Поэтому берём половину списка с самыми старыми показами
+    (ещё не показанные имеют last_used = 0, то есть идут первыми) и случайно
+    выбираем уже среди них. Показанное вернётся в игру, когда остальные
+    догонят его по свежести.
+    """
     cur = await _db.execute(
-        "SELECT * FROM answers WHERE owner = ? AND owner_id = ? ORDER BY RANDOM() LIMIT 1",
+        "SELECT COUNT(*) AS n FROM answers WHERE owner = ? AND owner_id = ?",
         (owner, owner_id),
     )
-    return await cur.fetchone()
+    total = (await cur.fetchone())["n"]
+    if not total:
+        return None
+    pool = max(1, total // 2)
+    cur = await _db.execute(
+        """SELECT * FROM answers WHERE owner = ? AND owner_id = ?
+           ORDER BY last_used ASC, RANDOM() LIMIT ?""",
+        (owner, owner_id, pool),
+    )
+    rows = await cur.fetchall()
+    row = random.choice(rows)
+    # метка в миллисекундах: в секундах несколько вызовов подряд получали
+    # одинаковую свежесть, и сортировка вырождалась в чистый рандом
+    await _db.execute(
+        "UPDATE answers SET last_used = ? WHERE id = ?",
+        (int(time.time() * 1000), row["id"]),
+    )
+    await _db.commit()
+    return row
 
 
 async def ans_stats(owner: str, owner_ids: list[int]) -> dict[int, tuple[int, int]]:

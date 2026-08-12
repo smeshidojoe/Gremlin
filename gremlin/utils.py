@@ -46,7 +46,7 @@ def until_ts(minutes: int) -> int | None:
 def fmt_ts(ts: int | None) -> str:
     if not ts:
         return "навсегда"
-    return time.strftime("%d.%m.%Y %H:%M", time.localtime(ts))
+    return _local(ts).strftime("%d.%m.%Y %H:%M")
 
 
 # ---------- местное время ----------
@@ -61,6 +61,12 @@ def _tz() -> timezone:
 
 def local_now() -> datetime:
     return datetime.now(_tz())
+
+
+def _local(ts: float) -> datetime:
+    """Unix-время -> местное. Через TZ_OFFSET, а не через часовой пояс машины:
+    вне докера он может быть любым, и даты в меню разъехались бы со статистикой."""
+    return datetime.fromtimestamp(ts, _tz())
 
 
 def day_num(ts: float | None = None) -> int:
@@ -99,13 +105,13 @@ def rel_time(ts: int) -> str:
         return f"{d // 60} мин назад"
     if d < 21600:  # до 6 часов — относительное, дальше уже путает
         return f"{d // 3600} ч назад"
-    today = time.localtime(now).tm_yday
-    then = time.localtime(ts)
-    if then.tm_yday == today:
-        return time.strftime("сегодня %H:%M", then)
-    if then.tm_yday == today - 1:
-        return time.strftime("вчера %H:%M", then)
-    return time.strftime("%d.%m %H:%M", then)
+    today = day_num(now)
+    then = _local(ts)
+    if day_num(ts) == today:
+        return then.strftime("сегодня %H:%M")
+    if day_num(ts) == today - 1:
+        return then.strftime("вчера %H:%M")
+    return then.strftime("%d.%m %H:%M")
 
 
 # kind события -> эмодзи и человеческая подпись

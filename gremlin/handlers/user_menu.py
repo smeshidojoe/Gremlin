@@ -1,7 +1,7 @@
 """Личное меню владельца чатов: настройка всех функций. Всё в одном сообщении."""
 import asyncio
 import logging
-import os
+import re
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandStart, StateFilter
@@ -9,7 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    Message, ReplyKeyboardRemove, WebAppInfo,
+    Message, ReplyKeyboardRemove,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -56,8 +56,6 @@ async def view_home(user_id: int, bot: Bot) -> tuple[str, InlineKeyboardMarkup]:
     """Единое меню — одинаковое для всех допущенных."""
     b = InlineKeyboardBuilder()
     b.button(text="💬 Чаты", callback_data="u:chats")
-    if config.WEBAPP_URL:
-        b.button(text="🖥 Открыть в приложении", web_app=WebAppInfo(url=config.WEBAPP_URL))
     b.button(text="📜 Лог событий", callback_data="a:log")
     b.button(text="🐞 Ошибки", callback_data="a:errors")
     b.button(text="⚙️ Состояние", callback_data="a:health")
@@ -65,7 +63,7 @@ async def view_home(user_id: int, bot: Bot) -> tuple[str, InlineKeyboardMarkup]:
         # управление доступом — граница доверия, только владелец бота
         b.button(text="👥 Доступ к боту", callback_data="u:acc")
     b.button(text="✖️ Закрыть", callback_data="u:close")
-    b.adjust(1, 1, 2, 1, 1, 1)
+    b.adjust(1, 2, 1, 1, 1)
     return _HOME_TEXT, b.as_markup()
 
 
@@ -421,12 +419,20 @@ ANS_OWNER = {"t": "trig", "c": "cmd"}
 ANS_LIMIT = 60   # ответов бывает много: списки-рулетки вроде !судимости
 
 
+_TAGS = re.compile(r"<[^>]+>")
+
+
+def _plain(text: str | None) -> str:
+    """Текст без разметки — для превью в меню: сырые теги там только мешают."""
+    return utils.esc(_TAGS.sub("", text or ""))
+
+
 def _ans_line(a) -> str:
     """Одна строка варианта в человеческом виде."""
     if a["file_path"]:
         s = f"🖼 медиа ({a['media_type']})"
-        return s + (f" · подпись: <code>{utils.esc(a['text'])}</code>" if a["text"] else "")
-    return f"💬 <code>{utils.esc(a['text'] or '')}</code>"
+        return s + (f" · подпись: <code>{_plain(a['text'])}</code>" if a["text"] else "")
+    return f"💬 <code>{_plain(a['text'])}</code>"
 
 
 def _ans_preview(answers: list) -> str:
@@ -989,7 +995,8 @@ async def trig_reply_input(message: Message, state: FSMContext, bot: Bot) -> Non
         await _done(message, bot, state, await view_trigs(cid, 0))
         return
     if message.text:
-        await db.trig_add(cid, phrase, message.text)
+        # html_text сохраняет жирный/курсив/ссылки, которые человек набрал в Telegram
+        await db.trig_add(cid, phrase, message.html_text)
     else:
         media = triggers.extract_media(message)
         if media is None:
@@ -1001,7 +1008,7 @@ async def trig_reply_input(message: Message, state: FSMContext, bot: Bot) -> Non
             return
         # файл скачиваем сразу — триггер не зависит от сохранности этой переписки
         path = await triggers.save_media(bot, media.file_id, cid, media.kind)
-        await db.trig_add(cid, phrase, message.caption or None, path, media.kind)
+        await db.trig_add(cid, phrase, message.html_text or None, path, media.kind)
     note = "✅ Триггер добавлен.\n\n"
     if not (await db.get_settings(cid)).trig_on:
         # добавили триггер — значит хотят, чтобы он работал; иначе «добавил, а тишина»
@@ -1105,7 +1112,6 @@ async def view_cmd(cid: int, rid: int) -> tuple[str, InlineKeyboardMarkup]:
         f"Вызовов: <b>{r['count']}</b>"
     )
     b.row(_btn(f"🎲 Варианты ответа: {len(answers)}", f"u:an:{cid}:c:{rid}:0"))
-    values = list(config.CMD_COOLDOWN_PRESETS)
     b.row(
         _btn("◀", f"u:cmc:{cid}:{rid}:-"),
         _btn(f"⏱ {cd}", f"u:cmc:{cid}:{rid}:+"),
@@ -1163,13 +1169,14 @@ async def cb_answer_add(cb: CallbackQuery, state: FSMContext) -> None:
 async def ans_new_input(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
     cid, code, oid = data["cid"], data["code"], data["oid"]
-    text = (message.text or message.caption or "").strip()
-    if text == "/cancel":
+    raw = (message.text or message.caption or "").strip()
+    text = message.html_text.strip()          # с разметкой, как её набрали
+    if raw == "/cancel":
         await _done(message, bot, state, await view_answers(cid, code, oid, 0))
         return
 
     media = triggers.extract_media(message) if code == "t" else None
-    if media is None and not text:
+    if media is None and not raw:
         hint = ("⚠️ Нужен текст или медиа." if code == "t"
                 else "⚠️ Нужен текст: у счётчиков ответы только текстовые.")
         await _retry(message, bot, state, f"<b>🎲 Новый вариант ответа</b>\n\n{hint}")
@@ -1271,7 +1278,7 @@ async def cmd_template_input(message: Message, state: FSMContext, bot: Bot) -> N
     if not text:
         await _retry(message, bot, state, _CMD_NAME_HEAD + "⚠️ Нужен текст заготовки.")
         return
-    await db.cmd_add(cid, data["cmd"], text, 30)
+    await db.cmd_add(cid, data["cmd"], message.html_text.strip(), 30)
     note = "✅ Счётчик создан.\n\n"
     if not (await db.get_settings(cid)).cmds_on:
         await db.set_setting(cid, "cmds_on", 1)

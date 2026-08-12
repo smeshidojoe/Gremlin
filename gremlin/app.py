@@ -5,12 +5,12 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import ErrorEvent, MenuButtonCommands, MenuButtonWebApp, WebAppInfo
+from aiogram.types import ErrorEvent, MenuButtonCommands
 
-from . import config, db, userbot, web
+from . import config, db, userbot
 from .handlers import admin_menu, cards, events, group, user_menu
 from .middlewares import TrackingMiddleware
-from .services import digest, errorlog
+from .services import backup, digest, errorlog
 
 logger = logging.getLogger("gremlin")
 
@@ -52,16 +52,7 @@ async def main() -> None:
     dp.callback_query.middleware(TrackingMiddleware())
     dp.errors.register(_on_error)
 
-    web_runner = None
-    if config.WEBAPP_URL:
-        web_runner = await web.start()  # mini app
-        # официальная кнопка-меню (≡) в личке: открывает аппку
-        await bot.set_chat_menu_button(
-            menu_button=MenuButtonWebApp(text="⚙️ Настройки", web_app=WebAppInfo(url=config.WEBAPP_URL))
-        )
-    else:
-        logger.info("WEBAPP_URL не задан — mini app выключен")
-        await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
     # порядок важен: специфичные роутеры до группового catch-all
     dp.include_routers(
@@ -73,6 +64,7 @@ async def main() -> None:
     )
 
     digest_task = asyncio.create_task(digest.scheduler(bot))
+    backup_task = asyncio.create_task(backup.scheduler())
     try:
         ub = await userbot.start(bot)
     except Exception:
@@ -89,10 +81,9 @@ async def main() -> None:
         )
     finally:
         digest_task.cancel()
+        backup_task.cancel()
         if ub is not None:
             await ub.disconnect()
-        if web_runner is not None:
-            await web_runner.cleanup()
         await db.close()
         await bot.session.close()
         logger.info("bot stopped")

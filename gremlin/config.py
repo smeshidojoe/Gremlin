@@ -46,12 +46,6 @@ CAPTCHA_TIMEOUT_PRESETS = (60, 120, 300, 600)
 # Сообщение не трогаем, если оно старше стольких секунд (защита от бэклога).
 MSG_MAX_AGE = 120
 
-# Mini app. WEBAPP_URL — публичный https-адрес (Telegram требует https). Пусто = аппка выкл.
-# `or` вместо дефолта getenv: пустая переменная в .env (WEBAPP_PORT=) иначе перебила бы дефолт.
-WEBAPP_URL = (os.getenv("WEBAPP_URL") or "").rstrip("/")
-WEBAPP_HOST = os.getenv("WEBAPP_HOST") or "0.0.0.0"
-WEBAPP_PORT = int(os.getenv("WEBAPP_PORT") or "8080")
-
 # Варианты наказаний (селектор).
 PUNISH_VALUES = ("delete", "mute", "ban")
 PUNISH_LABELS = {"delete": "только удаление", "mute": "мут", "ban": "бан"}
@@ -102,6 +96,13 @@ TRIG_COOLDOWN = 30
 # Счётчики (команды со счётом): лимит на чат и пресеты кулдауна, сек (0 = без кулдауна).
 CMD_LIMIT = 30
 CMD_COOLDOWN_PRESETS = (0, 5, 10, 30, 60, 180, 600)
+# Отдельный кулдаун для тех, кто в чате не состоит (комментаторы под постами канала):
+# один на все счётчики сразу, чтобы гость не перебирал их по кругу. 0 = как у всех.
+CMD_GUEST_CD_PRESETS = (0, 300, 900, 1800, 3600, 7200, 21600, 86400)
+CMD_GUEST_CD_LABELS = {
+    0: "как у всех", 300: "5 мин", 900: "15 мин", 1800: "30 мин",
+    3600: "1 час", 7200: "2 часа", 21600: "6 часов", 86400: "сутки",
+}
 # Медиа-ответы триггеров лежат тут (файл скачивается один раз при создании).
 TRIG_DIR = os.getenv("TRIG_DIR") or os.path.join(BASE_DIR, "data", "triggers")
 
@@ -111,6 +112,11 @@ TG_API_ID = os.getenv("TG_API_ID") or ""
 TG_API_HASH = os.getenv("TG_API_HASH") or ""
 TG_SESSION = os.getenv("TG_SESSION") or os.path.join(BASE_DIR, "data", "audit_session")
 USERBOT_ON = (os.getenv("USERBOT_ON") or "1") not in ("0", "false", "no")
+
+# Автобэкап базы: копия раз в сутки в BACKUP_DIR, хранится последние BACKUP_KEEP штук.
+BACKUP_ON = (os.getenv("BACKUP_ON") or "1") not in ("0", "false", "no")
+BACKUP_DIR = os.getenv("BACKUP_DIR") or os.path.join(BASE_DIR, "data", "backups")
+BACKUP_KEEP = int(os.getenv("BACKUP_KEEP") or 14)
 
 # Возврат после разбана: сколько часов живёт пригласительная ссылка и «пропуск»,
 # по которому бот сам одобряет заявку на вступление от разбаненного.

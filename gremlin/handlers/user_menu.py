@@ -1727,11 +1727,10 @@ async def cb_lift(cb: CallbackQuery, bot: Bot) -> None:
     cid = int(cid)
     if not await _guard(cb, cid):
         return
-    ok, msg, link = await moderation.lift_punishment(bot, int(pid))
+    # ссылку на возврат не делаем: она нужна только в карточке лог-чата
+    ok, msg, _ = await moderation.lift_punishment(bot, int(pid), invite=False)
     text, kb = await view_punishments(cid, 0)
-    # ссылку дописываем в это же сообщение — до следующего перехода по меню
-    await cb.message.edit_text(text + moderation.unban_note(link), reply_markup=kb,
-                               disable_web_page_preview=True)
+    await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer(msg, show_alert=not ok)
 
 
@@ -1799,7 +1798,7 @@ async def cb_wl_toggle(cb: CallbackQuery, bot: Bot) -> None:
     if e["user_id"] and "anon" in on:     # разрешили анонимные — снимаем старый бан канала
         p = await db.active_punishment_of(cid, e["user_id"], "banchan")
         if p is not None:
-            ok, msg, _ = await moderation.lift_punishment(bot, p["id"])
+            ok, msg, _ = await moderation.lift_punishment(bot, p["id"], invite=False)
             note = " · бан канала снят" if ok else f" · бан снять не вышло: {msg}"
             if ok:
                 await db.add_event(
@@ -1934,7 +1933,7 @@ async def wl_target_input(message: Message, state: FSMContext, bot: Bot) -> None
         if user_id:                     # был забанен как анонимный отправитель — снимаем
             p = await db.active_punishment_of(cid, user_id, "banchan")
             if p is not None:
-                ok, msg, _ = await moderation.lift_punishment(bot, p["id"])
+                ok, msg, _ = await moderation.lift_punishment(bot, p["id"], invite=False)
                 note += ("✅ Бан канала снят.\n\n" if ok
                          else f"⚠️ Бан канала снять не вышло: {msg}\n\n")
                 if ok:

@@ -179,11 +179,13 @@ async def apply_punishment(bot: Bot, chat_id: int, user: User, kind: str,
     )
 
 
-async def lift_punishment(bot: Bot, pid: int) -> tuple[bool, str, str | None]:
+async def lift_punishment(bot: Bot, pid: int,
+                          invite: bool = True) -> tuple[bool, str, str | None]:
     """Снять наказание по id. Вернуть (успех, текст, ссылка на возврат или None).
 
     Ссылку не публикуем сами — её дописывает вызвавший в своё же сообщение,
-    чтобы лог-чат не пух от отдельных постов.
+    чтобы лог-чат не пух от отдельных постов. invite=False — ссылку вообще не
+    создавать: в меню она не нужна, а лишние одноразовые ссылки копятся в чате.
     """
     p = await db.get_punishment(pid)
     if p is None:
@@ -200,7 +202,7 @@ async def lift_punishment(bot: Bot, pid: int) -> tuple[bool, str, str | None]:
         logger.warning("lift %s failed: %s", pid, e)
         return False, f"Не удалось снять: {e}", None
     await db.deactivate_punishment(pid)
-    link = await invite_back(bot, chat_id, uid) if kind == "ban" else None
+    link = await invite_back(bot, chat_id, uid) if (kind == "ban" and invite) else None
     return True, "Снято.", link
 
 

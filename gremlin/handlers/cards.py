@@ -37,7 +37,14 @@ async def card_lift(cb: CallbackQuery, bot: Bot) -> None:
         await cb.answer(text, show_alert=True)
         return
     # ссылку дописываем в саму карточку — отдельный пост только замусорил бы лог
-    await _mark(cb, "\n\n✅ <b>Наказание снято</b>" + moderation.unban_note(link))
+    clean = cb.message.html_text + "\n\n✅ <b>Наказание снято</b>"
+    marked = await _mark(cb, "\n\n✅ <b>Наказание снято</b>" + moderation.unban_note(link))
+    if marked and link and p is not None:
+        # запомним карточку: ссылку из неё надо будет убрать при возврате человека
+        # или перед тем, как Telegram перестанет давать править сообщение
+        await moderation.remember_unban_card(
+            p["chat_id"], p["user_id"], cb.message.chat.id, cb.message.message_id, clean
+        )
     await db.add_event(
         p["chat_id"] if p else None, "card",
         f"снято наказание #{pid} юзером {cb.from_user.id}",

@@ -33,25 +33,28 @@ def invalidate_admins(chat_id: int) -> None:
 _linked: dict[int, tuple[float, tuple]] = {}
 
 
-async def linked_chat(bot: Bot, chat_id: int) -> tuple[int | None, str | None]:
-    """Привязанный к супергруппе канал (id, username). Нужен, чтобы ссылки
-    на его посты не считались рекламой чужого канала."""
+async def linked_chat(bot: Bot, chat_id: int) -> tuple[int | None, str | None, str | None]:
+    """Привязанный к супергруппе канал: (id, username, название).
+
+    Нужен, чтобы ссылки на его посты не считались рекламой чужого канала,
+    а в списке чатов было видно, к какому каналу привязано обсуждение.
+    """
     now = time.monotonic()
     cached = _linked.get(chat_id)
     if cached and cached[0] > now:
         return cached[1]
-    result: tuple[int | None, str | None] = (None, None)
+    result: tuple[int | None, str | None, str | None] = (None, None, None)
     try:
         chat = await bot.get_chat(chat_id)
         linked_id = getattr(chat, "linked_chat_id", None)
         if linked_id:
-            uname = None
+            uname, title = None, None
             try:
                 linked = await bot.get_chat(linked_id)
-                uname = linked.username
+                uname, title = linked.username, linked.title
             except Exception:
                 pass
-            result = (linked_id, uname)
+            result = (linked_id, uname, title)
     except Exception:
         pass
     _linked[chat_id] = (now + config.ADMIN_CACHE_TTL, result)

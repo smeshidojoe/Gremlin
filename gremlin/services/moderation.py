@@ -1,5 +1,6 @@
 """Ядро модерации: применение наказаний, карточки в лог-чат, глобальный админ-лог."""
 import asyncio
+import json
 import logging
 import time
 
@@ -251,6 +252,86 @@ async def invite_back(bot: Bot, chat_id: int, uid: int) -> str | None:
     return link.invite_link
 
 
+# Карточка, в которую дописана ссылка на возврат: её надо будет почистить,
+# когда ссылка отзовётся или протухнет. Править своё сообщение бот может лишь
+# 48 часов, поэтому чистим с запасом — за пять минут до лимита.
+CARD_EDIT_LIMIT = 48 * 3600 - 300
+
+
+def unban_card_key(chat_id: int, uid: int) -> str:
+    return f"unban_card:{chat_id}:{uid}"
+
+
+async def remember_unban_card(chat_id: int, uid: int, log_chat_id: int,
+                              msg_id: int, clean_text: str) -> None:
+    """Запомнить карточку со ссылкой и её вид без ссылки.
+
+    Карточек может быть несколько: одного и того же человека могли банить и
+    разбанивать не раз, и ссылка попадала в каждую. Поэтому копим список, а не
+    одну запись — иначе старая карточка осталась бы с живой ссылкой.
+    """
+    raw = await db.kv_get(unban_card_key(chat_id, uid))
+    try:
+        data = json.loads(raw) if raw else {}
+    except ValueError:
+        data = {}
+    cards = [c for c in data.get("cards", []) if c.get("msg") != msg_id]
+    cards.append({"log": log_chat_id, "msg": msg_id, "text": clean_text})
+    await db.kv_set(unban_card_key(chat_id, uid), json.dumps({
+        "until": int(time.time()) + CARD_EDIT_LIMIT, "cards": cards[-10:],
+    }))
+
+
+async def clear_unban_card(bot: Bot, chat_id: int, uid: int, returned: bool = False) -> None:
+    """Убрать ссылку из карточек — молча, если править уже нельзя.
+
+    returned — человек вернулся в чат; иначе просто вышел срок.
+    """
+    raw = await db.kv_get(unban_card_key(chat_id, uid))
+    if not raw:
+        return
+    await db.kv_set(unban_card_key(chat_id, uid), None)
+    note = ("\n\n<i>Участник возвращён. Ссылка на возврат деактивирована.</i>"
+            if returned else "\n\n<i>Ссылка на возврат деактивирована.</i>")
+    try:
+        cards = json.loads(raw).get("cards", [])
+    except ValueError:
+        return
+    for card in cards:
+        try:
+            await bot.edit_message_text(
+                card["text"] + note, chat_id=card["log"], message_id=card["msg"],
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+        except Exception:
+            logger.warning("не вышло убрать ссылку из карточки", exc_info=True)
+
+
+async def card_sweeper(bot: Bot) -> None:
+    """Раз в пять минут чистит карточки, у которых ссылка вот-вот протухнет.
+
+    В Telegram при этом не ходим: пока чистить нечего, это один запрос к своей
+    же базе и сон.
+    """
+    while True:
+        try:
+            now = time.time()
+            for key, raw in await db.kv_prefix("unban_card:"):
+                try:
+                    data = json.loads(raw)
+                except ValueError:
+                    await db.kv_set(key, None)
+                    continue
+                if now < data.get("until", 0):
+                    continue
+                _, chat_id, uid = key.split(":")
+                await clear_unban_card(bot, int(chat_id), int(uid))
+                await db.kv_set(unban_link_key(int(chat_id), int(uid)), None)
+        except Exception:
+            logger.warning("card sweeper tick failed", exc_info=True)
+        await asyncio.sleep(300)
+
+
 async def revoke_unban_link(bot: Bot, chat_id: int, uid: int) -> None:
     """Человек вернулся — ссылка больше не нужна, отзываем её.
 
@@ -260,6 +341,8 @@ async def revoke_unban_link(bot: Bot, chat_id: int, uid: int) -> None:
     link = await db.kv_get(unban_link_key(chat_id, uid))
     await db.kv_set(unban_link_key(chat_id, uid), None)
     await db.kv_set(unban_pass_key(chat_id, uid), None)
+    # человек в чате: ссылка мертва, убираем её из карточек
+    await clear_unban_card(bot, chat_id, uid, returned=True)
     if not link:
         return
     try:

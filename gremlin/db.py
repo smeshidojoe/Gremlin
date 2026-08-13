@@ -1064,6 +1064,14 @@ async def kv_get(key: str) -> str | None:
     return row["v"] if row else None
 
 
+async def kv_prefix(prefix: str) -> list[tuple[str, str]]:
+    """Все пары по префиксу ключа — например, все отложенные правки карточек."""
+    cur = await _db.execute(
+        "SELECT k, v FROM kv WHERE k LIKE ? ORDER BY k", (prefix + "%",)
+    )
+    return [(r["k"], r["v"]) for r in await cur.fetchall()]
+
+
 async def kv_set(key: str, value: str | None) -> None:
     if value is None:
         await _db.execute("DELETE FROM kv WHERE k = ?", (key,))

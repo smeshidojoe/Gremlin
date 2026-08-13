@@ -10,7 +10,7 @@ from aiogram.types import ErrorEvent, MenuButtonCommands
 from . import config, db, userbot
 from .handlers import admin_menu, cards, events, group, user_menu
 from .middlewares import TrackingMiddleware
-from .services import backup, digest, errorlog
+from .services import backup, digest, errorlog, moderation
 
 logger = logging.getLogger("gremlin")
 
@@ -65,6 +65,7 @@ async def main() -> None:
 
     digest_task = asyncio.create_task(digest.scheduler(bot))
     backup_task = asyncio.create_task(backup.scheduler())
+    sweeper_task = asyncio.create_task(moderation.card_sweeper(bot))
     try:
         ub = await userbot.start(bot)
     except Exception:
@@ -82,6 +83,7 @@ async def main() -> None:
     finally:
         digest_task.cancel()
         backup_task.cancel()
+        sweeper_task.cancel()
         if ub is not None:
             await ub.disconnect()
         await db.close()

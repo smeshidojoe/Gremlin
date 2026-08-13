@@ -569,7 +569,7 @@ async def moderate(message: Message, bot: Bot) -> None:
         me = await bot.me()
         own_names = {me.username, chat.username}
         own_ids = {chat.id}
-        linked_id, linked_name = await adm_cache.linked_chat(bot, chat.id)
+        linked_id, linked_name, _ = await adm_cache.linked_chat(bot, chat.id)
         if linked_id:
             own_ids.add(linked_id)
         if linked_name:

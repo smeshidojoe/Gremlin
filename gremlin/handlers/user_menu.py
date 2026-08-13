@@ -14,7 +14,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .. import config, db, schema, utils
-from ..services import filters as flt, resolve, triggers
+from ..services import adm_cache, filters as flt, resolve, triggers
 
 logger = logging.getLogger("gremlin.user_menu")
 
@@ -77,7 +77,12 @@ async def view_chats(bot: Bot) -> tuple[str, InlineKeyboardMarkup]:
     if chats:
         text = f"<b>💬 Чаты</b> ({len(chats)})\n\nВыберите чат — откроются его данные и настройки."
         for c in chats:
-            b.button(text=c["title"] or str(c["chat_id"]), callback_data=f"u:c:{c['chat_id']}")
+            title = c["title"] or str(c["chat_id"])
+            # у обсуждений название канала важнее собственного: чатов может быть
+            # несколько, и по их именам не понять, к чему они прицеплены
+            _, _, linked = await adm_cache.linked_chat(bot, c["chat_id"])
+            label = f"{title} · 📣 {linked}" if linked else title
+            b.button(text=label[:60], callback_data=f"u:c:{c['chat_id']}")
     else:
         text = "<b>💬 Чаты</b>\n\nПока пусто. Добавьте бота в чат администратором."
     b.button(

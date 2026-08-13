@@ -210,29 +210,38 @@ def unban_pass_key(chat_id: int, uid: int) -> str:
     return f"unban_pass:{chat_id}:{uid}"
 
 
+def unban_link_key(chat_id: int, uid: int) -> str:
+    return f"unban_link:{chat_id}:{uid}"
+
+
 async def invite_back(bot: Bot, chat_id: int, uid: int) -> str | None:
     """После разбана: ссылка на возврат + пропуск на автоодобрение заявки.
 
     Разбан только снимает блокировку, членом чата человека он не делает. В личку
     бот написать чаще всего не может (тот ему не писал), поэтому ссылку возвращаем
-    наверх — вызвавший дописывает её в свою же карточку, чтобы лог-чат не пух от
-    отдельных постов. Заодно ставим «пропуск»: если чат по заявкам, заявку от
-    этого юзера бот одобрит автоматически.
+    наверх — вызвавший дописывает её в свою же карточку.
+
+    Ссылка сделана «по заявке», а не одноразовой: одноразовую мог потратить любой,
+    кто увидел карточку в лог-чате, и разбаненному бы не досталось. Тут же заявку
+    от него бот одобрит сам по «пропуску», а заявка постороннего уйдёт админам.
     """
     until = int(time.time()) + config.UNBAN_PASS_HOURS * 3600
     await db.kv_set(unban_pass_key(chat_id, uid), str(until))
 
-    link = None
+    old = await db.kv_get(unban_link_key(chat_id, uid))
+    if old:
+        return old                            # живая ссылка уже есть, вторую не плодим
+
     try:
         link = await bot.create_chat_invite_link(
-            chat_id, member_limit=1, expire_date=until,
+            chat_id, creates_join_request=True, expire_date=until,
             name=f"возврат {uid}"[:32],
         )
     except Exception:
         logger.warning("invite link failed for chat %s", chat_id, exc_info=True)
-
-    if link is None:
         return ""                             # бан сняли, но ссылку сделать не вышло
+
+    await db.kv_set(unban_link_key(chat_id, uid), link.invite_link)
     try:                                      # вдруг человек всё же писал боту
         await bot.send_message(
             uid, f"Вас разблокировали. Ссылка для возврата в чат:\n{link.invite_link}"
@@ -240,6 +249,23 @@ async def invite_back(bot: Bot, chat_id: int, uid: int) -> str | None:
     except Exception:
         pass
     return link.invite_link
+
+
+async def revoke_unban_link(bot: Bot, chat_id: int, uid: int) -> None:
+    """Человек вернулся — ссылка больше не нужна, отзываем её.
+
+    Иначе она болталась бы в карточке живой ещё двое суток, и по ней мог зайти
+    любой, кому карточку переслали.
+    """
+    link = await db.kv_get(unban_link_key(chat_id, uid))
+    await db.kv_set(unban_link_key(chat_id, uid), None)
+    await db.kv_set(unban_pass_key(chat_id, uid), None)
+    if not link:
+        return
+    try:
+        await bot.revoke_chat_invite_link(chat_id, link)
+    except Exception:
+        logger.warning("revoke invite link failed in %s", chat_id, exc_info=True)
 
 
 def unban_note(link: str | None) -> str:
@@ -251,7 +277,7 @@ def unban_note(link: str | None) -> str:
     if link is None:
         return ""
     if link:
-        return f"\n\nСсылка для входа:\n{link}"
+        return f"\n\nСсылка для входа (по заявке, её бот одобрит сам):\n{link}"
     return ("\n\n⚠️ Ссылку создать не вышло — боту нужно право "
             "«Пригласительные ссылки».")
 

@@ -101,6 +101,9 @@ async def member_updated(update: ChatMemberUpdated, bot: Bot) -> None:
     target = new.user
     # состав поменялся — кэш «состоит в чате» для этого юзера устарел
     adm_cache.invalidate_member(chat.id, target.id)
+    if new.status in ("member", "administrator", "creator"):
+        # человек в чате: ссылка на возврат больше не нужна, даже если вошёл иначе
+        await moderation.revoke_unban_link(bot, chat.id, target.id)
     if target.is_bot:
         return
 
@@ -184,7 +187,8 @@ async def join_request(update, bot: Bot) -> None:
         logger.warning("approve join request failed in %s for %s", chat_id, user.id,
                        exc_info=True)
         return
-    await db.kv_set(moderation.unban_pass_key(chat_id, user.id), None)
+    # вернулся — пропуск и ссылка своё отработали
+    await moderation.revoke_unban_link(bot, chat_id, user.id)
     adm_cache.invalidate_member(chat_id, user.id)
     await db.add_event(
         chat_id, "join", f"заявка одобрена после разбана: {user.full_name} ({user.id})"

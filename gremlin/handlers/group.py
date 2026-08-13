@@ -108,13 +108,15 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
         return
 
     parts = (message.text or "").split()[1:]
-    mute_min = 0  # навсегда
+    mute_min = config.MANUAL_MUTE_DEFAULT      # срок не указали — сутки
     if kind == "mute" and parts:
         parsed = utils.parse_duration(parts[0])
         if parsed is not None:
             mute_min = parsed
             parts = parts[1:]
     reason = " ".join(parts) or "без причины"
+    # текст берём до удаления — он уходит в карточку
+    body = moderation.message_body(message.reply_to_message)
 
     pid = await moderation.apply_punishment(
         bot, message.chat.id, target, kind, mute_min, reason, message.from_user.id
@@ -123,16 +125,18 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
         await message.reply("Не получилось — проверь права бота.")
         return
     until = utils.until_ts(mute_min) if kind == "mute" else None
-    dur = f" на {utils.fmt_minutes(mute_min)}" if kind == "mute" else ""
-    await message.reply(
-        f"{moderation.KIND_EMOJI[kind]} {utils.mention(target.id, target.full_name, target.username)} "
-        f"получил {moderation.KIND_LABEL[kind].lower()}{dur}. Причина: {utils.esc(reason)}"
-    )
+
+    # В чат ничего не пишем: наказание и так видно в лог-чате, а сообщение
+    # нарушителя вместе с командой убираем, чтобы лента осталась чистой.
+    for msg in (message.reply_to_message, message):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
     bit = config.BIT_BAN if kind == "ban" else config.BIT_MUTE
-    # в карточку кладём то сообщение, на которое ответил админ
     card = _manual_card_text(
-        kind, message.chat.title, target, reason, until, message.from_user,
-        moderation.message_body(message.reply_to_message),
+        kind, message.chat.title, target, reason, until, message.from_user, body,
     )
     await moderation.send_card(bot, message.chat.id, bit, card, pid, kind)
     await db.add_event(
@@ -149,6 +153,43 @@ async def cmd_mute(message: Message, bot: Bot) -> None:
 @router.message(F.text.regexp(r"^!(ban|бан)(\s|$)"))
 async def cmd_ban(message: Message, bot: Bot) -> None:
     await _manual_punish(message, bot, "ban")
+
+
+@router.message(F.text.regexp(r"^!(dm|дм)(\s|$)"))
+async def cmd_delete(message: Message, bot: Bot) -> None:
+    """!dm ответом на сообщение — удалить его вместе с самой командой."""
+    if stale(message):
+        return
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply("Команда работает ответом на сообщение.")
+        return
+    if not await _is_chat_admin(bot, message.chat.id, message.from_user.id):
+        return  # молча игнорим не-админов
+    target_msg = message.reply_to_message
+    target = target_msg.from_user
+    body = moderation.message_body(target_msg)     # текст сохраняем до удаления
+    reason = " ".join((message.text or "").split()[1:]) or "без причины"
+
+    try:
+        await target_msg.delete()
+    except Exception:
+        await message.reply("Не получилось удалить — сообщение старше 48 часов или нет прав.")
+        return
+    try:
+        await message.delete()                     # следом убираем саму команду
+    except Exception:
+        pass
+
+    card = _manual_card_text(
+        "delete", message.chat.title, target, reason, None, message.from_user, body
+    )
+    await moderation.send_card(bot, message.chat.id, config.BIT_ADMIN, card,
+                               None, "delete", target.id)
+    await db.add_event(
+        message.chat.id, "admin_action",
+        f"удаление сообщения: {target.full_name} ({target.id}) — {reason} "
+        f"| by {message.from_user.id}",
+    )
 
 
 @router.message(F.text.startswith("!"))

@@ -10,7 +10,7 @@ import uuid
 from dataclasses import dataclass
 
 from aiogram import Bot
-from aiogram.types import FSInputFile, Message
+from aiogram.types import FSInputFile, LinkPreviewOptions, Message
 
 from .. import config
 
@@ -73,10 +73,14 @@ async def send_answer(message: Message, ans) -> None:
     поэтому уходит как HTML. Битая разметка -> повтор обычным текстом.
     """
     if not ans["file_path"]:
+        # превью ссылок гасим: ответ триггера должен выглядеть так, как его
+        # написали, а не тащить за собой картинку с чужого сайта
+        no_preview = LinkPreviewOptions(is_disabled=True)
         try:
-            await message.reply(ans["text"])
+            await message.reply(ans["text"], link_preview_options=no_preview)
         except Exception:
-            await message.reply(html.escape(ans["text"] or ""), parse_mode=None)
+            await message.reply(html.escape(ans["text"] or ""), parse_mode=None,
+                                link_preview_options=no_preview)
         return
     kind = ans["media_type"]
     if kind not in MEDIA_KINDS or not os.path.exists(ans["file_path"]):

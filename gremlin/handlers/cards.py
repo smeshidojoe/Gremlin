@@ -1,10 +1,30 @@
 """Кнопки на карточках в лог-чате: снять наказание / подтвердить."""
+import logging
+
 from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery
 
 from .. import db
 
+logger = logging.getLogger("gremlin.cards")
+
 router = Router()
+
+
+async def _mark(cb: CallbackQuery, note: str) -> bool:
+    """Дописать итог в карточку. False — Telegram не дал её править.
+
+    Кнопки живут вечно, а вот править своё сообщение бот может лишь 48 часов.
+    Действие к этому моменту уже выполнено, поэтому молчать нельзя — итог
+    покажем всплывашкой.
+    """
+    try:
+        await cb.message.edit_text(cb.message.html_text + note, reply_markup=None,
+                                   disable_web_page_preview=True)
+        return True
+    except Exception:
+        logger.warning("card edit failed (старше 48 часов?)", exc_info=True)
+        return False
 
 
 @router.callback_query(F.data.startswith("k:lift:"))
@@ -17,15 +37,12 @@ async def card_lift(cb: CallbackQuery, bot: Bot) -> None:
         await cb.answer(text, show_alert=True)
         return
     # ссылку дописываем в саму карточку — отдельный пост только замусорил бы лог
-    await cb.message.edit_text(
-        cb.message.html_text + "\n\n✅ <b>Наказание снято</b>" + moderation.unban_note(link),
-        reply_markup=None, disable_web_page_preview=True,
-    )
+    await _mark(cb, "\n\n✅ <b>Наказание снято</b>" + moderation.unban_note(link))
     await db.add_event(
         p["chat_id"] if p else None, "card",
         f"снято наказание #{pid} юзером {cb.from_user.id}",
     )
-    await cb.answer("Снято")
+    await cb.answer("Разбанен")
 
 
 @router.callback_query(F.data.startswith("k:ban:"))
@@ -43,9 +60,7 @@ async def card_ban(cb: CallbackQuery, bot: Bot) -> None:
         chat_id, user_id, None, None, "ban", "бан из карточки", None, cb.from_user.id
     )
     await db.add_event(chat_id, "card", f"бан из карточки: {user_id} by {cb.from_user.id}")
-    await cb.message.edit_text(
-        cb.message.html_text + "\n\n⛔ <b>Забанен</b>", reply_markup=None
-    )
+    await _mark(cb, "\n\n⛔ <b>Забанен</b>")
     await cb.answer("Забанен")
 
 
@@ -53,7 +68,5 @@ async def card_ban(cb: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data == "k:wok")
 async def card_watch_ok(cb: CallbackQuery) -> None:
-    await cb.message.edit_text(
-        cb.message.html_text + "\n\n🕊 <b>Оставлен под наблюдением</b>", reply_markup=None
-    )
-    await cb.answer()
+    ok = await _mark(cb, "\n\n🕊 <b>Оставлен под наблюдением</b>")
+    await cb.answer("" if ok else "Оставлен под наблюдением")

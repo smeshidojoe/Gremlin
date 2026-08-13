@@ -77,8 +77,13 @@ def collect(stats_db: str) -> dict | None:
             ((uid, n) for uid, n in per_user.items() if uid in people),
             key=lambda x: -x[1],
         )[:3]
-        silent = sorted(
-            (label(uid) for uid in people if per_user.get(uid, 0) == 0),
+        silent_ids = [uid for uid in people if per_user.get(uid, 0) == 0]
+        silent = sorted((label(uid) for uid in silent_ids), key=str.lower)
+        # для кнопки «списком»: ник, если он есть, иначе имя с id — такой список
+        # можно скопировать и скормить массовым операциям
+        silent_raw = sorted(
+            (f"@{people[uid]['username']}" if people[uid]["username"] else f"{label(uid)} — {uid}"
+             for uid in silent_ids),
             key=str.lower,
         )
         now = utils.local_now()
@@ -87,6 +92,7 @@ def collect(stats_db: str) -> dict | None:
             "total": sum(per_user.values()),
             "top": [(label(uid), n) for uid, n in top],
             "silent": silent,
+            "silent_raw": silent_raw,
             "members": len(people),
             "updated": utils.utc_iso_to_local(meta.get("updated_at")),
             "since": since,
@@ -168,6 +174,9 @@ async def send_digest(bot: Bot, chat_id: int, to_user: int) -> bool:
 
     b = InlineKeyboardBuilder()
     b.button(text="📄 Отправить файл", callback_data=f"d:file:{chat_id}")
+    b.button(text="📋 Молчуны списком", callback_data=f"d:silent:{chat_id}")
+    b.button(text="✖️ Закрыть", callback_data=f"d:close:{chat_id}")
+    b.adjust(1)
     kb = b.as_markup()
     text = render(d)
 

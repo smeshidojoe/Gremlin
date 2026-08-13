@@ -82,15 +82,21 @@ def body_block(text: str | None, media: str | None = None) -> str:
     return f"\n\n{head}\n{utils.esc(utils.chunk(text, BODY_LIMIT))}"
 
 
-def _button_urls(message) -> list[str]:
-    """Ссылки с инлайн-кнопок под сообщением.
+def _buttons(message) -> list[str]:
+    """Кнопки под сообщением: подпись и ссылка, если она есть.
 
     Реклама через инлайн-ботов часто приходит картинкой без подписи, а вся суть
-    висит на кнопке — без этого в карточке было бы «фото без текста».
+    висит на кнопке — без этого в карточке было бы только «фото без текста».
     """
     markup = getattr(message, "reply_markup", None)
     rows = getattr(markup, "inline_keyboard", None) or []
-    return [b.url for row in rows for b in row if getattr(b, "url", None)]
+    out = []
+    for row in rows:
+        for b in row:
+            label = utils.esc(getattr(b, "text", "") or "кнопка")
+            url = getattr(b, "url", None)
+            out.append(f"{label} → {utils.esc(url)}" if url else label)
+    return out
 
 
 def message_body(message) -> str:
@@ -100,10 +106,13 @@ def message_body(message) -> str:
     media = next((label for attr, label in _MEDIA_LABELS.items()
                   if getattr(message, attr, None) is not None), None)
     block = body_block(message.text or message.caption, media)
-    urls = _button_urls(message)
-    if urls:
-        shown = ", ".join(utils.esc(u) for u in urls[:5])
-        block += f"\n🔘 <b>Кнопки:</b> {shown}"
+    buttons = _buttons(message)
+    if buttons:
+        # каждая с новой строки: со ссылками строка иначе переносится в кашу
+        shown = "\n".join(buttons[:5])
+        if len(buttons) > 5:
+            shown += f"\n…ещё {len(buttons) - 5}"
+        block += f"\n🔘 <b>Кнопки:</b>\n{shown}"
     return block
 
 

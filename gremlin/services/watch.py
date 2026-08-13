@@ -56,32 +56,45 @@ _SYMBOL_IN_WORD = re.compile(r"[а-яёa-z][€₽$£♱♰卐]|[€₽$£♱♰
 _PROFILE_ADS = re.compile(r"(смотри|ссылк\w+ в|в профил|проф\w* 👆|check bio)", re.IGNORECASE)
 
 
+# Косметика: странное написание ника. Живые люди украшают имена постоянно —
+# латиница вперемешку с кириллицей, «€» вместо буквы, иероглифы, готические
+# буквы. Само по себе это не спам, поэтому вся косметика вместе не может
+# перевесить порог подозрения: её сумма ограничена COSMETIC_CAP.
+COSMETIC_CAP = 30
+
+
 def score_profile(first_name: str | None, last_name: str | None,
                   username: str | None) -> tuple[int, list[str]]:
     """Оценка профиля. Вернуть (очки, причины)."""
     name = " ".join(x for x in (first_name, last_name) if x)
-    score, reasons = 0, []
     if not name:
         return 0, []
+    score, reasons = 0, []
+    cosmetic = 0
+
+    # тревожные признаки: так оформляют профиль ради рекламы и обхода фильтров
     if _INVISIBLE.search(_visible_part(name)):
         score += 40; reasons.append("невидимые символы в имени")
-    if _RARE_SCRIPT.search(name):
-        score += 35; reasons.append("нетипичный алфавит в имени")
     if _URLISH.search(name):
-        score += 30; reasons.append("ссылка/упоминание в имени")
+        score += 40; reasons.append("ссылка/упоминание в имени")
     if _PROFILE_ADS.search(name):
-        score += 35; reasons.append("реклама профиля в имени")
+        score += 45; reasons.append("реклама профиля в имени")
+
+    # косметические: считаем, но общий вклад режем
+    if _RARE_SCRIPT.search(name):
+        cosmetic += 35; reasons.append("нетипичный алфавит в имени")
     if _HOMOGLYPH_WORD.search(name):
-        score += 25; reasons.append("гомоглифы в имени")
+        cosmetic += 25; reasons.append("гомоглифы в имени")
     if _SYMBOL_IN_WORD.search(name):
-        score += 25; reasons.append("символы-заменители в имени")
-    if _CJK.search(name):
-        score += 15; reasons.append("CJK-имя")
+        cosmetic += 25; reasons.append("символы-заменители в имени")
+    if _CJK.search(name) and not _RARE_SCRIPT.search(name):
+        cosmetic += 15; reasons.append("CJK-имя")   # иначе один признак дважды
     if len(_EMOJI.findall(name)) >= 4:   # пара эмодзи в нике — обычное дело
-        score += 10; reasons.append("эмодзи-спам в имени")
+        cosmetic += 10; reasons.append("эмодзи-спам в имени")
     if re.search(r"[а-яёa-z]\d{2,}|[一-鿿぀-ヿ]\d", name, re.IGNORECASE):
-        score += 10; reasons.append("цифры в имени")
-    return score, reasons
+        cosmetic += 10; reasons.append("цифры в имени")
+
+    return score + min(cosmetic, COSMETIC_CAP), reasons
 
 
 def score_message(text: str) -> tuple[int, list[str]]:
@@ -201,6 +214,15 @@ if __name__ == "__main__":
     for name in ("✧Yutohai✧ 📖", "Лягушенька 🐸", "Аня 💐🌸", "👨‍👩‍👧 Семья"):
         s, r = score_profile(name, None, "user")
         assert s == 0, (name, s, r)
+
+    # украшенные ники живых людей: косметика не должна дотягивать до карточки
+    for name in ("~×°KåPå€ь в KeDåX°×~ o_O", "邋望Walen—神", "𝔻𝕒𝕣𝕜 𝕃𝕠𝕣𝕕 Д€КО"):
+        s, r = score_profile(name, None, "user")
+        assert s <= COSMETIC_CAP, (name, s, r)
+    # а ссылка или реклама в имени — сама по себе повод для карточки
+    for name in ("Аня t.me/spamchat", "смотри ссылку в профиле"):
+        s, r = score_profile(name, None, "user")
+        assert s >= 40, (name, s, r)
     # а спрятанный символ в обычном тексте — по-прежнему сигнал
     s, _ = score_message("текст‮со скрытым разворотом")
     assert s >= 30

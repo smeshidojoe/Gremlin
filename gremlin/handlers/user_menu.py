@@ -37,6 +37,8 @@ class Input(StatesGroup):
     link_wl = State()       # ждём чат/канал для вайтлиста ссылок
     trig_edit_phrase = State()  # ждём новую фразу триггера
     ans_new = State()           # ждём новый вариант ответа (триггер/счётчик)
+    mass_unban = State()        # ждём список id для массового разбана
+    mass_kick = State()         # ждём список id для массового кика
 
 
 _HOME_TEXT = "<b>🧌 Gremlin</b>\n\nМодерация и мониторинг чатов."
@@ -200,8 +202,12 @@ async def _edit_menu(message: Message, bot: Bot, state: FSMContext,
             )
             return
         except Exception:
-            pass  # сообщение удалили/устарело — покажем новым
-    await message.answer(text, reply_markup=kb)
+            # сообщение удалили/устарело — покажем новым
+            logger.warning("edit menu %s failed", msg_id, exc_info=True)
+    # дальше правим уже это новое сообщение, иначе следующий шаг снова
+    # промахнётся мимо старого и в чате останется лишняя простыня
+    sent = await message.answer(text, reply_markup=kb)
+    await state.update_data(msg_id=sent.message_id)
 
 
 async def _retry(message: Message, bot: Bot, state: FSMContext, prompt: str) -> None:
@@ -648,6 +654,8 @@ async def view_punishments(cid: int, page: int) -> tuple[str, InlineKeyboardMark
         nav.append(("Позже ➡️", f"u:p:{cid}:{page + 1}"))
     if nav:
         b.row(*[_btn(t, d) for t, d in nav])
+    b.row(_btn("🔓 Массовый разбан", f"u:mub:{cid}"),
+          _btn("👢 Массовый кик", f"u:mkick:{cid}"))
     b.row(_btn("⬅️ Назад", f"u:c:{cid}"))
     return "\n".join(lines), b.as_markup()
 
@@ -1074,6 +1082,63 @@ async def cb_digest_now(cb: CallbackQuery, bot: Bot) -> None:
                     show_alert=not ok)
 
 
+@router.callback_query(F.data == "d:x")
+async def cb_close_message(cb: CallbackQuery) -> None:
+    """Закрыть присланный список: просто убираем сообщение."""
+    try:
+        await cb.message.delete()
+    except Exception:
+        await cb.answer("Не смог удалить — уберите вручную.", show_alert=True)
+        return
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("d:close:"))
+async def cb_close_digest(cb: CallbackQuery) -> None:
+    """Закрыть сводку. Забываем её id, иначе следующая попробует править удалённое."""
+    cid = int(cb.data.split(":")[2])
+    await db.kv_set(f"digest_msg:{cid}", None)
+    try:
+        await cb.message.delete()
+    except Exception:
+        await cb.answer("Не смог удалить — уберите вручную.", show_alert=True)
+        return
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("d:silent:"))
+async def cb_digest_silent(cb: CallbackQuery, bot: Bot) -> None:
+    """Список молчунов блоком кода: такой копируется одним нажатием."""
+    from ..services import digest
+    cid = int(cb.data.split(":")[2])
+    if digest.tracked_chat() != cid:
+        await cb.answer("Сводка есть только по профильному чату.", show_alert=True)
+        return
+    d = await asyncio.to_thread(digest.collect, config.STATS_DB)
+    rows = (d or {}).get("silent_raw") or []
+    if not rows:
+        await cb.answer("Молчунов нет — писали все.", show_alert=True)
+        return
+    await cb.answer()
+    # шлём отдельными сообщениями, а не правим сводку: её удобно держать перед глазами
+    head = f"<b>🤐 Не писали на этой неделе ({len(rows)}):</b>\n"
+    chunk: list[str] = []
+    size = 0
+    for row in rows + [None]:                    # None — сигнал «долить остаток»
+        line = utils.esc(row) if row else ""
+        if row is not None and size + len(line) < 3500:
+            chunk.append(line)
+            size += len(line) + 1
+            continue
+        close = InlineKeyboardBuilder()
+        close.button(text="✖️ Закрыть", callback_data="d:x")
+        await cb.message.answer(head + "<pre>" + "\n".join(chunk) + "</pre>",
+                                reply_markup=close.as_markup())
+        head, chunk, size = "", [line], len(line) + 1
+        if row is None:
+            break
+
+
 @router.callback_query(F.data.startswith("d:file:"))
 async def cb_digest_file(cb: CallbackQuery, bot: Bot) -> None:
     """Кнопка под сводкой: собрать и прислать полный HTML-отчёт."""
@@ -1121,6 +1186,227 @@ async def view_cmd(cid: int, rid: int) -> tuple[str, InlineKeyboardMarkup]:
     b.row(_btn("❌ Удалить счётчик", f"u:cmd:{cid}:{rid}"))
     b.row(_btn("⬅️ Назад", f"u:cml:{cid}:0"))
     return text, b.as_markup()
+
+
+# ---------- массовый разбан ----------
+
+MASS_LIMIT = 100
+MASS_DELAY = 1.0     # пауза между людьми: лимиты Telegram важнее скорости
+
+
+@router.callback_query(F.data.startswith("u:mub:"))
+async def cb_mass_unban(cb: CallbackQuery, state: FSMContext) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    await _ask(
+        cb, state, Input.mass_unban,
+        "<b>🔓 Массовый разбан</b>\n\nПришлите список одним сообщением: id или "
+        "@username через пробел, запятую или с новой строки. Отрицательный id — "
+        f"канал-отправитель.\nЗа раз обрабатываю до {MASS_LIMIT} штук, "
+        "по одному в секунду — чтобы Telegram не выдал лимит.",
+        f"u:p:{cid}:0", cid=cid,
+    )
+
+
+# Ответы Telegram человеку ни о чём не говорят — переводим знакомые.
+_ERRORS_RU = (
+    ("PARTICIPANT_ID_INVALID", "неверный id — это не человек из этого чата "
+                               "(возможно, id канала или опечатка)"),
+    ("USER_ID_INVALID", "такого пользователя не существует"),
+    ("USER_NOT_PARTICIPANT", "в чате не состоит"),
+    ("CHAT_ADMIN_REQUIRED", "у бота нет прав банить в этом чате"),
+    ("CHANNEL_INVALID", "чат недоступен боту"),
+    ("CHAT_NOT_FOUND", "чат не найден"),
+    ("USER_NOT_FOUND", "пользователь не найден"),
+    ("PEER_ID_INVALID", "неверный id"),
+    ("Too Many Requests", "Telegram просит подождать — попробуйте позже"),
+)
+
+
+def _human_error(e: Exception) -> str:
+    text = str(e)
+    for needle, human in _ERRORS_RU:
+        if needle.lower() in text.lower():
+            return human
+    return utils.esc(text[:80])
+
+
+@router.callback_query(F.data.startswith("u:mkick:"))
+async def cb_mass_kick(cb: CallbackQuery, state: FSMContext) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    await _ask(
+        cb, state, Input.mass_kick,
+        "<b>👢 Массовый кик</b>\n\nПришлите список одним сообщением: id или "
+        "@username через пробел, запятую или с новой строки.\n"
+        "Кик = бан и сразу разбан: человек вылетает из чата, но может вернуться "
+        "по ссылке. Админов чата и владельца бота не трону.\n"
+        f"За раз обрабатываю до {MASS_LIMIT} штук, по одному в секунду.",
+        f"u:p:{cid}:0", cid=cid,
+    )
+
+
+async def _unban_channel(bot: Bot, cid: int, sid: int) -> tuple[str, str]:
+    """Снять бан отправителя-канала. Забанен он или нет, Telegram не скажет,
+    поэтому смотрим в свою базу: там записаны баны, которые ставил бот."""
+    known = await db.active_punishment_of(cid, sid, "banchan")
+    try:
+        await bot.unban_chat_sender_chat(cid, sid)
+    except Exception as e:
+        return "fail", f"канал <code>{sid}</code> — {_human_error(e)}"
+    await db.deactivate_user_punishments(cid, sid)
+    if known is None:
+        return "skip", f"канал <code>{sid}</code> — в моих банах не числился, бан снят на всякий случай"
+    return "done", f"канал <code>{sid}</code>"
+
+
+async def _unban_one(bot: Bot, cid: int, token: str) -> tuple[str, str]:
+    """Разобрать одну запись списка. Вернуть (итог, строка для отчёта).
+
+    Итог: done — сняли, skip — не был забанен, fail — не получилось.
+    """
+    uid, label = None, token
+    if token.lstrip("-").isdigit():
+        uid = int(token)
+    elif token.startswith("@") and len(token) > 3:
+        uid, name = await resolve.by_username(bot, token)
+        label = name or token
+        if uid is None:
+            return "fail", f"{utils.esc(token)} — не удалось определить id"
+    else:
+        return "fail", f"{utils.esc(token)} — не похоже на id или @username"
+
+    if uid < 0:
+        return await _unban_channel(bot, cid, uid)
+
+    try:
+        member = await bot.get_chat_member(cid, uid)
+    except Exception as e:
+        # Каналы часто записывают без префикса -100: как участник такой id
+        # невалиден, а как отправитель-канал — вполне рабочий. Пробуем так,
+        # но если и там мимо — показываем исходную ошибку про участника.
+        for variant in db.id_variants(uid):
+            if variant < 0:
+                result, line = await _unban_channel(bot, cid, variant)
+                if result != "fail":
+                    return result, line
+                break
+        return "fail", f"<code>{uid}</code> — {_human_error(e)}"
+    who = label if label != token else await db.user_label(uid)
+    # user_label для незнакомых возвращает сам id — не дублируем его в строке
+    tag = f"{utils.esc(who)} (<code>{uid}</code>)" if who != str(uid) else f"<code>{uid}</code>"
+    if member.status != "kicked":
+        return "skip", f"{tag} — не забанен"
+    try:
+        await bot.unban_chat_member(cid, uid, only_if_banned=True)
+    except Exception as e:
+        return "fail", f"{tag} — {_human_error(e)}"
+    await db.deactivate_user_punishments(cid, uid)
+    return "done", tag
+
+
+async def _kick_one(bot: Bot, cid: int, token: str) -> tuple[str, str]:
+    """Выгнать одного. «Кика» в Bot API нет: баним и тут же снимаем бан —
+    человек вылетает из чата, но может вернуться по ссылке."""
+    uid, label = None, token
+    if token.lstrip("-").isdigit():
+        uid = int(token)
+    elif token.startswith("@") and len(token) > 3:
+        uid, name = await resolve.by_username(bot, token)
+        label = name or token
+        if uid is None:
+            return "fail", f"{utils.esc(token)} — не удалось определить id"
+    else:
+        return "fail", f"{utils.esc(token)} — не похоже на id или @username"
+
+    if uid < 0 or uid > 1_000_000_000_000:
+        return "fail", f"<code>{uid}</code> — это канал, кикнуть нельзя (только забанить)"
+    if uid in config.ADMIN_IDS:
+        return "skip", f"<code>{uid}</code> — владелец бота, не трогаю"
+
+    try:
+        member = await bot.get_chat_member(cid, uid)
+    except Exception as e:
+        return "fail", f"<code>{uid}</code> — {_human_error(e)}"
+    who = label if label != token else await db.user_label(uid)
+    tag = f"{utils.esc(who)} (<code>{uid}</code>)" if who != str(uid) else f"<code>{uid}</code>"
+    if member.status in ("creator", "administrator"):
+        return "skip", f"{tag} — админ чата, не трогаю"
+    if member.status in ("left", "kicked"):
+        return "skip", f"{tag} — в чате не состоит"
+    try:
+        await bot.ban_chat_member(cid, uid)
+        await bot.unban_chat_member(cid, uid, only_if_banned=True)   # бан снят = кик
+    except Exception as e:
+        return "fail", f"{tag} — {_human_error(e)}"
+    return "done", tag        # в журнал не пишем: отчёт показывается в этом же окне
+
+
+async def _mass_run(message: Message, bot: Bot, state: FSMContext, cid: int,
+                    title: str, worker, labels: tuple[str, str, str],
+                    empty_hint: str) -> None:
+    """Общий движок массовых операций: разбор списка, пауза, прогресс, отчёт."""
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        await _done(message, bot, state, await view_punishments(cid, 0))
+        return
+    tokens = [t for t in re.split(r"[\s,;]+", text) if t]
+    if not tokens:
+        await _retry(message, bot, state, f"<b>{title}</b>\n\n⚠️ {empty_hint}")
+        return
+    cut = len(tokens) > MASS_LIMIT
+    tokens = tokens[:MASS_LIMIT]
+
+    ch = await db.get_chat(cid)
+    head = f"<b>{title}</b> · {utils.esc(ch['title'] if ch else str(cid))}\n\n"
+    await _edit_menu(message, bot, state, head + f"Обрабатываю: 0 из {len(tokens)}…", None)
+
+    # короткий список обновляем на каждом шаге, длинный — раз в десяток,
+    # чтобы не долбить Telegram правками
+    step = 1 if len(tokens) <= 20 else 10
+    done, skip, fail = [], [], []
+    for i, token in enumerate(tokens, 1):
+        result, line = await worker(bot, cid, token)
+        {"done": done, "skip": skip, "fail": fail}[result].append(line)
+        if i % step == 0 and i < len(tokens):   # показываем, что не завис
+            await _edit_menu(message, bot, state,
+                             head + f"Обрабатываю: {i} из {len(tokens)}…", None)
+        if i < len(tokens):
+            await asyncio.sleep(MASS_DELAY)
+
+    parts = [head.rstrip("\n")]
+    for label, rows in zip(labels, (done, skip, fail)):
+        if rows:
+            parts.append(f"\n<b>{label} ({len(rows)}):</b>")
+            parts.extend(f"• {r}" for r in rows)
+    if cut:
+        parts.append(f"\n<i>Обработал первые {MASS_LIMIT}, остальных пришлите "
+                     f"следующим списком.</i>")
+    b = InlineKeyboardBuilder()
+    b.row(_btn("⬅️ К наказаниям", f"u:p:{cid}:0"))
+    # сначала правим сообщение (в состоянии лежит его id), потом сбрасываем состояние
+    await _edit_menu(message, bot, state, utils.chunk("\n".join(parts)), b.as_markup())
+    await state.clear()
+
+
+@router.message(StateFilter(Input.mass_unban))
+async def mass_unban_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    await _mass_run(
+        message, bot, state, (await state.get_data())["cid"], "🔓 Массовый разбан",
+        _unban_one, ("✅ Разбанены", "➖ Не были забанены", "⚠️ Не вышло"),
+        "Не нашёл ни одного id.",
+    )
+
+
+@router.message(StateFilter(Input.mass_kick))
+async def mass_kick_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    await _mass_run(
+        message, bot, state, (await state.get_data())["cid"], "👢 Массовый кик",
+        _kick_one, ("✅ Кикнуты", "➖ Пропущены", "⚠️ Не вышло"),
+        "Не нашёл ни одного id.",
+    )
 
 
 @router.callback_query(F.data.startswith("u:an:"))

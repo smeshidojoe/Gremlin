@@ -1,9 +1,12 @@
 """Ядро модерации: применение наказаний, карточки в лог-чат, глобальный админ-лог."""
+import asyncio
 import logging
 import time
 
 from aiogram import Bot
-from aiogram.types import ChatPermissions, InlineKeyboardMarkup, User
+from aiogram.types import (
+    ChatPermissions, InlineKeyboardMarkup, LinkPreviewOptions, User,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .. import config, db, utils
@@ -99,13 +102,38 @@ def _buttons(message) -> list[str]:
     return out
 
 
-def message_body(message) -> str:
-    """То же для сообщения aiogram: сам достанет текст, вложение и кнопки."""
+def message_link(message) -> str | None:
+    """Ссылка на сообщение. Для закрытых чатов — вида t.me/c/<чат>/<id>,
+    её откроет любой, кто в чате состоит. Для лички ссылки не бывает."""
+    chat = getattr(message, "chat", None)
+    if chat is None or chat.type not in ("group", "supergroup", "channel"):
+        return None
+    if getattr(chat, "username", None):
+        return f"https://t.me/{chat.username}/{message.message_id}"
+    internal = str(chat.id)
+    if not internal.startswith("-100"):
+        return None                      # старые группы ссылок на сообщения не имеют
+    return f"https://t.me/c/{internal[4:]}/{message.message_id}"
+
+
+def message_body(message, with_link: bool = False) -> str:
+    """То же для сообщения aiogram: сам достанет текст, вложение и кнопки.
+
+    with_link — сообщение остаётся в чате (например, карточка подозрения),
+    и на него можно дать ссылку. Для удалённых она бессмысленна.
+    """
     if message is None:
         return ""
     media = next((label for attr, label in _MEDIA_LABELS.items()
                   if getattr(message, attr, None) is not None), None)
-    block = body_block(message.text or message.caption, media)
+    lines = []
+    link = message_link(message) if with_link else None
+    if link:
+        lines.append(f"🔗 <b>Ссылка:</b> {link}")   # сначала «где», потом «что»
+    inner = body_block(message.text or message.caption, media).lstrip("\n")
+    if inner:
+        lines.append(inner)
+    block = ("\n\n" + "\n".join(lines)) if lines else ""
     buttons = _buttons(message)
     if buttons:
         # каждая с новой строки: со ссылками строка иначе переносится в кашу
@@ -249,9 +277,22 @@ async def send_card(bot: Bot, chat_id: int, bit: int, text: str,
         return
     kb = card_kb(pid, kind, chat_id, user_id)
     try:
-        await bot.send_message(s.log_chat_id, text, reply_markup=kb)
+        await bot.send_message(s.log_chat_id, text, reply_markup=kb,
+                               link_preview_options=LinkPreviewOptions(is_disabled=True))
     except Exception:
         logger.warning("card send failed for chat %s", chat_id, exc_info=True)
+
+
+# Альбом (несколько фото одним постом) приходит боту как несколько отдельных
+# сообщений с общим media_group_id. Без склейки в лог улетала карточка на каждую
+# картинку. Копим их тут: (chat_id, media_group_id) -> что успели увидеть.
+_ALBUMS: dict[tuple[int, str], dict] = {}
+ALBUM_WAIT = 1.5     # сколько ждём остальные части альбома, сек
+
+
+def _album_sweep(now: float) -> None:
+    for key, st in [(k, v) for k, v in _ALBUMS.items() if now - v["ts"] > 60]:
+        _ALBUMS.pop(key, None)
 
 
 async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
@@ -259,7 +300,26 @@ async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
     """Полный цикл нарушения: удалить сообщение, наказать, карточка, логи."""
     chat = message.chat
     user = message.from_user
+    group_id = getattr(message, "media_group_id", None)
+    key = (chat.id, group_id) if group_id else None
+
+    if key is not None and key in _ALBUMS:
+        # это ещё одна картинка того же поста: молча удаляем и доливаем в карточку
+        state = _ALBUMS[key]
+        state["count"] += 1
+        if not state["caption"]:
+            state["caption"] = message.caption or message.text or ""
+        try:
+            await message.delete()
+        except Exception:
+            logger.warning("delete failed in %s", chat.id, exc_info=True)
+        return
+
     body = message_body(message)      # текст берём до удаления
+    if key is not None:
+        _album_sweep(time.time())
+        _ALBUMS[key] = {"count": 1, "caption": message.caption or message.text or "",
+                        "ts": time.time()}
     try:
         await message.delete()
     except Exception:
@@ -268,6 +328,12 @@ async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
     reason = f"{feature_label}: {detail}" if detail else feature_label
     pid = await apply_punishment(bot, chat.id, user, punish_kind, mute_min, reason, None)
     applied = punish_kind if pid else "delete"
+
+    if key is not None:
+        # ждём остальные части поста, потом рисуем одну карточку на весь альбом
+        await asyncio.sleep(ALBUM_WAIT)
+        state = _ALBUMS.pop(key, {"count": 1, "caption": ""})
+        body = body_block(state["caption"], f"альбом, {state['count']} шт.")
 
     who = utils.mention(user.id, user.full_name, user.username)
     card = card_text(

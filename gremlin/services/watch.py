@@ -140,8 +140,10 @@ async def check_user(bot, chat, user, settings, message=None) -> None:
 
     total = p_score + m_score
     reasons = p_reasons + m_reasons
-    # текст сообщения — только если человек что-то писал: на входе в чат его нет
-    body = moderation.message_body(message)
+    # текст сообщения — только если человек что-то писал: на входе в чат его нет.
+    # Ссылку даём: при подозрении сообщение остаётся в чате, его можно открыть.
+    body = moderation.message_body(message, with_link=True)
+    body_gone = moderation.message_body(message)   # для автобана: сообщение удалим
     if total < settings.watch_suspect:
         if profile_changed:
             await db.watch_set(chat.id, user.id, sig, False)
@@ -165,7 +167,7 @@ async def check_user(bot, chat, user, settings, message=None) -> None:
             f"⛔ <b>Бан (наблюдение)</b> · {utils.esc(chat.title)}\n"
             f"👤 {who} (<code>{user.id}</code>)\n"
             f"📎 Сигналы: {utils.esc(why)} — <b>{total} очков</b>\n"
-            f"🤖 Кем: Gremlin (автомод)" + body
+            f"🤖 Кем: Gremlin (автомод)" + body_gone
         )
         await db.add_event(chat.id, "watch", f"ban: {user.full_name} ({user.id}) — {why} ({total})")
         await moderation.send_card(bot, chat.id, config.BIT_WATCH, card, pid, "ban", user.id)

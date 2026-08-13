@@ -536,20 +536,32 @@ async def moderate(message: Message, bot: Bot) -> None:
         )
         return
 
-    # --- пересылки из каналов ---
+    # --- пересылки: из каналов, групп и от людей ---
     if s.forwards_on and message.forward_origin is not None and "links" not in scopes:
         origin = message.forward_origin
         origin_chat = getattr(origin, "chat", None)
-        if origin_chat is not None and origin_chat.type == "channel":
-            origin_scopes = await db.wl_scopes_for(
-                chat.id, origin_chat.id, origin_chat.username
+        origin_user = getattr(origin, "sender_user", None)
+        source = None                    # что писать в причине; None = пересылку пропускаем
+        if origin_chat is not None:
+            if origin_chat.id != chat.id:      # свои же сообщения пересылать можно
+                allowed = await db.wl_scopes_for(chat.id, origin_chat.id, origin_chat.username)
+                if not allowed & {"all", "anon", "links"}:
+                    kind = "канала" if origin_chat.type == "channel" else "чата"
+                    source = f"из {kind}: {origin_chat.title or origin_chat.id}"
+        elif origin_user is not None:
+            if origin_user.id != user.id:      # своё же — не нарушение
+                allowed = await db.wl_scopes_for(chat.id, origin_user.id, origin_user.username)
+                if not allowed & {"all", "links"}:
+                    source = f"от {origin_user.full_name}"
+        else:
+            # скрытый отправитель: id не отдают, есть только подпись
+            source = f"от {getattr(origin, 'sender_user_name', 'скрытого отправителя')}"
+        if source is not None:
+            await moderation.violation(
+                bot, message, config.BIT_LINKS, "пересылка",
+                s.links_punish, s.links_mute_min, source,
             )
-            if not origin_scopes & {"all", "anon", "links"}:
-                await moderation.violation(
-                    bot, message, config.BIT_LINKS, "пересылка из канала",
-                    s.links_punish, s.links_mute_min, utils.esc(origin_chat.title or ""),
-                )
-                return
+            return
 
     # «свои» цели: этот чат (по нику и по t.me/c/<id>), привязанный канал, сам бот
     own_names, own_ids = set(), set()

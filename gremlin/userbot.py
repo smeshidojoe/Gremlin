@@ -107,16 +107,7 @@ def find_caller(chat_id: int, bot_username: str | None) -> tuple | None:
 
 def score_bot_message(message) -> tuple[int, list[str]]:
     """Насколько сообщение стороннего бота похоже на спам."""
-    text = (message.text or "") + " " + " ".join(_button_urls(message))
-    score, reasons = watch.score_message(text)
-    urls = _button_urls(message)
-    if urls:
-        score += 20
-        reasons.append("кнопки со ссылками")
-    if any(re.search(r"(telegra\.ph|graph\.org|t\.me/)", u, re.I) for u in urls):
-        score += 30
-        reasons.append("кнопка на telegra.ph/чат")
-    return score, reasons
+    return watch.score_content(message.text or "", _button_urls(message))
 
 
 async def _handle_bot_spam(bot: Bot, chat_id: int, message, sender) -> None:
@@ -160,10 +151,12 @@ async def _handle_bot_spam(bot: Bot, chat_id: int, message, sender) -> None:
         lines.append(f"👤 Позвал: {who} (<code>{uid}</code>)")
         if s.watch_ban and score >= s.watch_ban:
             try:
+                from .services import adm_cache
+                member = await adm_cache.is_member(bot, chat_id, uid)
                 await bot.ban_chat_member(chat_id, uid)
                 pid = await db.add_punishment(
                     chat_id, uid, uname, name, "ban",
-                    f"вызов спам-бота @{bot_uname}", None, None,
+                    f"вызов спам-бота @{bot_uname}", None, None, was_member=member,
                 )
                 lines.append("⛔ Забанен автоматически")
             except Exception:

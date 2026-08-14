@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS settings(
     inline_on       INTEGER NOT NULL DEFAULT 1,
     inline_punish   TEXT    NOT NULL DEFAULT 'mute',
     inline_mute_min INTEGER NOT NULL DEFAULT 60,
+    inline_spam     INTEGER NOT NULL DEFAULT 40,
     links_on        INTEGER NOT NULL DEFAULT 1,
     extlinks_on     INTEGER NOT NULL DEFAULT 1,
     links_punish    TEXT    NOT NULL DEFAULT 'delete',
@@ -146,7 +147,8 @@ CREATE TABLE IF NOT EXISTS punishments(
     until_ts INTEGER,                -- NULL = навсегда
     by_id    INTEGER,                -- кто наказал (NULL = бот сам)
     created  INTEGER NOT NULL,
-    active   INTEGER NOT NULL DEFAULT 1
+    active   INTEGER NOT NULL DEFAULT 1,
+    was_member INTEGER NOT NULL DEFAULT 1   -- состоял ли в чате на момент наказания
 );
 CREATE TABLE IF NOT EXISTS events(
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -180,6 +182,7 @@ class Settings:
     inline_on: int = 1
     inline_punish: str = "mute"
     inline_mute_min: int = 60
+    inline_spam: int = 40
     links_on: int = 1
     extlinks_on: int = 1
     links_punish: str = "delete"
@@ -238,6 +241,7 @@ _SETTINGS_MIGRATIONS = {
     "cmds_on": "INTEGER NOT NULL DEFAULT 0",
     "digest_to": "INTEGER NOT NULL DEFAULT 0",
     "cmds_guest_cd": "INTEGER NOT NULL DEFAULT 3600",
+    "inline_spam": "INTEGER NOT NULL DEFAULT 40",
     "words_guests": "INTEGER NOT NULL DEFAULT 1",
     "extlinks_on": "INTEGER NOT NULL DEFAULT 1",
     "service_join": "INTEGER NOT NULL DEFAULT 0",
@@ -254,6 +258,7 @@ _TABLE_MIGRATIONS = {
     "triggers": {"file_path": "TEXT", "media_type": "TEXT",
                  "cooldown": "INTEGER NOT NULL DEFAULT 30"},
     "whitelist": {"title": "TEXT"},
+    "punishments": {"was_member": "INTEGER NOT NULL DEFAULT 1"},
     "answers": {"last_used": "INTEGER NOT NULL DEFAULT 0"},
 }
 
@@ -619,7 +624,9 @@ def id_variants(cid: int) -> tuple[int, ...]:
 
 async def add_punishment(chat_id: int, user_id: int, username: str | None, name: str | None,
                          kind: str, reason: str | None, until: int | None,
-                         by_id: int | None) -> int:
+                         by_id: int | None, was_member: bool = True) -> int:
+    """was_member — состоял ли человек в чате. Комментатор под постом канала в
+    чате не состоит, и при разбане ссылка на возврат ему ни к чему."""
     # прошлые активные наказания того же юзера в этом чате гасим
     await _db.execute(
         "UPDATE punishments SET active = 0 WHERE chat_id = ? AND user_id = ? AND active = 1",
@@ -627,9 +634,10 @@ async def add_punishment(chat_id: int, user_id: int, username: str | None, name:
     )
     cur = await _db.execute(
         """INSERT INTO punishments (chat_id, user_id, username, name, kind, reason,
-                                    until_ts, by_id, created, active)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
-        (chat_id, user_id, username, name, kind, reason, until, by_id, _now()),
+                                    until_ts, by_id, created, active, was_member)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
+        (chat_id, user_id, username, name, kind, reason, until, by_id, _now(),
+         int(was_member)),
     )
     await _db.commit()
     return cur.lastrowid

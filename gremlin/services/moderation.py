@@ -11,6 +11,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .. import config, db, utils
+from . import adm_cache
 
 logger = logging.getLogger("gremlin.moderation")
 
@@ -103,6 +104,13 @@ def _buttons(message) -> list[str]:
     return out
 
 
+def button_urls(message) -> list[str]:
+    """Только ссылки с кнопок — для скоринга содержимого."""
+    markup = getattr(message, "reply_markup", None)
+    rows = getattr(markup, "inline_keyboard", None) or []
+    return [b.url for row in rows for b in row if getattr(b, "url", None)]
+
+
 def message_link(message) -> str | None:
     """Ссылка на сообщение. Для закрытых чатов — вида t.me/c/<чат>/<id>,
     её откроет любой, кто в чате состоит. Для лички ссылки не бывает."""
@@ -165,6 +173,9 @@ async def apply_punishment(bot: Bot, chat_id: int, user: User, kind: str,
     if kind == "delete":
         return None
     until = utils.until_ts(mute_min) if kind == "mute" else None
+    # спрашиваем до наказания: после бана статус всё равно станет «kicked»,
+    # и уже не понять, был человек в чате или писал из комментариев
+    member = await adm_cache.is_member(bot, chat_id, user.id)
     try:
         if kind == "mute":
             await bot.restrict_chat_member(
@@ -176,7 +187,8 @@ async def apply_punishment(bot: Bot, chat_id: int, user: User, kind: str,
         logger.warning("punish %s failed in %s for %s", kind, chat_id, user.id, exc_info=True)
         return None
     return await db.add_punishment(
-        chat_id, user.id, user.username, user.full_name, kind, reason, until, by_id
+        chat_id, user.id, user.username, user.full_name, kind, reason, until, by_id,
+        was_member=member,
     )
 
 
@@ -203,7 +215,10 @@ async def lift_punishment(bot: Bot, pid: int,
         logger.warning("lift %s failed: %s", pid, e)
         return False, f"Не удалось снять: {e}", None
     await db.deactivate_punishment(pid)
-    link = await invite_back(bot, chat_id, uid) if (kind == "ban" and invite) else None
+    # не состоял в чате (комментатор под постом канала) — возвращать некуда
+    was_member = bool(p["was_member"]) if "was_member" in p.keys() else True
+    link = (await invite_back(bot, chat_id, uid)
+            if (kind == "ban" and invite and was_member) else None)
     return True, "Снято.", link
 
 

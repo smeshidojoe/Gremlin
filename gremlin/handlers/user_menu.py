@@ -1392,7 +1392,7 @@ async def _ban_one(bot: Bot, cid: int, token: str,
         except Exception as e:
             return "fail", f"канал <code>{uid}</code> — {_human_error(e)}"
         await db.add_punishment(cid, uid, None, None, "banchan",
-                                "массовый бан", None, by_id)
+                                "массовый бан", None, by_id, was_member=False)
         return "done", f"канал <code>{uid}</code>"
 
     who, status = await db.user_label(uid), None
@@ -1411,7 +1411,8 @@ async def _ban_one(bot: Bot, cid: int, token: str,
     except Exception as e:
         return "fail", f"{tag} — {_human_error(e)}"
     await db.add_punishment(cid, uid, None, label if label != token else None,
-                            "ban", "массовый бан", None, by_id)
+                            "ban", "массовый бан", None, by_id,
+                            was_member=status in ("member", "restricted"))
     return "done", tag
 
 

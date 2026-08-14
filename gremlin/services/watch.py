@@ -115,6 +115,26 @@ def score_message(text: str) -> tuple[int, list[str]]:
     return score, reasons
 
 
+def score_buttons(urls: list[str]) -> tuple[int, list[str]]:
+    """Оценка кнопок под сообщением: в рекламе вся суть висит именно на них."""
+    score, reasons = 0, []
+    if urls:
+        score += 20
+        reasons.append("кнопки со ссылками")
+    if any(re.search(r"(telegra\.ph|graph\.org|t\.me/)", u, re.I) for u in urls):
+        score += 30
+        reasons.append("кнопка на telegra.ph/чат")
+    return score, reasons
+
+
+def score_content(text: str, urls: list[str] | None = None) -> tuple[int, list[str]]:
+    """Текст плюс кнопки — общая оценка содержимого сообщения."""
+    urls = urls or []
+    score, reasons = score_message(text + " " + " ".join(urls))
+    b_score, b_reasons = score_buttons(urls)
+    return score + b_score, reasons + b_reasons
+
+
 def profile_sig(first_name: str | None, last_name: str | None, username: str | None) -> str:
     """Подпись профиля для отслеживания изменений."""
     return f"{first_name or ''}|{last_name or ''}|{username or ''}"

@@ -488,6 +488,7 @@ async def moderate(message: Message, bot: Bot) -> None:
         pid = await db.add_punishment(
             chat.id, message.sender_chat.id, message.sender_chat.username, title,
             "banchan", "сообщение от имени канала/группы", None, None,
+            was_member=False,
         )
         card = (
             f"📛 <b>Бан отправителя-канала</b> · {utils.esc(chat.title)}\n"
@@ -530,9 +531,19 @@ async def moderate(message: Message, bot: Bot) -> None:
     if (s.inline_on and message.via_bot is not None and "inline" not in scopes
             and not await db.inline_wl_allowed(
                 chat.id, message.via_bot.username, message.via_bot.id)):
+        kind, mute_min = s.inline_punish, s.inline_mute_min
+        detail = f"@{message.via_bot.username}"
+        # Гифка через @gif и рекламная простыня с кнопками на telegra.ph — разные
+        # вещи, а правило одно. Поэтому за спам-содержимое наказание ужесточаем.
+        if s.inline_spam:
+            score, why = watch.score_content(
+                message.text or message.caption or "", moderation.button_urls(message)
+            )
+            if score >= s.inline_spam:
+                kind, mute_min = "ban", 0
+                detail += f" — спам: {', '.join(why)} ({score} очков)"
         await moderation.violation(
-            bot, message, config.BIT_INLINE, "инлайн-бот",
-            s.inline_punish, s.inline_mute_min, f"@{message.via_bot.username}",
+            bot, message, config.BIT_INLINE, "инлайн-бот", kind, mute_min, detail,
         )
         return
 

@@ -57,6 +57,8 @@ async def card_ban(cb: CallbackQuery, bot: Bot) -> None:
     """Забанить по карточке (мут/удаление/подозрение -> бан)."""
     _, _, chat_id, user_id = cb.data.split(":")
     chat_id, user_id = int(chat_id), int(user_id)
+    from ..services import adm_cache
+    member = await adm_cache.is_member(bot, chat_id, user_id)   # до бана
     try:
         await bot.ban_chat_member(chat_id, user_id)
     except Exception as e:
@@ -64,7 +66,8 @@ async def card_ban(cb: CallbackQuery, bot: Bot) -> None:
         return
     await db.deactivate_user_punishments(chat_id, user_id)
     await db.add_punishment(
-        chat_id, user_id, None, None, "ban", "бан из карточки", None, cb.from_user.id
+        chat_id, user_id, None, None, "ban", "бан из карточки", None, cb.from_user.id,
+        was_member=member,
     )
     await db.add_event(chat_id, "card", f"бан из карточки: {user_id} by {cb.from_user.id}")
     await _mark(cb, "\n\n⛔ <b>Забанен</b>")

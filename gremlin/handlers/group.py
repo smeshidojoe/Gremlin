@@ -9,7 +9,7 @@ from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .. import config, db, utils
-from ..services import adm_cache, filters, moderation, triggers, watch
+from ..services import adm_cache, filters, moderation, resolve, triggers, watch
 
 logger = logging.getLogger("gremlin.group")
 
@@ -68,8 +68,15 @@ def _prune_cooldowns(now: float) -> None:
 
 @router.message(Command("start", "menu", "admin", ignore_mention=True))
 async def ignore_bot_commands(message: Message) -> None:
-    """В группе на /start и прочие личные команды бот не отвечает — меню только в личке."""
-    return
+    """В группе на /start и прочие личные команды бот не отвечает — меню только в личке.
+
+    Само сообщение убираем: при добавлении по ссылке Telegram сам шлёт в чат
+    «/start@бот», и он висит в ленте мусором.
+    """
+    try:
+        await message.delete()
+    except Exception:
+        pass          # не админ ещё или сообщение чужое — не страшно
 
 
 # ---------- команды админов чата: !mute !ban ----------
@@ -155,6 +162,202 @@ async def cmd_ban(message: Message, bot: Bot) -> None:
     await _manual_punish(message, bot, "ban")
 
 
+async def _misuse(message: Message, bot: Bot, s) -> None:
+    """Команду модерации написал не админ: убираем и мутим, если так настроено.
+
+    Вайтлист не трогаем — там свои люди, которым просто нечего тут делать.
+    """
+    user = message.from_user
+    scopes = await db.wl_scopes_for(message.chat.id, user.id, user.username)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    if not s.misuse_mute or scopes or user.id in config.ADMIN_IDS:
+        return
+    pid = await moderation.apply_punishment(
+        bot, message.chat.id, user, "mute", s.misuse_mute,
+        "команда модерации не от админа", None,
+    )
+    if pid is None:
+        return
+    card = _manual_card_text(
+        "mute", message.chat.title, user, "команда модерации не от админа",
+        utils.until_ts(s.misuse_mute), user,
+        moderation.body_block(message.text or message.caption),
+    ).replace("👮 Кем:", "🤖 Кем: Gremlin (автомод) ·")
+    await moderation.send_card(bot, message.chat.id, config.BIT_MUTE, card, pid, "mute")
+    await db.add_event(message.chat.id, "manual",
+                       f"мут за чужую команду: {user.full_name} ({user.id})")
+
+
+RULES_DELAY = 2.0    # даём Telegram завести тред обсуждения под постом
+
+
+async def _post_rules(message: Message, chat_id: int) -> None:
+    """Ответить на автопересылку поста заготовкой правил.
+
+    Заготовок может быть несколько — берём случайную тем же механизмом, что
+    и у триггеров. Пауза нужна, чтобы комментарий не улетел раньше треда.
+    """
+    await asyncio.sleep(RULES_DELAY)
+    ans = await db.ans_pick("rules", chat_id)
+    if ans is None:
+        return
+    try:
+        await triggers.send_answer(message, ans)
+    except Exception as e:
+        if not utils.msg_gone(e):
+            logger.warning("rules post failed in %s", chat_id, exc_info=True)
+
+
+@router.message(F.text.regexp(r"^!(warn|варн)(\s|$)"))
+async def cmd_warn(message: Message, bot: Bot) -> None:
+    """!warn ответом: предупреждение с накоплением, наказание — по лимиту."""
+    if stale(message):
+        return
+    s = await db.get_settings(message.chat.id)
+    if not await _is_chat_admin(bot, message.chat.id, message.from_user.id):
+        await _misuse(message, bot, s)
+        return
+    if not s.warns_on:
+        return
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply("Команда работает ответом на сообщение нарушителя.")
+        return
+    target = message.reply_to_message.from_user
+    if target.id == bot.id or await _is_chat_admin(bot, message.chat.id, target.id):
+        await message.reply("Этого юзера предупреждать нечем — он админ.")
+        return
+
+    reason = " ".join((message.text or "").split()[1:]) or "без причины"
+    body = moderation.message_body(message.reply_to_message)
+    count = await db.warn_add(message.chat.id, target, reason, message.from_user.id)
+
+    for msg in (message.reply_to_message, message):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+    who = utils.mention(target.id, target.full_name, target.username)
+    admin = utils.mention(message.from_user.id, message.from_user.full_name,
+                          message.from_user.username)
+    card = (
+        f"⚠️ <b>Варн {count}/{s.warns_limit}</b> · {utils.esc(message.chat.title)}\n"
+        f"👤 {who} (<code>{target.id}</code>)\n"
+        f"📎 Причина: {utils.esc(reason)}\n"
+        f"👮 Кем: {admin}" + body
+    )
+    await moderation.send_card(bot, message.chat.id, config.BIT_WARN, card,
+                               user_id=target.id)
+    await db.add_event(
+        message.chat.id, "warn",
+        f"варн {count}/{s.warns_limit}: {target.full_name} ({target.id}) — {reason} "
+        f"| by {message.from_user.id}",
+    )
+    if count < s.warns_limit:
+        return
+
+    # лимит добит: наказываем и гасим счётчик, чтобы отсчёт пошёл заново
+    await db.warn_reset(message.chat.id, target.id)
+    kind = s.warns_punish
+    if kind == "delete":
+        return                       # «удаление» уже случилось выше
+    pid = await moderation.apply_punishment(
+        bot, message.chat.id, target, kind, s.warns_mute_min,
+        f"набрано {s.warns_limit} варнов", message.from_user.id,
+    )
+    if pid is None:
+        return
+    until = utils.until_ts(s.warns_mute_min) if kind == "mute" else None
+    bit = config.BIT_BAN if kind == "ban" else config.BIT_MUTE
+    punish_card = _manual_card_text(
+        kind, message.chat.title, target, f"набрано {s.warns_limit} варнов",
+        until, message.from_user,
+    )
+    await moderation.send_card(bot, message.chat.id, bit, punish_card, pid, kind)
+    await db.add_event(
+        message.chat.id, "manual",
+        f"{kind}: {target.full_name} ({target.id}) — лимит варнов | by {message.from_user.id}",
+    )
+
+
+async def _lift_target(message: Message, bot: Bot) -> tuple[int | None, str]:
+    """Кого снимать: реплай, @ник или id из команды. Вернуть (id, подпись)."""
+    if message.reply_to_message and message.reply_to_message.from_user:
+        u = message.reply_to_message.from_user
+        return u.id, utils.mention(u.id, u.full_name, u.username)
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        return None, ""
+    token = parts[1]
+    if token.lstrip("-").isdigit():
+        uid = int(token)
+        return uid, f"<code>{uid}</code>"
+    if token.startswith("@") and len(token) > 3:
+        uid, name = await resolve.by_username(bot, token)
+        return uid, utils.esc(name or token)
+    return None, ""
+
+
+@router.message(F.text.regexp(r"^!(unmute|размут|unban|разбан)(\s|$)"))
+async def cmd_lift(message: Message, bot: Bot) -> None:
+    """!unmute / !unban — снять наказание с того, на кого ответили или кого назвали."""
+    if stale(message):
+        return
+    s = await db.get_settings(message.chat.id)
+    if not await _is_chat_admin(bot, message.chat.id, message.from_user.id):
+        await _misuse(message, bot, s)
+        return
+
+    word = (message.text or "").split(maxsplit=1)[0].lower().lstrip("!")
+    unban = word in ("unban", "разбан")
+    uid, who = await _lift_target(message, bot)
+    if uid is None:
+        await message.reply("Кого снимать? Ответьте на сообщение или укажите @ник или id.")
+        return
+
+    try:
+        if uid < 0:
+            await bot.unban_chat_sender_chat(message.chat.id, uid)
+            done = True
+        elif unban:
+            member = await bot.get_chat_member(message.chat.id, uid)
+            done = member.status == "kicked"
+            if done:
+                await bot.unban_chat_member(message.chat.id, uid, only_if_banned=True)
+        else:
+            await bot.restrict_chat_member(message.chat.id, uid,
+                                           permissions=moderation.UNMUTE_PERMS)
+            done = True
+    except Exception as e:
+        await message.reply(f"Не вышло: {utils.esc(str(e)[:100])}")
+        return
+
+    await db.deactivate_user_punishments(message.chat.id, uid)
+    adm_cache.invalidate_member(message.chat.id, uid)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    kind = "🔓 Разбан" if unban else "🔊 Размут"
+    tail = "" if done else "\n<i>Наказания не было — снимать нечего.</i>"
+    card = (
+        f"{kind} · {utils.esc(message.chat.title)}\n"
+        f"👤 {who} (<code>{uid}</code>)\n"
+        f"👮 Кем: {utils.mention(message.from_user.id, message.from_user.full_name, message.from_user.username)}"
+        f"{tail}"
+    )
+    bit = config.BIT_BAN if unban else config.BIT_MUTE
+    await moderation.send_card(bot, message.chat.id, bit, card)
+    await db.add_event(
+        message.chat.id, "manual",
+        f"{'unban' if unban else 'unmute'}: {uid} | by {message.from_user.id}",
+    )
+
+
 @router.message(F.text.regexp(r"^!(dm|дм)(\s|$)"))
 async def cmd_delete(message: Message, bot: Bot) -> None:
     """!dm ответом на сообщение — удалить его вместе с самой командой."""
@@ -192,18 +395,19 @@ async def cmd_delete(message: Message, bot: Bot) -> None:
     )
 
 
-@router.message(F.text.startswith("!"))
+@router.message(F.text.contains("!") | F.caption.contains("!"))
 async def chat_command(message: Message, bot: Bot) -> None:
     """Счётчики: команда в чате -> ответ по заготовке + счётчик вызовов.
 
+    Ловим и подпись к медиа: команду часто пишут прямо под картинкой.
     Стоит выше системных !mute/!ban — но те перехватываются раньше по своим
     регуляркам, а сюда попадает всё остальное с «!».
     """
     s = await db.get_settings(message.chat.id)
     if not s.cmds_on:
         return
-    word = (message.text or "").split(maxsplit=1)[0].lower()
-    row = await db.cmd_find(message.chat.id, word)
+    text = (message.text or message.caption or "")
+    row = await _find_cmd(message.chat.id, text, bool(s.cmds_anywhere))
     if row is None:
         return
     # вызов из бэклога: счётчик растёт, но в чат ничего не шлём — иначе после
@@ -247,11 +451,52 @@ async def chat_command(message: Message, bot: Bot) -> None:
     body = f"{ans['text']} [{count}]"
     try:
         await message.reply(body)
-    except Exception:
+    except Exception as e:
+        if utils.msg_gone(e):
+            return                       # сообщение с командой уже удалили
         try:
             await message.reply(utils.esc(body), parse_mode=None)
-        except Exception:
-            logger.warning("counter %s failed in %s", row["id"], message.chat.id, exc_info=True)
+        except Exception as e2:
+            if not utils.msg_gone(e2):
+                logger.warning("counter %s failed in %s", row["id"], message.chat.id,
+                               exc_info=True)
+
+
+async def _link_punish(bot: Bot, chat_id: int, user_id: int, s,
+                       kind: str) -> tuple[str, int]:
+    """Наказание за ссылку: своё на каждый тип и отдельно для не участников.
+
+    kind: tg | ext | men | fwd. Статус в чате спрашиваем, только если настройки
+    участников и гостей для этого типа различаются — иначе лишний запрос в
+    Telegram на каждое нарушение.
+    """
+    mine = (getattr(s, f"lp_{kind}"), getattr(s, f"lm_{kind}"))
+    guest = (getattr(s, f"gp_{kind}"), getattr(s, f"gm_{kind}"))
+    if mine == guest:
+        return mine
+    return mine if await adm_cache.is_member(bot, chat_id, user_id) else guest
+
+
+async def _find_cmd(chat_id: int, text: str, anywhere: bool):
+    """Найти счётчик в сообщении.
+
+    По умолчанию — только если сообщение с него начинается, как обычная команда.
+    С тумблером «в любом месте» — первое слово с «!», которое совпало.
+    """
+    # хвостовую пунктуацию срезаем: «!черви?» и «!черви!!!» — та же команда
+    words = [w.rstrip("?!.,;:…\"'»)(") for w in text.split()]
+    words = [w for w in words if len(w) > 1 and w.startswith("!")]
+    if not words:
+        return None
+    if not anywhere:
+        # команда должна открывать сообщение, иначе это просто разговор о ней
+        first = text.split()[0].rstrip("?!.,;:…\"'»)(").lower()
+        return await db.cmd_find(chat_id, first) if first.startswith("!") else None
+    for w in words:
+        row = await db.cmd_find(chat_id, w.lower())
+        if row is not None:
+            return row
+    return None
 
 
 async def fire_trigger(bot: Bot, message: Message, s) -> None:
@@ -263,7 +508,7 @@ async def fire_trigger(bot: Bot, message: Message, s) -> None:
         return
     now = time.monotonic()
     for t in await db.trig_list(message.chat.id):
-        if t["phrase"] not in low:
+        if not triggers.phrase_matches(t["phrase"], low):
             continue
         key = (message.chat.id, t["id"])
         if t["cooldown"] and now - _trig_fired.get(key, 0) < t["cooldown"]:
@@ -271,8 +516,12 @@ async def fire_trigger(bot: Bot, message: Message, s) -> None:
         _trig_fired[key] = now
         try:
             await triggers.send(message, t)
-        except Exception:
-            logger.warning("trigger %s failed in %s", t["id"], message.chat.id, exc_info=True)
+        except Exception as e:
+            if utils.msg_gone(e):
+                logger.info("триггер %s: отвечать уже некому, сообщение удалили", t["id"])
+            else:
+                logger.warning("trigger %s failed in %s", t["id"], message.chat.id,
+                               exc_info=True)
         return  # один триггер на сообщение
 
 
@@ -468,6 +717,8 @@ async def moderate(message: Message, bot: Bot) -> None:
     if message.sender_chat is not None:
         # анонимный админ этого же чата — ок; автопересылка из привязанного канала — ок
         if message.sender_chat.id == chat.id or message.is_automatic_forward:
+            if message.is_automatic_forward and s.rules_on:
+                asyncio.create_task(_post_rules(message, chat.id))
             return
         anon_body = moderation.message_body(message)   # текст берём до удаления
         sender_scopes = await db.wl_scopes_for(
@@ -570,7 +821,7 @@ async def moderate(message: Message, bot: Bot) -> None:
         if source is not None:
             await moderation.violation(
                 bot, message, config.BIT_LINKS, "пересылка",
-                s.links_punish, s.links_mute_min, source,
+                *await _link_punish(bot, chat.id, user.id, s, "fwd"), source,
             )
             return
 
@@ -603,7 +854,7 @@ async def moderate(message: Message, bot: Bot) -> None:
         if links:
             await moderation.violation(
                 bot, message, config.BIT_LINKS, "ссылка на сторонний чат",
-                s.links_punish, s.links_mute_min, links[0],
+                *await _link_punish(bot, chat.id, user.id, s, "tg"), links[0],
             )
             return
         # опционально: @упоминания каналов/групп (упоминания людей всегда ок)
@@ -616,7 +867,7 @@ async def moderate(message: Message, bot: Bot) -> None:
                 if ctype in ("channel", "supergroup", "group"):
                     await moderation.violation(
                         bot, message, config.BIT_LINKS, "упоминание стороннего чата",
-                        s.links_punish, s.links_mute_min, f"@{uname}",
+                        *await _link_punish(bot, chat.id, user.id, s, "men"), f"@{uname}",
                     )
                     return
 
@@ -629,7 +880,7 @@ async def moderate(message: Message, bot: Bot) -> None:
         if ext:
             await moderation.violation(
                 bot, message, config.BIT_LINKS, "внешняя ссылка",
-                s.links_punish, s.links_mute_min, ext[0],
+                *await _link_punish(bot, chat.id, user.id, s, "ext"), ext[0],
             )
             return
 

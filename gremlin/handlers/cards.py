@@ -18,13 +18,17 @@ async def _mark(cb: CallbackQuery, note: str) -> bool:
     Действие к этому моменту уже выполнено, поэтому молчать нельзя — итог
     покажем всплывашкой.
     """
+    from ..services import moderation
+    text = cb.message.html_text + note
     try:
-        await cb.message.edit_text(cb.message.html_text + note, reply_markup=None,
+        await cb.message.edit_text(text, reply_markup=None,
                                    disable_web_page_preview=True)
-        return True
     except Exception:
         logger.warning("card edit failed (старше 48 часов?)", exc_info=True)
         return False
+    # та же карточка лежит копией в другом логе — там кнопки тоже надо убрать
+    await moderation.update_twins(cb.bot, cb.message.chat.id, cb.message.message_id, text)
+    return True
 
 
 @router.callback_query(F.data.startswith("k:lift:"))

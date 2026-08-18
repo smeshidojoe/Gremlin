@@ -45,7 +45,11 @@ async def main() -> None:
         raise RuntimeError("BOT_TOKEN is not set (.env)")
 
     await db.init()
-    bot = Bot(config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bot = Bot(config.BOT_TOKEN, default=DefaultBotProperties(
+        parse_mode=ParseMode.HTML,
+        # превью ссылок не нужно нигде: ни в меню, ни в карточках, ни в ответах
+        link_preview_is_disabled=True,
+    ))
     dp = Dispatcher()
 
     dp.message.middleware(TrackingMiddleware())

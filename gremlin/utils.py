@@ -171,6 +171,22 @@ def esc(text: str | None) -> str:
     return html.escape(text or "")
 
 
+# ответы Telegram на «отвечать уже некому»: сообщение удалили, пока бот думал
+# или разгребал бэклог. Это не ошибка бота, в лог сыпать нечего.
+_GONE_HINTS = (
+    "message to be replied not found",
+    "message to reply not found",
+    "message_id_invalid",
+    "message to delete not found",
+    "replied message not found",
+)
+
+
+def msg_gone(e: Exception) -> bool:
+    text = str(e).lower()
+    return any(h in text for h in _GONE_HINTS)
+
+
 def chunk(text: str, limit: int = 3900) -> str:
     """Обрезка под лимит Telegram."""
     return text if len(text) <= limit else text[: limit - 1] + "…"

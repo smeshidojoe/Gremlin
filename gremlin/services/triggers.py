@@ -6,13 +6,14 @@
 import html
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass
 
 from aiogram import Bot
 from aiogram.types import FSInputFile, LinkPreviewOptions, Message
 
-from .. import config
+from .. import config, utils
 
 logger = logging.getLogger("gremlin.triggers")
 
@@ -27,6 +28,30 @@ MEDIA_KINDS = {
     "audio": (".mp3", "answer_audio", True),
     "document": ("", "answer_document", True),
 }
+
+
+# фраза со звёздочкой ловит любые окончания: «пив*» -> пиво, пива, пивом
+_STEM_CACHE: dict[str, re.Pattern] = {}
+
+
+def phrase_matches(phrase: str, text_low: str) -> bool:
+    """Совпала ли фраза триггера с текстом.
+
+    Без звёздочки — как раньше, простое вхождение. Со звёздочкой на конце —
+    основа плюс любые буквы: слово целиком, а не кусок другого слова.
+    """
+    if not phrase.endswith("*"):
+        return phrase in text_low
+    stem = phrase[:-1]
+    if not stem:
+        return False
+    rx = _STEM_CACHE.get(stem)
+    if rx is None:
+        rx = re.compile(rf"(?<!\w){re.escape(stem)}\w*", re.IGNORECASE | re.UNICODE)
+        if len(_STEM_CACHE) > 2000:
+            _STEM_CACHE.clear()
+        _STEM_CACHE[stem] = rx
+    return rx.search(text_low) is not None
 
 
 @dataclass
@@ -78,7 +103,9 @@ async def send_answer(message: Message, ans) -> None:
         no_preview = LinkPreviewOptions(is_disabled=True)
         try:
             await message.reply(ans["text"], link_preview_options=no_preview)
-        except Exception:
+        except Exception as e:
+            if utils.msg_gone(e):
+                return                        # исходное сообщение удалили
             await message.reply(html.escape(ans["text"] or ""), parse_mode=None,
                                 link_preview_options=no_preview)
         return
@@ -92,7 +119,9 @@ async def send_answer(message: Message, ans) -> None:
         kwargs["caption"] = ans["text"]
     try:
         await getattr(message, method)(FSInputFile(ans["file_path"]), **kwargs)
-    except Exception:
+    except Exception as e:
+        if utils.msg_gone(e):
+            return
         if "caption" in kwargs:               # подпись с битой разметкой
             kwargs["caption"] = html.escape(ans["text"])
             kwargs["parse_mode"] = None

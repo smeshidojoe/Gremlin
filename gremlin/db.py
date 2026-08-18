@@ -1,6 +1,7 @@
 """Единая SQLite-база: чаты, настройки, вайтлисты, стоп-слова, наказания, события, юзеры."""
 import os
 import random
+import re
 import time
 from dataclasses import dataclass, fields
 
@@ -29,6 +30,25 @@ CREATE TABLE IF NOT EXISTS settings(
     extlinks_on     INTEGER NOT NULL DEFAULT 1,
     links_punish    TEXT    NOT NULL DEFAULT 'delete',
     links_mute_min  INTEGER NOT NULL DEFAULT 60,
+    links_guest_punish   TEXT    NOT NULL DEFAULT 'delete',
+    links_guest_mute_min INTEGER NOT NULL DEFAULT 60,
+    -- наказания по типам: l* — участники, g* — не участники
+    lp_tg         TEXT    NOT NULL DEFAULT 'delete',
+    lm_tg         INTEGER NOT NULL DEFAULT 60,
+    lp_ext        TEXT    NOT NULL DEFAULT 'delete',
+    lm_ext        INTEGER NOT NULL DEFAULT 60,
+    lp_men        TEXT    NOT NULL DEFAULT 'delete',
+    lm_men        INTEGER NOT NULL DEFAULT 60,
+    lp_fwd        TEXT    NOT NULL DEFAULT 'delete',
+    lm_fwd        INTEGER NOT NULL DEFAULT 60,
+    gp_tg         TEXT    NOT NULL DEFAULT 'delete',
+    gm_tg         INTEGER NOT NULL DEFAULT 60,
+    gp_ext        TEXT    NOT NULL DEFAULT 'delete',
+    gm_ext        INTEGER NOT NULL DEFAULT 60,
+    gp_men        TEXT    NOT NULL DEFAULT 'delete',
+    gm_men        INTEGER NOT NULL DEFAULT 60,
+    gp_fwd        TEXT    NOT NULL DEFAULT 'delete',
+    gm_fwd        INTEGER NOT NULL DEFAULT 60,
     mentions_check  INTEGER NOT NULL DEFAULT 0,
     anon_on         INTEGER NOT NULL DEFAULT 1,
     forwards_on     INTEGER NOT NULL DEFAULT 0,
@@ -53,10 +73,17 @@ CREATE TABLE IF NOT EXISTS settings(
     trig_on         INTEGER NOT NULL DEFAULT 0,
     cmds_on         INTEGER NOT NULL DEFAULT 0,
     cmds_guest_cd   INTEGER NOT NULL DEFAULT 3600,
+    cmds_anywhere   INTEGER NOT NULL DEFAULT 0,
     digest_to       INTEGER NOT NULL DEFAULT 0,
     service_join    INTEGER NOT NULL DEFAULT 0,
     service_leave   INTEGER NOT NULL DEFAULT 0,
     service_other   INTEGER NOT NULL DEFAULT 0,
+    misuse_mute     INTEGER NOT NULL DEFAULT 5,
+    warns_on        INTEGER NOT NULL DEFAULT 0,
+    warns_limit     INTEGER NOT NULL DEFAULT 3,
+    warns_punish    TEXT    NOT NULL DEFAULT 'mute',
+    warns_mute_min  INTEGER NOT NULL DEFAULT 1440,
+    rules_on        INTEGER NOT NULL DEFAULT 0,
     cards_on        INTEGER NOT NULL DEFAULT 1,
     card_mask       INTEGER NOT NULL DEFAULT 4095,
     log_chat_id     INTEGER
@@ -150,6 +177,18 @@ CREATE TABLE IF NOT EXISTS punishments(
     active   INTEGER NOT NULL DEFAULT 1,
     was_member INTEGER NOT NULL DEFAULT 1   -- состоял ли в чате на момент наказания
 );
+CREATE TABLE IF NOT EXISTS warns(
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id  INTEGER NOT NULL,
+    user_id  INTEGER NOT NULL,
+    username TEXT,
+    name     TEXT,
+    reason   TEXT,
+    by_id    INTEGER,
+    created  INTEGER NOT NULL,
+    active   INTEGER NOT NULL DEFAULT 1   -- 0 = сгорел при наказании или снят вручную
+);
+CREATE INDEX IF NOT EXISTS idx_warns_chat ON warns(chat_id, user_id, active);
 CREATE TABLE IF NOT EXISTS events(
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER,
@@ -187,6 +226,24 @@ class Settings:
     extlinks_on: int = 1
     links_punish: str = "delete"
     links_mute_min: int = 60
+    links_guest_punish: str = "delete"
+    links_guest_mute_min: int = 60
+    lp_tg: str = "delete"
+    lm_tg: int = 60
+    lp_ext: str = "delete"
+    lm_ext: int = 60
+    lp_men: str = "delete"
+    lm_men: int = 60
+    lp_fwd: str = "delete"
+    lm_fwd: int = 60
+    gp_tg: str = "delete"
+    gm_tg: int = 60
+    gp_ext: str = "delete"
+    gm_ext: int = 60
+    gp_men: str = "delete"
+    gm_men: int = 60
+    gp_fwd: str = "delete"
+    gm_fwd: int = 60
     mentions_check: int = 0
     anon_on: int = 1
     forwards_on: int = 0
@@ -211,10 +268,17 @@ class Settings:
     trig_on: int = 0
     cmds_on: int = 0
     cmds_guest_cd: int = 3600
+    cmds_anywhere: int = 0
     digest_to: int = 0
     service_join: int = 0
     service_leave: int = 0
     service_other: int = 0
+    misuse_mute: int = 5
+    warns_on: int = 0
+    warns_limit: int = 3
+    warns_punish: str = "mute"
+    warns_mute_min: int = 1440
+    rules_on: int = 0
     cards_on: int = 1
     card_mask: int = 4095
     log_chat_id: int | None = None
@@ -242,6 +306,31 @@ _SETTINGS_MIGRATIONS = {
     "digest_to": "INTEGER NOT NULL DEFAULT 0",
     "cmds_guest_cd": "INTEGER NOT NULL DEFAULT 3600",
     "inline_spam": "INTEGER NOT NULL DEFAULT 40",
+    "cmds_anywhere": "INTEGER NOT NULL DEFAULT 0",
+    "misuse_mute": "INTEGER NOT NULL DEFAULT 5",
+    "warns_on": "INTEGER NOT NULL DEFAULT 0",
+    "warns_limit": "INTEGER NOT NULL DEFAULT 3",
+    "warns_punish": "TEXT NOT NULL DEFAULT 'mute'",
+    "warns_mute_min": "INTEGER NOT NULL DEFAULT 1440",
+    "rules_on": "INTEGER NOT NULL DEFAULT 0",
+    "links_guest_punish": "TEXT NOT NULL DEFAULT 'delete'",
+    "links_guest_mute_min": "INTEGER NOT NULL DEFAULT 60",
+    "lp_tg": "TEXT NOT NULL DEFAULT 'delete'",
+    "lm_tg": "INTEGER NOT NULL DEFAULT 60",
+    "lp_ext": "TEXT NOT NULL DEFAULT 'delete'",
+    "lm_ext": "INTEGER NOT NULL DEFAULT 60",
+    "lp_men": "TEXT NOT NULL DEFAULT 'delete'",
+    "lm_men": "INTEGER NOT NULL DEFAULT 60",
+    "lp_fwd": "TEXT NOT NULL DEFAULT 'delete'",
+    "lm_fwd": "INTEGER NOT NULL DEFAULT 60",
+    "gp_tg": "TEXT NOT NULL DEFAULT 'delete'",
+    "gm_tg": "INTEGER NOT NULL DEFAULT 60",
+    "gp_ext": "TEXT NOT NULL DEFAULT 'delete'",
+    "gm_ext": "INTEGER NOT NULL DEFAULT 60",
+    "gp_men": "TEXT NOT NULL DEFAULT 'delete'",
+    "gm_men": "INTEGER NOT NULL DEFAULT 60",
+    "gp_fwd": "TEXT NOT NULL DEFAULT 'delete'",
+    "gm_fwd": "INTEGER NOT NULL DEFAULT 60",
     "words_guests": "INTEGER NOT NULL DEFAULT 1",
     "extlinks_on": "INTEGER NOT NULL DEFAULT 1",
     "service_join": "INTEGER NOT NULL DEFAULT 0",
@@ -285,6 +374,26 @@ async def _migrate() -> None:
         if await cur.fetchone() is None:
             await _db.execute(f"UPDATE settings SET card_mask = card_mask | {bit}")
             await _db.execute("INSERT INTO kv (k, v) VALUES (?, '1')", (flag,))
+    # у чатов, заведённых до появления развилки «перенести настройки», её быть
+    # не должно: они уже настроены руками
+    cur = await _db.execute("SELECT v FROM kv WHERE k = 'mig_setup_done'")
+    if await cur.fetchone() is None:
+        await _db.execute(
+            "INSERT OR IGNORE INTO kv (k, v) "
+            "SELECT 'setup_done:' || chat_id, '1' FROM chats"
+        )
+        await _db.execute("INSERT INTO kv (k, v) VALUES ('mig_setup_done', '1')")
+
+    # наказание за ссылки разъехалось по типам: раскладываем старое значение
+    cur = await _db.execute("SELECT v FROM kv WHERE k = 'mig_links_split'")
+    if await cur.fetchone() is None:
+        for t in ("tg", "ext", "men", "fwd"):
+            await _db.execute(
+                f"UPDATE settings SET lp_{t} = links_punish, lm_{t} = links_mute_min, "
+                f"gp_{t} = links_guest_punish, gm_{t} = links_guest_mute_min"
+            )
+        await _db.execute("INSERT INTO kv (k, v) VALUES ('mig_links_split', '1')")
+
     # таблицы удалённых функций: варны, список для жалоб, отдельный вайтлист анонимов
     # (его содержимое давно переехало в общий whitelist)
     cur = await _db.execute("SELECT v FROM kv WHERE k = 'mig_drop_dead'")
@@ -392,6 +501,26 @@ async def all_chats(active_only: bool = False) -> list[aiosqlite.Row]:
     return await cur.fetchall()
 
 
+async def chats_for(user_id: int) -> list[aiosqlite.Row]:
+    """Чаты, которыми человек вправе управлять.
+
+    Владелец бота видит все, остальные — только те, куда бота позвали они сами.
+    Лог-чаты в список не попадают: они настраиваются внутри своего чата.
+    """
+    chats = await moderated_chats()
+    if user_id in config.ADMIN_IDS:
+        return chats
+    return [c for c in chats if c["owner_id"] == user_id]
+
+
+async def owns_chat(user_id: int, chat_id: int) -> bool:
+    """Может ли человек трогать этот чат."""
+    if user_id in config.ADMIN_IDS:
+        return True
+    ch = await get_chat(chat_id)
+    return ch is not None and ch["owner_id"] == user_id
+
+
 async def moderated_chats() -> list[aiosqlite.Row]:
     """Рабочие чаты для меню: без тех, что служат лог-чатом для другого чата."""
     cur = await _db.execute(
@@ -400,7 +529,9 @@ async def moderated_chats() -> list[aiosqlite.Row]:
                WHERE log_chat_id IS NOT NULL AND log_chat_id != chat_id
            ) ORDER BY added_at"""
     )
-    return await cur.fetchall()
+    rows = await cur.fetchall()
+    gl = await global_log()          # общий лог тоже не рабочий чат
+    return [r for r in rows if r["chat_id"] != gl]
 
 
 # ---------- настройки ----------
@@ -671,6 +802,48 @@ async def active_punishments(chat_id: int, limit: int = 10, offset: int = 0) -> 
     return await cur.fetchall()
 
 
+# ---------- варны ----------
+
+async def warn_add(chat_id: int, user, reason: str, by_id: int) -> int:
+    """Записать варн, вернуть текущее число активных у этого человека."""
+    await _db.execute(
+        """INSERT INTO warns(chat_id, user_id, username, name, reason, by_id, created)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (chat_id, user.id, user.username, user.full_name, reason, by_id, _now()),
+    )
+    await _db.commit()
+    return await warn_count(chat_id, user.id)
+
+
+async def warn_count(chat_id: int, user_id: int) -> int:
+    cur = await _db.execute(
+        "SELECT COUNT(*) AS c FROM warns WHERE chat_id = ? AND user_id = ? AND active = 1",
+        (chat_id, user_id),
+    )
+    return (await cur.fetchone())["c"]
+
+
+async def warn_reset(chat_id: int, user_id: int) -> None:
+    """Погасить варны: добрал лимит и получил наказание либо админ снял вручную."""
+    await _db.execute(
+        "UPDATE warns SET active = 0 WHERE chat_id = ? AND user_id = ? AND active = 1",
+        (chat_id, user_id),
+    )
+    await _db.commit()
+
+
+async def warn_users(chat_id: int) -> list[aiosqlite.Row]:
+    """Кто сейчас с варнами: по человеку строка со счётчиком и последней причиной."""
+    cur = await _db.execute(
+        """SELECT user_id, COUNT(*) AS cnt, MAX(created) AS last_ts,
+                  MAX(username) AS username, MAX(name) AS name
+           FROM warns WHERE chat_id = ? AND active = 1
+           GROUP BY user_id ORDER BY cnt DESC, last_ts DESC""",
+        (chat_id,),
+    )
+    return await cur.fetchall()
+
+
 async def active_punishment_of(chat_id: int, user_id: int, kind: str) -> aiosqlite.Row | None:
     """Активное наказание нужного вида. id канала сверяем в обоих форматах."""
     ids = id_variants(user_id)
@@ -727,6 +900,33 @@ async def track_user(user_id: int, username: str | None, first_name: str | None)
         (user_id, username, first_name, now, now),
     )
     await _db.commit()
+
+
+async def names_in(text: str) -> str:
+    """Заменить id после «by» на @ник — id в логе человеку ничего не говорят.
+
+    Делается при выводе, поэтому старые записи тоже читаются нормально.
+    """
+    if not text:
+        return text
+    out = text
+    for uid in set(re.findall(r"(?<= by )(-?\d+)", text)):
+        out = out.replace(f" by {uid}", f" by {await user_handle(int(uid))}")
+    return out
+
+
+async def user_handle(user_id: int | None) -> str:
+    """Короткая подпись человека: @ник, а если ника нет — имя, иначе id.
+
+    Для мест, где важна опознаваемость, а не полнота: имена бывают в эмодзи и
+    занимают всю строку.
+    """
+    row = await get_user(user_id) if user_id else None
+    if row and row["username"]:
+        return f"@{row['username']}"
+    if row and row["first_name"]:
+        return row["first_name"]
+    return str(user_id or "—")
 
 
 async def user_label(user_id: int | None, username: str | None = None,
@@ -1070,6 +1270,33 @@ async def kv_get(key: str) -> str | None:
     cur = await _db.execute("SELECT v FROM kv WHERE k = ?", (key,))
     row = await cur.fetchone()
     return row["v"] if row else None
+
+
+GLOBAL_LOG_KEY = "global_log"
+
+
+async def global_log() -> int | None:
+    """Общий лог-чат владельца бота: копия всех карточек со всех чатов."""
+    raw = await kv_get(GLOBAL_LOG_KEY)
+    return int(raw) if raw else None
+
+
+async def set_global_log(chat_id: int | None) -> None:
+    await kv_set(GLOBAL_LOG_KEY, str(chat_id) if chat_id else None)
+
+
+async def table_counts() -> dict[str, int]:
+    """Счётчики по таблицам для раздела «Состояние»."""
+    out: dict[str, int] = {}
+    for t in ("words", "whitelist", "triggers", "chat_cmds", "events", "users", "answers"):
+        cur = await _db.execute(f"SELECT COUNT(*) AS c FROM {t}")
+        out[t] = (await cur.fetchone())["c"]
+    cur = await _db.execute(
+        "SELECT COUNT(*) AS c FROM punishments WHERE active = 1 "
+        "AND (until_ts IS NULL OR until_ts > ?)", (_now(),)
+    )
+    out["punishments_active"] = (await cur.fetchone())["c"]
+    return out
 
 
 async def kv_prefix(prefix: str) -> list[tuple[str, str]]:

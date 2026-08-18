@@ -320,6 +320,8 @@ async def clear_unban_card(bot: Bot, chat_id: int, uid: int, returned: bool = Fa
             )
         except Exception:
             logger.warning("не вышло убрать ссылку из карточки", exc_info=True)
+        # копия карточки в другом логе тащит ту же ссылку — чистим и там
+        await update_twins(bot, card["log"], card["msg"], card["text"] + note)
 
 
 async def card_sweeper(bot: Bot) -> None:
@@ -342,6 +344,13 @@ async def card_sweeper(bot: Bot) -> None:
                 _, chat_id, uid = key.split(":")
                 await clear_unban_card(bot, int(chat_id), int(uid))
                 await db.kv_set(unban_link_key(int(chat_id), int(uid)), None)
+            # связки копий живут ровно столько, сколько Telegram даёт править
+            for key, raw in await db.kv_prefix("twin:"):
+                try:
+                    if now >= json.loads(raw).get("until", 0):
+                        await db.kv_set(key, None)
+                except ValueError:
+                    await db.kv_set(key, None)
         except Exception:
             logger.warning("card sweeper tick failed", exc_info=True)
         await asyncio.sleep(300)
@@ -397,16 +406,68 @@ async def unban_pass_valid(chat_id: int, uid: int) -> bool:
 async def send_card(bot: Bot, chat_id: int, bit: int, text: str,
                     pid: int | None = None, kind: str = "delete",
                     user_id: int | None = None) -> None:
-    """Карточка события в лог-чат чата (если включено и бит разрешён)."""
+    """Карточка события: в лог-чат этого чата и в глобальный лог владельца бота.
+
+    Лог чата слушается настройками самого чата, глобальный — нет: он общий и
+    собирает всё подряд, иначе смысла в нём мало.
+    """
     s = await db.get_settings(chat_id)
-    if not s.cards_on or not s.log_chat_id or not (s.card_mask & bit):
-        return
     kb = card_kb(pid, kind, chat_id, user_id)
+    no_preview = LinkPreviewOptions(is_disabled=True)
+    targets = []
+    if s.cards_on and s.log_chat_id and (s.card_mask & bit):
+        targets.append(s.log_chat_id)
+    global_log = await db.global_log()
+    if global_log and global_log not in targets and global_log != chat_id:
+        targets.append(global_log)
+    sent = []
+    for target in targets:
+        try:
+            msg = await bot.send_message(target, text, reply_markup=kb,
+                                         link_preview_options=no_preview)
+            sent.append((target, msg.message_id))
+        except Exception:
+            logger.warning("card send failed for chat %s -> %s", chat_id, target,
+                           exc_info=True)
+    if len(sent) > 1:
+        await link_twins(sent)
+
+
+# Одно и то же событие уходит и в лог чата, и в глобальный. Кнопки живут в обеих
+# копиях, поэтому копии надо помнить: нажали в одной — вторую правим следом,
+# иначе там останутся живые кнопки под уже снятым наказанием.
+
+def twin_key(chat_id: int, msg_id: int) -> str:
+    return f"twin:{chat_id}:{msg_id}"
+
+
+async def link_twins(sent: list[tuple[int, int]]) -> None:
+    """Записать копии карточки друг на друга."""
+    until = int(time.time()) + CARD_EDIT_LIMIT
+    for chat_id, msg_id in sent:
+        others = [[c, m] for c, m in sent if (c, m) != (chat_id, msg_id)]
+        await db.kv_set(twin_key(chat_id, msg_id),
+                        json.dumps({"until": until, "twins": others}))
+
+
+async def update_twins(bot: Bot, chat_id: int, msg_id: int, text: str) -> None:
+    """Повторить итог в копиях карточки и снять с них кнопки."""
+    raw = await db.kv_get(twin_key(chat_id, msg_id))
+    if not raw:
+        return
     try:
-        await bot.send_message(s.log_chat_id, text, reply_markup=kb,
-                               link_preview_options=LinkPreviewOptions(is_disabled=True))
-    except Exception:
-        logger.warning("card send failed for chat %s", chat_id, exc_info=True)
+        twins = json.loads(raw).get("twins", [])
+    except ValueError:
+        return
+    for twin_chat, twin_msg in twins:
+        try:
+            await bot.edit_message_text(
+                text, chat_id=twin_chat, message_id=twin_msg, reply_markup=None,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+        except Exception:
+            logger.warning("twin card edit failed: %s/%s", twin_chat, twin_msg,
+                           exc_info=True)
 
 
 # Альбом (несколько фото одним постом) приходит боту как несколько отдельных

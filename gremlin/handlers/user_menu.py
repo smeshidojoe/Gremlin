@@ -59,39 +59,65 @@ async def view_home(user_id: int, bot: Bot) -> tuple[str, InlineKeyboardMarkup]:
     """Единое меню — одинаковое для всех допущенных."""
     b = InlineKeyboardBuilder()
     b.button(text="💬 Чаты", callback_data="u:chats")
-    b.button(text="📜 Лог событий", callback_data="a:log")
-    b.button(text="🐞 Ошибки", callback_data="a:errors")
-    b.button(text="⚙️ Состояние", callback_data="a:health")
     if user_id in config.ADMIN_IDS:
-        # управление доступом — граница доверия, только владелец бота
+        # служебные разделы и управление доступом — только владельцу бота
+        b.button(text="📜 Лог событий", callback_data="a:log")
+        b.button(text="🐞 Ошибки", callback_data="a:errors")
+        b.button(text="⚙️ Состояние", callback_data="a:health")
         b.button(text="👥 Доступ к боту", callback_data="u:acc")
     b.button(text="✖️ Закрыть", callback_data="u:close")
     b.adjust(1, 2, 1, 1, 1)
     return _HOME_TEXT, b.as_markup()
 
 
-async def view_chats(bot: Bot) -> tuple[str, InlineKeyboardMarkup]:
-    """Рабочие чаты бота (лог-чаты сюда не попадают — они внутри своих чатов)."""
+CHATS_PER_PAGE = 5
+
+
+async def view_chats(bot: Bot, viewer_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """Чаты, доступные этому человеку.
+
+    Владелец бота видит все, остальные — только свои. Лог-чаты сюда не попадают:
+    они настраиваются внутри того чата, которому служат логом.
+    """
     me = await bot.me()
-    chats = await db.moderated_chats()
+    chats = await db.chats_for(viewer_id)
+    pages = max(1, -(-len(chats) // CHATS_PER_PAGE))
+    page = max(0, min(page, pages - 1))
+    chunk = chats[page * CHATS_PER_PAGE:(page + 1) * CHATS_PER_PAGE]
+
     b = InlineKeyboardBuilder()
     if chats:
-        text = f"<b>💬 Чаты</b> ({len(chats)})\n\nВыберите чат — откроются его данные и настройки."
-        for c in chats:
+        text = f"<b>💬 Чаты</b> ({len(chats)})"
+        if pages > 1:
+            text += f" · страница {page + 1} из {pages}"
+        text += "\n\nВыберите чат — откроются его данные и настройки."
+        for c in chunk:
             title = c["title"] or str(c["chat_id"])
             # у обсуждений название канала важнее собственного: чатов может быть
             # несколько, и по их именам не понять, к чему они прицеплены
             _, _, linked = await adm_cache.linked_chat(bot, c["chat_id"])
             label = f"{title} · 📣 {linked}" if linked else title
-            b.button(text=label[:60], callback_data=f"u:c:{c['chat_id']}")
+            b.row(_btn(label[:60], f"u:c:{c['chat_id']}"))
     else:
-        text = "<b>💬 Чаты</b>\n\nПока пусто. Добавьте бота в чат администратором."
-    b.button(
+        text = ("<b>💬 Чаты</b>\n\nПока пусто. Добавьте бота администратором в свой "
+                "чат — он появится здесь.")
+    if pages > 1:
+        prev_p = page - 1 if page else pages - 1
+        next_p = page + 1 if page + 1 < pages else 0
+        b.row(_btn("◀", f"u:chats:{prev_p}"),
+              _btn(f"{page + 1}/{pages}", f"u:chats:{page}"),
+              _btn("▶", f"u:chats:{next_p}"))
+    b.row(InlineKeyboardButton(
         text="➕ Добавить в чат",
         url=f"https://t.me/{me.username}?startgroup=true&admin={_ADD_RIGHTS}",
-    )
-    b.button(text="⬅️ Назад", callback_data="u:home")
-    b.adjust(1)
+    ))
+    if viewer_id in config.ADMIN_IDS:
+        gl = await db.global_log()
+        gl_chat = await db.get_chat(gl) if gl else None
+        gl_name = (gl_chat["title"] if gl_chat and gl_chat["title"]
+                   else (str(gl) if gl else "не задан"))
+        b.row(_btn(f"🌍 Глобальный лог: {gl_name}", "u:glog"))
+    b.row(_btn("⬅️ Назад", "u:home"))
     return text, b.as_markup()
 
 
@@ -124,6 +150,79 @@ async def _log_chat_label(log_chat_id: int | None) -> str:
     return f"<code>{log_chat_id}</code>"
 
 
+def setup_key(cid: int) -> str:
+    return f"setup_done:{cid}"
+
+
+async def needs_setup(cid: int, viewer_id: int) -> bool:
+    """Чат ещё не настраивали, и человеку есть откуда перенести настройки."""
+    if await db.kv_get(setup_key(cid)):
+        return False
+    return any(c["chat_id"] != cid for c in await db.chats_for(viewer_id))
+
+
+async def view_setup(cid: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Развилка для свежего чата: перенести настройки или начать с нуля."""
+    ch = await db.get_chat(cid)
+    text = (
+        f"<b>🆕 {utils.esc(ch['title'] if ch else str(cid))}</b>\n\n"
+        "Чат добавлен, но ещё не настроен. Можно перенести правила из другого "
+        "чата — фильтры, стоп-слова, вайтлисты, триггеры и счётчики поедут "
+        "целиком, вместе с медиа.\n\n"
+        "Не переносятся: получатель недельной сводки и счёт вызовов у команд."
+    )
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="📥 Перенести настройки",
+                               callback_data=f"u:cp:{cid}", style="success"))
+    b.row(InlineKeyboardButton(text="🛠 Настроить с нуля",
+                               callback_data=f"u:cpn:{cid}", style="danger"))
+    b.row(_btn("⬅️ Назад", "u:chats"))
+    return text, b.as_markup()
+
+
+async def view_copy_from(cid: int, viewer_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Выбор чата-источника. Только свои чаты: иначе через перенос можно было бы
+    вытащить чужие стоп-слова, вайтлист и триггеры."""
+    others = [c for c in await db.chats_for(viewer_id) if c["chat_id"] != cid]
+    b = InlineKeyboardBuilder()
+    text = "<b>📥 Откуда перенести</b>\n\nВыберите чат — его настройки скопируются сюда."
+    if not others:
+        text = "<b>📥 Откуда перенести</b>\n\nПока неоткуда: других чатов у бота нет."
+    for c in others:
+        b.row(_btn(c["title"] or str(c["chat_id"]), f"u:cps:{cid}:{c['chat_id']}"))
+    b.row(_btn("⬅️ Назад", f"u:c:{cid}"))
+    return text, b.as_markup()
+
+
+async def view_copy_pick(cid: int, src: int, picked: set[str]) -> tuple[str, InlineKeyboardMarkup]:
+    """Галочки: какие разделы переносим."""
+    from ..services import transfer
+    ch = await db.get_chat(src)
+    text = (
+        f"<b>📥 Перенос из «{utils.esc(ch['title'] if ch else str(src))}»</b>\n\n"
+        "Отметьте, что перенести. Вместе с настройками едут и списки раздела: "
+        "стоп-слова, вайтлист, разрешённые чаты и боты, триггеры с медиа, счётчики.\n"
+        f"Выбрано: <b>{len(picked)}</b> из {len(transfer.ALL_GROUPS)}"
+    )
+    b = InlineKeyboardBuilder()
+    row = []
+    for key in transfer.ALL_GROUPS:
+        mark = "✅" if key in picked else "☐"
+        row.append(_btn(f"{mark} {transfer.GROUPS[key][0]}", f"u:cpg:{cid}:{src}:{key}"))
+        if len(row) == 2:
+            b.row(*row)
+            row = []
+    if row:
+        b.row(*row)
+    b.row(_btn("Отметить все", f"u:cpg:{cid}:{src}:__all"),
+          _btn("Снять все", f"u:cpg:{cid}:{src}:__none"))
+    if picked:
+        b.row(InlineKeyboardButton(text="✅ Подтвердить",
+                                   callback_data=f"u:cpd:{cid}:{src}", style="success"))
+    b.row(_btn("⬅️ Назад", f"u:cp:{cid}"))
+    return text, b.as_markup()
+
+
 async def view_chat(cid: int, viewer_id: int) -> tuple[str, InlineKeyboardMarkup]:
     """Мини-дашборд чата: данные + сводка настроек + кнопки разделов."""
     ch = await db.get_chat(cid)
@@ -132,9 +231,14 @@ async def view_chat(cid: int, viewer_id: int) -> tuple[str, InlineKeyboardMarkup
     pun = await db.active_punishments_count(cid)
     marks = [f"{'✅' if getattr(s, key) else '🚫'} {lbl}" for key, lbl in schema.OVERVIEW]
     half = (len(marks) + 1) // 2
+    owner_line = ""
+    if viewer_id in config.ADMIN_IDS and ch and ch["owner_id"]:
+        # чужие чаты в списке видит только владелец бота — подскажем, чей это
+        owner_line = f"👤 Владелец: {utils.esc(await db.user_handle(ch['owner_id']))}\n"
     text = (
         f"<b>⚙️ {utils.esc(ch['title'] if ch else str(cid))}</b>\n"
-        f"<code>{cid}</code>\n\n"
+        f"<code>{cid}</code>\n"
+        f"{owner_line}\n"
         f"💬 Сообщений: сегодня <b>{st['d1']}</b> · за 7д <b>{st['d7']}</b>\n"
         f"👥 За 7д: пришло <b>{st['joins']}</b> · ушло <b>{st['leaves']}</b>\n"
         f"🔨 Наказаний: активных <b>{pun}</b> · за 7д <b>{st['pun7']}</b>\n"
@@ -156,6 +260,8 @@ async def view_chat(cid: int, viewer_id: int) -> tuple[str, InlineKeyboardMarkup
     from ..services import digest as _dg
     if _dg.tracked_chat() == cid:          # подробная статистика — только этот чат
         b.button(text="📊 Недельная сводка", callback_data=f"u:s:{cid}:digest")
+    b.button(text="⚠️ Варны", callback_data=f"u:s:{cid}:warns")
+    b.button(text="📜 Правила в постах", callback_data=f"u:s:{cid}:rules")
     b.button(text="🧹 Системные", callback_data=f"u:s:{cid}:service")
     b.button(text="🕊 Вайтлист", callback_data=f"u:s:{cid}:wl")
     b.button(text="🪪 Карточки и лог", callback_data=f"u:s:{cid}:cards")
@@ -166,9 +272,10 @@ async def view_chat(cid: int, viewer_id: int) -> tuple[str, InlineKeyboardMarkup
     log_name = (log_ch["title"] if log_ch and log_ch["title"]
                 else (str(s.log_chat_id) if s.log_chat_id else "не задан"))
     b.button(text=f"📍 Лог-чат: {log_name}", callback_data=f"u:logsel:{cid}")
+    b.button(text="📥 Перенести настройки", callback_data=f"u:cp:{cid}")
     b.button(text="🚪 Убрать бота из чата", callback_data=f"a:leave:{cid}")
     b.button(text="⬅️ Назад", callback_data="u:chats")
-    b.adjust(2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1)
+    b.adjust(2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1)
     return text, b.as_markup()
 
 
@@ -287,7 +394,14 @@ async def view_section(cid: int, sec: str) -> tuple[str, InlineKeyboardMarkup]:
     for w in section.widgets:
         await _render_widget(b, cid, w, s)
 
-    b.row(_btn("⬅️ Назад", f"u:c:{cid}"))
+    # back: ключ другого раздела либо готовый callback-шаблон с {cid}
+    if not section.back:
+        back = f"u:c:{cid}"
+    elif section.back.startswith("u:"):
+        back = section.back.format(cid=cid)
+    else:
+        back = f"u:s:{cid}:{section.back}"
+    b.row(_btn("⬅️ Назад", back))
     return text, b.as_markup()
 
 
@@ -296,6 +410,10 @@ async def _render_widget(b: InlineKeyboardBuilder, cid: int, widget: str, s) -> 
     if widget == "anon":
         allowed = [r for r in await db.wl_list(cid) if r["scope"] in ("all", "anon")]
         b.row(_btn(f"🕊 Разрешённые отправители: {len(allowed)}", f"u:s:{cid}:wl"))
+
+    elif widget == "links_pun":
+        b.row(_btn("⚖️ Наказания для участников", f"u:s:{cid}:links_member"))
+        b.row(_btn("⚖️ Наказания для не участников", f"u:s:{cid}:links_guest"))
 
     elif widget == "link_wl":
         n = len(await db.link_wl_list(cid))
@@ -336,6 +454,14 @@ async def _render_widget(b: InlineKeyboardBuilder, cid: int, widget: str, s) -> 
     elif widget == "welcome_text":
         mark = "задано" if s.welcome_text else "не задано"
         b.row(_btn(f"✏️ Текст приветствия ({mark})", f"u:wtxt:{cid}"))
+
+    elif widget == "warnlist":
+        n = len(await db.warn_users(cid))
+        b.row(_btn(f"📋 Кто с варнами: {n}", f"u:wn:{cid}:0"))
+
+    elif widget == "rules_text":
+        rows = await db.ans_list("rules", cid)
+        b.row(_btn(f"✏️ Заготовки: {len(rows)}", f"u:an:{cid}:r:{cid}:0"))
 
     elif widget == "digest_to":
         who = await db.user_label(s.digest_to) if s.digest_to else "не задан"
@@ -427,7 +553,7 @@ async def view_wl_entry(cid: int, row_id: int) -> tuple[str, InlineKeyboardMarku
 # Ответов у объекта может быть несколько, бот берёт случайный. Владельца в
 # callback пишем одной буквой: t — триггер, c — счётчик (лимит 64 байта).
 
-ANS_OWNER = {"t": "trig", "c": "cmd"}
+ANS_OWNER = {"t": "trig", "c": "cmd", "r": "rules"}
 ANS_LIMIT = 60   # ответов бывает много: списки-рулетки вроде !судимости
 
 
@@ -458,7 +584,11 @@ def _ans_preview(answers: list) -> str:
 
 
 def _ans_back(cid: int, code: str, oid: int) -> str:
-    return f"u:tgv:{cid}:{oid}" if code == "t" else f"u:cmv:{cid}:{oid}"
+    if code == "t":
+        return f"u:tgv:{cid}:{oid}"
+    if code == "r":
+        return f"u:s:{cid}:rules"
+    return f"u:cmv:{cid}:{oid}"
 
 
 async def view_answers(cid: int, code: str, oid: int,
@@ -466,12 +596,12 @@ async def view_answers(cid: int, code: str, oid: int,
     owner = ANS_OWNER[code]
     rows = await db.ans_list(owner, oid)
     chunk, page, pages = _page_slice(rows, page)
-    title = "🎯 Триггер" if code == "t" else "🔢 Счётчик"
+    title = {"t": "🎯 Триггер", "r": "📜 Правила"}.get(code, "🔢 Счётчик")
     lines = [
         f"<b>{title} · варианты ответа</b>\n",
         "Вариантов несколько — бот отвечает случайным. "
         + ("Можно текст, медиа или медиа с подписью."
-           if code == "t" else "Только текст: число в скобках дописывается само."),
+           if code in ("t", "r") else "Только текст: число в скобках дописывается само."),
         f"\nВсего: <b>{len(rows)}</b> из {ANS_LIMIT}"
         + (f" · страница {page + 1} из {pages}" if pages > 1 else ""),
         "",
@@ -635,35 +765,124 @@ async def view_words(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup
     return "\n".join(lines), b.as_markup()
 
 
-async def view_punishments(cid: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
-    per = 8
-    total = await db.active_punishments_count(cid)
-    rows = await db.active_punishments(cid, limit=per, offset=page * per)
-    ch = await db.get_chat(cid)
-    title = utils.esc(ch["title"] if ch else str(cid))
-    lines = [f"<b>🚫 Активные наказания</b> · {title}\n"]
-    b = InlineKeyboardBuilder()
+async def view_warned(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """Кто в чате с активными варнами. Кнопка на человека — снять все его варны."""
+    rows = await db.warn_users(cid)
+    chunk, page, pages = _page_slice(rows, page)
+    s = await db.get_settings(cid)
+    lines = [
+        "<b>⚠️ Варны</b>\n",
+        f"Людей с варнами: <b>{len(rows)}</b> · лимит: <b>{s.warns_limit}</b>",
+        "",
+    ]
     if not rows:
-        lines.append("Пусто — все чисты.")
+        lines.append("Пока чисто.")
+    start = page * LIST_PER_PAGE
+    for i, r in enumerate(chunk, start + 1):
+        who = f"@{r['username']}" if r["username"] else utils.esc(r["name"] or r["user_id"])
+        lines.append(f"{i}. {who} — <b>{r['cnt']}</b>/{s.warns_limit} · "
+                     f"{utils.rel_time(r['last_ts'])}")
+
+    b = InlineKeyboardBuilder()
+    for i, r in enumerate(chunk, start + 1):
+        who = r["username"] or r["name"] or r["user_id"]
+        b.row(_btn(f"{i}. 🧹 Снять варны: {str(who)[:22]}", f"u:wnr:{cid}:{r['user_id']}"))
+    _pager(b, cid, "u:wn", page, pages)
+    b.row(_btn("⬅️ Назад", f"u:s:{cid}:warns"))
+    return "\n".join(lines), b.as_markup()
+
+
+@router.callback_query(F.data.startswith("u:wn:"))
+async def cb_warned(cb: CallbackQuery, state: FSMContext) -> None:
+    _, _, cid, page = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    await state.clear()
+    text, kb = await view_warned(cid, int(page))
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:wnr:"))
+async def cb_warns_reset(cb: CallbackQuery) -> None:
+    _, _, cid, uid = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    await db.warn_reset(cid, int(uid))
+    text, kb = await view_warned(cid, 0)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer("Варны сняты")
+
+
+ACTIVE_PER_PAGE = 5
+_KIND_WORD = {"ban": "бан", "mute": "мут", "banchan": "бан канала"}
+
+
+async def view_punishments(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """Главная страница раздела: сводка и действия. Сам список — за кнопкой,
+    иначе при десятке наказаний экран превращался в лес кнопок «Снять…»."""
+    rows = await db.active_punishments(cid, limit=1000)
+    ch = await db.get_chat(cid)
+    counts: dict[str, int] = {}
     for r in rows:
-        who = r["name"] or await db.user_label(r["user_id"], r["username"])
-        lines.append(
-            f"• {utils.esc(who)} — <b>{r['kind']}</b> до {utils.fmt_ts(r['until_ts'])}\n"
-            f"  причина: {utils.esc(r['reason'] or '—')}"
-        )
-        b.button(text=f"🔓 Снять: {who}", callback_data=f"u:pu:{cid}:{r['id']}")
-    b.adjust(1)
-    nav = []
-    if page > 0:
-        nav.append(("⬅️ Раньше", f"u:p:{cid}:{page - 1}"))
-    if (page + 1) * per < total:
-        nav.append(("Позже ➡️", f"u:p:{cid}:{page + 1}"))
-    if nav:
-        b.row(*[_btn(t, d) for t, d in nav])
+        counts[r["kind"]] = counts.get(r["kind"], 0) + 1
+    lines = [
+        f"<b>🚫 Наказания</b> · {utils.esc(ch['title'] if ch else str(cid))}\n",
+        f"Активных сейчас: <b>{len(rows)}</b>",
+    ]
+    if counts:
+        lines.append(", ".join(f"{_KIND_WORD.get(k, k)} — {n}" for k, n in sorted(counts.items())))
+    else:
+        lines.append("Все чисты.")
+    lines.append("\nМассовые действия принимают список id или @username одним сообщением.")
+
+    b = InlineKeyboardBuilder()
+    b.row(_btn(f"📋 Активные: {len(rows)}", f"u:pa:{cid}:0"))
     b.row(_btn("🔓 Массовый разбан", f"u:mub:{cid}"),
           _btn("👢 Массовый кик", f"u:mkick:{cid}"))
     b.row(_btn("⛔ Массовый бан", f"u:mban:{cid}"))
+    b.row(_btn("⚙️ Настройки", f"u:s:{cid}:punish_cfg"))
     b.row(_btn("⬅️ Назад", f"u:c:{cid}"))
+    return "\n".join(lines), b.as_markup()
+
+
+async def view_active(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """Список активных наказаний: текстом с номерами, кнопки — только цифры."""
+    total = await db.active_punishments_count(cid)
+    pages = max(1, -(-total // ACTIVE_PER_PAGE))
+    page = max(0, min(page, pages - 1))
+    rows = await db.active_punishments(cid, limit=ACTIVE_PER_PAGE,
+                                       offset=page * ACTIVE_PER_PAGE)
+    lines = [
+        "<b>📋 Активные наказания</b>\n",
+        "Кнопка с номером снимает наказание.",
+        f"\nВсего: <b>{total}</b>" + (f" · страница {page + 1} из {pages}" if pages > 1 else ""),
+        "",
+    ]
+    if not rows:
+        lines.append("Пусто — все чисты.")
+    start = page * ACTIVE_PER_PAGE
+    b = InlineKeyboardBuilder()
+    for i, r in enumerate(rows, start + 1):
+        who = r["name"] or await db.user_label(r["user_id"], r["username"])
+        until = ("навсегда" if not r["until_ts"]
+                 else f"до {utils.fmt_ts(r['until_ts'])}")
+        lines.append(
+            f"{i}. <b>{utils.esc(utils.chunk(who, 40))}</b> — "
+            f"{_KIND_WORD.get(r['kind'], r['kind'])} {until}\n"
+            f"    <i>{utils.esc(utils.chunk(r['reason'] or '—', 60))}</i>"
+        )
+        b.row(_btn(f"{i}. 🔓 Снять: {utils.chunk(who, 24)}",
+                   f"u:pu:{cid}:{r['id']}:{page}"))
+    if pages > 1:
+        prev_p = page - 1 if page else pages - 1
+        next_p = page + 1 if page + 1 < pages else 0
+        b.row(_btn("◀", f"u:pa:{cid}:{prev_p}"),
+              _btn(f"{page + 1}/{pages}", f"u:pa:{cid}:{page}"),
+              _btn("▶", f"u:pa:{cid}:{next_p}"))
+    b.row(_btn("⬅️ Назад", f"u:p:{cid}:0"))
     return "\n".join(lines), b.as_markup()
 
 
@@ -705,13 +924,15 @@ async def cb_home(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     await cb.answer()
 
 
-@router.callback_query(F.data == "u:chats")
+@router.callback_query(F.data.startswith("u:chats"))
 async def cb_chats(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     was_picking = await state.get_state() in (Input.pick_log.state,)
     await state.clear()
     if was_picking:
         await _drop_reply_kb(cb.message)
-    text, kb = await view_chats(bot)
+    parts = cb.data.split(":")
+    page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+    text, kb = await view_chats(bot, cb.from_user.id, page)
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer()
 
@@ -788,9 +1009,22 @@ async def cb_access_del(cb: CallbackQuery) -> None:
     await cb.answer("Удалено")
 
 
+def _home_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ К чатам", callback_data="u:chats")
+    return b.as_markup()
+
+
 async def _guard(cb: CallbackQuery, cid: int) -> bool:
-    """Доступ к боту уже проверен мидлварью — все допущенные равны в правах."""
-    return True
+    """Чат свой? Владелец бота может всё, остальные — только свои чаты.
+
+    Проверяем на каждое действие, а не только при открытии карточки: id чата
+    лежит в callback, и его несложно подставить руками.
+    """
+    if await db.owns_chat(cb.from_user.id, cid):
+        return True
+    await cb.answer("Это не ваш чат.", show_alert=True)
+    return False
 
 
 @router.callback_query(F.data.startswith("u:c:"))
@@ -799,9 +1033,101 @@ async def cb_chat(cb: CallbackQuery, state: FSMContext) -> None:
     if not await _guard(cb, cid):
         return
     await state.clear()
+    if await needs_setup(cid, cb.from_user.id):
+        text, kb = await view_setup(cid)       # свежий чат — сперва развилка
+    else:
+        text, kb = await view_chat(cid, cb.from_user.id)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:cpn:"))
+async def cb_setup_skip(cb: CallbackQuery, state: FSMContext) -> None:
+    """«Настроить с нуля» — просто помечаем чат настроенным."""
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    await state.clear()
+    await db.kv_set(setup_key(cid), "1")
     text, kb = await view_chat(cid, cb.from_user.id)
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:cp:"))
+async def cb_copy_from(cb: CallbackQuery, state: FSMContext) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    await state.clear()
+    text, kb = await view_copy_from(cid, cb.from_user.id)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:cps:"))
+async def cb_copy_pick(cb: CallbackQuery, state: FSMContext) -> None:
+    """Источник выбран — показываем галочки разделов, по умолчанию все."""
+    from ..services import transfer
+    _, _, cid, src = cb.data.split(":")
+    cid, src = int(cid), int(src)
+    if cid == src or not await _guard(cb, cid) or not await _guard(cb, src):
+        return
+    await state.update_data(copy_groups=list(transfer.ALL_GROUPS))
+    text, kb = await view_copy_pick(cid, src, set(transfer.ALL_GROUPS))
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:cpg:"))
+async def cb_copy_toggle(cb: CallbackQuery, state: FSMContext) -> None:
+    """Галочка раздела: отметить, снять, всё, ничего."""
+    from ..services import transfer
+    _, _, cid, src, key = cb.data.split(":")
+    cid, src = int(cid), int(src)
+    if not await _guard(cb, cid) or not await _guard(cb, src):
+        return
+    data = await state.get_data()
+    picked = set(data.get("copy_groups", transfer.ALL_GROUPS))
+    if key == "__all":
+        picked = set(transfer.ALL_GROUPS)
+    elif key == "__none":
+        picked = set()
+    elif key in transfer.GROUPS:
+        picked.symmetric_difference_update({key})
+    await state.update_data(copy_groups=sorted(picked))
+    text, kb = await view_copy_pick(cid, src, picked)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:cpd:"))
+async def cb_copy_do(cb: CallbackQuery, state: FSMContext) -> None:
+    from ..services import transfer
+    _, _, cid, src = cb.data.split(":")
+    cid, src = int(cid), int(src)
+    if cid == src or not await _guard(cb, cid) or not await _guard(cb, src):
+        return
+    data = await state.get_data()
+    picked = set(data.get("copy_groups", transfer.ALL_GROUPS))
+    await state.clear()
+    if not picked:
+        await cb.answer("Ничего не отмечено.", show_alert=True)
+        return
+    await cb.answer("Переношу…")
+    try:
+        stats = await transfer.copy_chat(src, cid, picked)
+    except Exception:
+        logger.warning("перенос %s -> %s не удался", src, cid, exc_info=True)
+        await cb.answer("Не вышло перенести, посмотрите «🐞 Ошибки».", show_alert=True)
+        return
+    await db.kv_set(setup_key(cid), "1")
+    ch = await db.get_chat(src)
+    moved = ", ".join(f"{k}: {v}" for k, v in stats.items() if v)
+    note = (f"✅ Настройки перенесены из «{utils.esc(ch['title'] if ch else src)}».\n"
+            f"{moved or 'нечего было копировать'}.\n\n")
+    text, kb = await view_chat(cid, cb.from_user.id)
+    await cb.message.edit_text(note + text, reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("u:s:"))
@@ -1525,7 +1851,7 @@ async def cb_answer_add(cb: CallbackQuery, state: FSMContext) -> None:
         await cb.answer(f"Лимит {ANS_LIMIT} вариантов.", show_alert=True)
         return
     hint = ("Пришлите текст, медиа или медиа с подписью."
-            if code == "t" else "Пришлите текст ответа. Число в скобках бот допишет сам.")
+            if code in ("t", "r") else "Пришлите текст ответа. Число в скобках бот допишет сам.")
     await _ask(
         cb, state, Input.ans_new,
         f"<b>🎲 Новый вариант ответа</b>\n\n{hint}",
@@ -1543,9 +1869,9 @@ async def ans_new_input(message: Message, state: FSMContext, bot: Bot) -> None:
         await _done(message, bot, state, await view_answers(cid, code, oid, 0))
         return
 
-    media = triggers.extract_media(message) if code == "t" else None
+    media = triggers.extract_media(message) if code in ("t", "r") else None
     if media is None and not raw:
-        hint = ("⚠️ Нужен текст или медиа." if code == "t"
+        hint = ("⚠️ Нужен текст или медиа." if code in ("t", "r")
                 else "⚠️ Нужен текст: у счётчиков ответы только текстовые.")
         await _retry(message, bot, state, f"<b>🎲 Новый вариант ответа</b>\n\n{hint}")
         return
@@ -1744,6 +2070,24 @@ async def cb_log_select(cb: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(kb_msg_id=kb_msg.message_id)
 
 
+@router.callback_query(F.data == "u:glog")
+async def cb_global_log(cb: CallbackQuery, state: FSMContext) -> None:
+    """Общий лог со всех чатов — только для владельца бота."""
+    if cb.from_user.id not in config.ADMIN_IDS:
+        await cb.answer("Нет доступа.", show_alert=True)
+        return
+    await _ask(
+        cb, state, Input.pick_log,
+        "<b>🌍 Глобальный лог</b>\n\nСюда копией летят все карточки со всех чатов — "
+        "с теми же кнопками, что и в логе самого чата, так что модерировать можно "
+        "прямо отсюда.\nНастройки карточек отдельных чатов на него не влияют.\n\n"
+        "Нажмите «Выбрать чат» внизу экрана. Убрать — пришлите <code>-</code>.",
+        "u:chats", cid=0,
+    )
+    kb_msg = await cb.message.answer("👇", reply_markup=utils.request_chat_kb())
+    await state.update_data(kb_msg_id=kb_msg.message_id)
+
+
 async def _finish_log_pick(message: Message, bot: Bot, state: FSMContext,
                            cid: int, note: str) -> None:
     """Убрать носитель клавиатуры и вернуть раздел на место."""
@@ -1760,15 +2104,32 @@ async def _finish_log_pick(message: Message, bot: Bot, state: FSMContext,
         await tmp.delete()
     except Exception:
         pass
-    await _done(message, bot, state, await view_section(cid, "cards"), note)
+    view = (await view_chats(bot, message.from_user.id) if cid == 0
+            else await view_section(cid, "cards"))
+    await _done(message, bot, state, view, note)
 
 
 @router.message(StateFilter(Input.pick_log), F.chat_shared)
 async def log_chat_shared(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
     cid = data["cid"]
-    await db.set_setting(cid, "log_chat_id", message.chat_shared.chat_id)
-    await db.add_event(cid, "bot", f"лог-чат установлен: {message.chat_shared.chat_id}")
+    picked = message.chat_shared.chat_id
+    if cid == 0:                                   # глобальный лог владельца бота
+        if message.from_user.id not in config.ADMIN_IDS:
+            return
+        await db.set_global_log(picked)
+        await db.add_event(None, "bot", f"глобальный лог: {picked}")
+        await _finish_log_pick(message, bot, state, cid,
+                               "✅ Глобальный лог обновлён.\n\n")
+        return
+    # чужой рабочий чат логом быть не может: туда полетели бы карточки с чужими
+    # сообщениями. Свои и незнакомые боту чаты — пожалуйста.
+    if not await db.owns_chat(message.from_user.id, picked) and await db.get_chat(picked):
+        await _finish_log_pick(message, bot, state, cid,
+                               "⚠️ Этот чат принадлежит другому владельцу.\n\n")
+        return
+    await db.set_setting(cid, "log_chat_id", picked)
+    await db.add_event(cid, "bot", f"лог-чат установлен: {picked}")
     await _finish_log_pick(message, bot, state, cid, "✅ Лог-чат обновлён.\n\n")
 
 
@@ -1778,6 +2139,13 @@ async def log_pick_text(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
     cid = data["cid"]
     if text == "-":
+        if cid == 0:
+            if message.from_user.id not in config.ADMIN_IDS:
+                return
+            await db.set_global_log(None)
+            await _finish_log_pick(message, bot, state, cid,
+                                   "✅ Глобальный лог убран.\n\n")
+            return
         await db.set_setting(cid, "log_chat_id", None)
         await _finish_log_pick(message, bot, state, cid, "✅ Лог-чат убран.\n\n")
     elif text == "/cancel":
@@ -1802,18 +2170,79 @@ async def cb_punishments(cb: CallbackQuery) -> None:
     await cb.answer()
 
 
-@router.callback_query(F.data.startswith("u:pu:"))
-async def cb_lift(cb: CallbackQuery, bot: Bot) -> None:
-    from ..services import moderation
-    _, _, cid, pid = cb.data.split(":")
+@router.callback_query(F.data.startswith("u:pa:"))
+async def cb_active(cb: CallbackQuery, state: FSMContext) -> None:
+    _, _, cid, page = cb.data.split(":")
     cid = int(cid)
     if not await _guard(cb, cid):
         return
+    await state.clear()
+    text, kb = await view_active(cid, int(page))
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:pu:"))
+async def cb_lift(cb: CallbackQuery, bot: Bot) -> None:
+    from ..services import moderation
+    parts = cb.data.split(":")
+    cid, pid = int(parts[2]), int(parts[3])
+    page = int(parts[4]) if len(parts) > 4 else 0
+    if not await _guard(cb, cid):
+        return
     # ссылку на возврат не делаем: она нужна только в карточке лог-чата
-    ok, msg, _ = await moderation.lift_punishment(bot, int(pid), invite=False)
-    text, kb = await view_punishments(cid, 0)
+    ok, msg, _ = await moderation.lift_punishment(bot, pid, invite=False)
+    text, kb = await view_active(cid, page)      # остаёмся на той же странице
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer(msg, show_alert=not ok)
+
+
+@router.callback_query(F.data.startswith("a:clog:"))
+async def cb_chat_log(cb: CallbackQuery) -> None:
+    """Журнал конкретного чата. Доступен владельцу чата, не только владельцу бота."""
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    ch = await db.get_chat(cid)
+    rows = await db.recent_events(20, chat_id=cid)
+    title = utils.esc(ch["title"] if ch else str(cid))
+    lines = [f"<b>📜 Лог чата</b> · {title}\n"]
+    lines += [utils.event_line(r["kind"], await db.names_in(r["text"]), r["ts"])
+              for r in rows] or ["Пока пусто."]
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Назад", callback_data=f"u:c:{cid}")
+    await cb.message.edit_text(utils.chunk("\n".join(lines)), reply_markup=b.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("a:leave:"))
+async def cb_leave(cb: CallbackQuery) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Да, выйти", callback_data=f"a:leave_yes:{cid}")
+    b.button(text="⬅️ Отмена", callback_data=f"u:c:{cid}")
+    b.adjust(2)
+    await cb.message.edit_text(
+        f"Точно покинуть чат <code>{cid}</code>?", reply_markup=b.as_markup()
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("a:leave_yes:"))
+async def cb_leave_yes(cb: CallbackQuery, bot: Bot) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    try:
+        await bot.leave_chat(cid)
+    except Exception as e:
+        await cb.answer(f"Не вышло: {e}", show_alert=True)
+        return
+    await db.set_chat_active(cid, False)
+    await cb.message.edit_text("✅ Бот покинул чат.", reply_markup=_home_kb())
+    await cb.answer()
 
 
 # ---------- удаление из списков ----------

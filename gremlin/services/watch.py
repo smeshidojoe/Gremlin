@@ -75,10 +75,31 @@ def _digit_in_word(text: str) -> bool:
     return any(len(w) >= 4 and _DIGIT_INSIDE.search(w) for w in _WORD.findall(text))
 
 
-# слово, растащенное разделителями: к.а.з.и.н.о, п о р н о, с-л-и-в
-_SPLIT_WORD = re.compile(r"(?:[а-яёa-z][.\-_·•*|/\ ]){3,}[а-яёa-z]", re.IGNORECASE)
-# растянутые буквы: пооорно, сliiiв. Три и больше подряд — уже не эмоция
-_CHAR_RUN = re.compile(r"([а-яёa-z])\1{2,}", re.IGNORECASE)
+# слово, растащенное знаками: к.а.з.и.н.о, с-л-и-в. Пробела в списке нет
+# намеренно — с ним под правило попадала любая живая фраза с короткими словами
+# («него я в твиттере» читалось как «о я в т»)
+_SPLIT_WORD = re.compile(r"(?:[а-яёa-z][.\-_·•*|/]){3,}[а-яёa-z]", re.IGNORECASE)
+# то же самое, но через пробелы: «п о р н о». Тут строже — нужен длинный ряд
+# одиночных букв, и среди них хотя бы три согласных, иначе ловились «а я и т д»
+_VOWELS = set("аеёиоуыэюяaeiouy")
+
+
+def _spaced_word(text: str) -> bool:
+    run = []
+    for token in text.split():
+        letter = token.strip(".,!?;:()«»\"'")
+        if len(letter) == 1 and letter.isalpha():
+            run.append(letter.lower())
+            if len(run) >= 5 and sum(c not in _VOWELS for c in run) >= 3:
+                return True
+        else:
+            run = []
+    return False
+
+
+# растянутые буквы: пооооорно, сliiiiв. Нужно четыре повтора и больше — «эээ»,
+# «нуууу» и «ааааа» это обычная живая речь, а не попытка обойти фильтр
+_CHAR_RUN = re.compile(r"([а-яёa-z])\1{4,}", re.IGNORECASE)
 # ссылки из проверки на кривопись выкидываем: в любом адресе полно цифр рядом
 # с буквами (deezload2bot, track/2610505422), и это не обход фильтра
 _URL_TOKEN = re.compile(r"\S*(?:https?://|t\.me/|www\.|\.(?:com|ru|org|net|ph|io|me)\b)\S*",
@@ -153,29 +174,26 @@ def score_profile(first_name: str | None, last_name: str | None,
     return score + min(cosmetic, COSMETIC_CAP), reasons
 
 
-def score_message(text: str) -> tuple[int, list[str]]:
-    """Оценка текста сообщения.
+def message_parts(text: str) -> tuple[int, int, list[str]]:
+    """Разобрать текст на (тревожные очки, косметика, причины).
 
-    Как и у профилей, признаки делятся надвое. Тревожные (telegra.ph, невидимки,
-    сокращатели ссылок) весят полную цену. Косметика — кривое написание слов —
-    сама по себе поводом не считается: живые люди пишут «прив3т» и «нууу» без
-    всякого умысла, поэтому её сумма режется по TEXT_COSMETIC_CAP.
-
-    Зато косметика работает усилителем: та же кривая надпись рядом с настоящей
-    ссылкой — уже обход фильтра, и такое сочетание добирает очков до порога.
-    @упоминание ссылкой не считается: так зовут собеседника, а не рекламу.
+    Тревожные (telegra.ph, невидимки, сокращатели) и усилитель за кривопись
+    рядом со ссылкой — это уже поведение спамера, такое имеет смысл копить.
+    Косметика сама по себе — просто манера письма («эээ», «нууу», «прив3т»);
+    она живёт ровно одно сообщение и в копилку не идёт, иначе за день любой
+    разговорчивый человек набирает на карточку.
     """
-    score, reasons = 0, []
+    hard, reasons = 0, []
     if not text:
-        return 0, []
+        return 0, 0, []
     if _TELEGRAPH.search(text):
-        score += 45; reasons.append("telegra.ph-ссылка")
+        hard += 45; reasons.append("telegra.ph-ссылка")
     if _INVISIBLE.search(_visible_part(text)):
-        score += 30; reasons.append("невидимые символы")
+        hard += 30; reasons.append("невидимые символы")
     if _BOT_MENTION.search(text):
-        score += 25; reasons.append("упоминание бота")
+        hard += 25; reasons.append("упоминание бота")
     if _SHORTENER.search(text):
-        score += 20; reasons.append("ссылка через сокращатель")
+        hard += 20; reasons.append("ссылка через сокращатель")
 
     words = _wordy_part(text)
     cosmetic = 0
@@ -183,18 +201,24 @@ def score_message(text: str) -> tuple[int, list[str]]:
         cosmetic += 25; reasons.append("обфускация текста")
     elif _HOMOGLYPH_WORD.search(words):
         cosmetic += 15; reasons.append("гомоглифы в тексте")
-    if _SPLIT_WORD.search(words):
+    if _SPLIT_WORD.search(words) or _spaced_word(words):
         cosmetic += 20; reasons.append("слово через разделители")
     if _digit_in_word(words):
         cosmetic += 15; reasons.append("цифры вместо букв")
     if _CHAR_RUN.search(words):
         cosmetic += 10; reasons.append("растянутые буквы")
-    score += min(cosmetic, TEXT_COSMETIC_CAP)
+    cosmetic = min(cosmetic, TEXT_COSMETIC_CAP)
 
     if cosmetic and _REAL_LINK.search(text):
-        score += OBFUSCATION_BOOST
+        hard += OBFUSCATION_BOOST
         reasons.append("кривой текст вместе со ссылкой")
-    return score, reasons
+    return hard, cosmetic, reasons
+
+
+def score_message(text: str) -> tuple[int, list[str]]:
+    """Общая оценка текста: тревожное плюс косметика этого сообщения."""
+    hard, cosmetic, reasons = message_parts(text)
+    return hard + cosmetic, reasons
 
 
 # Ссылка вида t.me/<кто-то>[/что-то][?start=…]. Нужна, чтобы отличать инвайт
@@ -280,11 +304,11 @@ async def check_user(bot, chat, user, settings, message=None) -> None:
     from . import moderation
 
     p_score, p_reasons = score_profile(user.first_name, user.last_name, user.username)
-    m_score, m_reasons = (0, [])
+    hard, cosmetic, m_reasons = (0, 0, [])
     if message is not None:
-        m_score, m_reasons = score_message(message.text or message.caption or "")
+        hard, cosmetic, m_reasons = message_parts(message.text or message.caption or "")
     # чисто? тогда и в базу лезть незачем — на каждое сообщение это лишний запрос
-    if not p_score and not m_score:
+    if not p_score and not hard and not cosmetic:
         return
 
     sig = profile_sig(user.first_name, user.last_name, user.username)
@@ -295,9 +319,11 @@ async def check_user(bot, chat, user, settings, message=None) -> None:
     saved = 0
     if row is not None and now - (row["score_ts"] or 0) <= SCORE_WINDOW:
         saved = row["score"] or 0
-    pot = min(saved + m_score, SCORE_MAX)
+    # копим только тревожное: манера письма к спаму отношения не имеет, и без
+    # этого «эээ» да «нууу» за день набирали человеку на карточку
+    pot = min(saved + hard, SCORE_MAX)
 
-    total = p_score + pot
+    total = p_score + pot + cosmetic
     reasons = p_reasons + m_reasons
     if saved:
         reasons.append(f"копилка за сутки: {saved}")
@@ -439,6 +465,21 @@ if __name__ == "__main__":
                  "COVID19 статистика https://who.int/a"):
         s, r = score_message(text)
         assert s == 0, (text, s, r)
+    # манера письма живого человека: в копилку такое попадать не должно
+    for text in ("Типа эээ душу или как жанр или есть какая-то штука нишевая?",
+                 "нуууу такое, не зашло", "ааааа что это было"):
+        h, c, r = message_parts(text)
+        assert h == 0, (text, h, c, r)
+    # живая речь с короткими словами — не «слово через разделители»
+    for text in ("только про него я в твиттере шум видел после киберлика.",
+                 "он у нас в с ним поехал", "и т. п. дальше по списку",
+                 "с 1 по 5 я в отпуске"):
+        s, r = score_message(text)
+        assert s == 0, (text, s, r)
+    # а вот растащенное слово — да
+    for text in ("п о р н о бесплатно", "к.а.з.и.н.о бонус", "с-л-и-в базы"):
+        s, r = score_message(text)
+        assert "слово через разделители" in r, (text, s, r)
     # @упоминание человека — не ссылка, усилитель включать нельзя
     for text in ("прив3т @vasya_petrov, ты где", "нуууу @kolya сегодня не смогу"):
         s, r = score_message(text)

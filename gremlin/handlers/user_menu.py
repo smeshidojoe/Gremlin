@@ -1302,8 +1302,9 @@ async def cb_trig_add(cb: CallbackQuery, state: FSMContext) -> None:
         return
     await _ask(
         cb, state, Input.trig_phrase,
-        "<b>🎯 Новый триггер</b>\n\nПришлите ключевую фразу (от 3 символов). "
-        "Бот будет искать её внутри сообщений.",
+        "<b>🎯 Новый триггер</b>\n\nПришлите ключевую фразу (от 3 символов).\n"
+        "Срабатывает целиком: <code>донат</code> не поймает «донатный». "
+        "Нужны окончания — добавьте звёздочку: <code>донат*</code>.",
         f"u:tgl:{cid}:0", cid=cid,
     )
 
@@ -2531,7 +2532,8 @@ async def cb_trig_edit_phrase(cb: CallbackQuery, state: FSMContext) -> None:
         return
     await _ask(
         cb, state, Input.trig_edit_phrase,
-        f"<b>🎯 Триггер</b>\n\nПришлите новую ключевую фразу (от 3 символов).\n"
+        f"<b>🎯 Триггер</b>\n\nПришлите новую ключевую фразу (от 3 символов). "
+        f"Со звёздочкой на конце ловит окончания.\n"
         f"Сейчас: <code>{utils.esc(r['phrase'])}</code>",
         f"u:tgv:{cid}:{rid}", cid=cid, rid=rid,
     )

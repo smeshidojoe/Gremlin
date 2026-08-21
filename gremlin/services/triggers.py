@@ -37,20 +37,21 @@ _STEM_CACHE: dict[str, re.Pattern] = {}
 def phrase_matches(phrase: str, text_low: str) -> bool:
     """Совпала ли фраза триггера с текстом.
 
-    Без звёздочки — как раньше, простое вхождение. Со звёздочкой на конце —
-    основа плюс любые буквы: слово целиком, а не кусок другого слова.
+    Без звёздочки — слово целиком: «донат» не должен срабатывать на «донатный»
+    и «задонатил». Со звёздочкой на конце — основа плюс любые буквы: «донат*»
+    ловит все окончания, но по-прежнему не кусок середины другого слова.
     """
-    if not phrase.endswith("*"):
-        return phrase in text_low
-    stem = phrase[:-1]
-    if not stem:
+    stem = phrase.endswith("*")
+    body = phrase[:-1] if stem else phrase
+    if not body:
         return False
-    rx = _STEM_CACHE.get(stem)
+    rx = _STEM_CACHE.get(phrase)
     if rx is None:
-        rx = re.compile(rf"(?<!\w){re.escape(stem)}\w*", re.IGNORECASE | re.UNICODE)
+        tail = r"\w*" if stem else r"(?!\w)"
+        rx = re.compile(rf"(?<!\w){re.escape(body)}{tail}", re.IGNORECASE | re.UNICODE)
         if len(_STEM_CACHE) > 2000:
             _STEM_CACHE.clear()
-        _STEM_CACHE[stem] = rx
+        _STEM_CACHE[phrase] = rx
     return rx.search(text_low) is not None
 
 

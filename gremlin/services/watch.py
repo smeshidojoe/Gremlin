@@ -47,12 +47,49 @@ _EMOJI = re.compile(
     "[\U0001F300-\U0001F6FF\U0001F900-\U0001F9FF\U0001FA70-\U0001FAFF]"
 )
 _URLISH = re.compile(r"(t\.me/|https?://|@\w{4,})", re.IGNORECASE)
+# настоящая ссылка, без @упоминаний: обращение к человеку — не признак рекламы
+_REAL_LINK = re.compile(r"(t\.me/|tg://|https?://|www\.|\w+\.(?:com|ru|net|org|io)/)",
+                        re.IGNORECASE)
+# сокращатели: спам прячет за ними и telegra.ph, и чужие каналы
+_SHORTENER = re.compile(
+    r"\b(bit\.ly|vk\.cc|clck\.ru|goo\.su|tinyurl\.com|is\.gd|cutt\.ly|surl\.li|"
+    r"t\.co|rb\.gy|shorturl\.at|u\.to|qps\.ru|gg\.gg)\b", re.IGNORECASE)
 _TELEGRAPH = re.compile(r"(telegra\.ph|graph\.org)/", re.IGNORECASE)
 _BOT_MENTION = re.compile(r"@\w*bot\b", re.IGNORECASE)
 # кириллица и латиница внутри одного слова = гомоглифы
 _HOMOGLYPH_WORD = re.compile(r"\w*(?:[а-яё][a-z]|[a-z][а-яё])\w*", re.IGNORECASE)
 # валютные/декоративные символы внутри слов (Д€ᛠርKO€)
 _SYMBOL_IN_WORD = re.compile(r"[а-яёa-z][€₽$£♱♰卐]|[€₽$£♱♰卐][а-яёa-z]", re.IGNORECASE)
+# цифра вместо буквы внутри слова: п0рн0, каз1но, прив3т
+_WORD = re.compile(r"[^\W_]+", re.UNICODE)
+_DIGIT_INSIDE = re.compile(r"[а-яёa-z]\d+[а-яёa-z]", re.IGNORECASE)
+
+
+def _digit_in_word(text: str) -> bool:
+    """Цифра, вклиненная между букв, в слове хотя бы из четырёх знаков.
+
+    Проверяем именно так, а не одной регуляркой на «цифра рядом с буквой»:
+    иначе в кривопись записывались «3D», «1С», «5G», «A4», «COVID19» и прочая
+    обычная техническая речь. У них цифра либо с краю, либо слово короткое.
+    """
+    return any(len(w) >= 4 and _DIGIT_INSIDE.search(w) for w in _WORD.findall(text))
+
+
+# слово, растащенное разделителями: к.а.з.и.н.о, п о р н о, с-л-и-в
+_SPLIT_WORD = re.compile(r"(?:[а-яёa-z][.\-_·•*|/\ ]){3,}[а-яёa-z]", re.IGNORECASE)
+# растянутые буквы: пооорно, сliiiв. Три и больше подряд — уже не эмоция
+_CHAR_RUN = re.compile(r"([а-яёa-z])\1{2,}", re.IGNORECASE)
+# ссылки из проверки на кривопись выкидываем: в любом адресе полно цифр рядом
+# с буквами (deezload2bot, track/2610505422), и это не обход фильтра
+_URL_TOKEN = re.compile(r"\S*(?:https?://|t\.me/|www\.|\.(?:com|ru|org|net|ph|io|me)\b)\S*",
+                        re.IGNORECASE)
+
+
+def _wordy_part(text: str) -> str:
+    """Текст без ссылок — в нём и ищем кривое написание слов."""
+    return _URL_TOKEN.sub(" ", text or "")
+
+
 _PROFILE_ADS = re.compile(r"(смотри|ссылк\w+ в|в профил|проф\w* 👆|check bio)", re.IGNORECASE)
 
 
@@ -61,6 +98,25 @@ _PROFILE_ADS = re.compile(r"(смотри|ссылк\w+ в|в профил|пр�
 # буквы. Само по себе это не спам, поэтому вся косметика вместе не может
 # перевесить порог подозрения: её сумма ограничена COSMETIC_CAP.
 COSMETIC_CAP = 30
+
+# У текста потолок свой и выше: признаков там пять, и упираться в тридцатку
+# после первого же из них — значит не различать «нуууу» и «к.а.з.и.н.о п0рн0».
+TEXT_COSMETIC_CAP = 45
+
+# Кривое написание рядом со ссылкой — уже не случайность, а обход фильтра.
+# Столько добавляем, когда косметика и настоящая ссылка встретились вместе.
+OBFUSCATION_BOOST = 25
+
+# Столько добавляем тому, кто в чате не состоит, если очки уже есть.
+GUEST_BOOST = 15
+
+# Копилка сообщений: спам выгодно дробить на мелкие порции, поэтому очки за
+# сообщения складываются, пока человек не замолчит на сутки.
+SCORE_WINDOW = 86400
+SCORE_MAX = 200          # выше копить бессмысленно: бан наступит раньше
+
+# Повторная карточка подозрения — только если счёт заметно вырос.
+RECARD_STEP = 20
 
 
 def score_profile(first_name: str | None, last_name: str | None,
@@ -98,7 +154,17 @@ def score_profile(first_name: str | None, last_name: str | None,
 
 
 def score_message(text: str) -> tuple[int, list[str]]:
-    """Оценка текста сообщения."""
+    """Оценка текста сообщения.
+
+    Как и у профилей, признаки делятся надвое. Тревожные (telegra.ph, невидимки,
+    сокращатели ссылок) весят полную цену. Косметика — кривое написание слов —
+    сама по себе поводом не считается: живые люди пишут «прив3т» и «нууу» без
+    всякого умысла, поэтому её сумма режется по TEXT_COSMETIC_CAP.
+
+    Зато косметика работает усилителем: та же кривая надпись рядом с настоящей
+    ссылкой — уже обход фильтра, и такое сочетание добирает очков до порога.
+    @упоминание ссылкой не считается: так зовут собеседника, а не рекламу.
+    """
     score, reasons = 0, []
     if not text:
         return 0, []
@@ -108,30 +174,90 @@ def score_message(text: str) -> tuple[int, list[str]]:
         score += 30; reasons.append("невидимые символы")
     if _BOT_MENTION.search(text):
         score += 25; reasons.append("упоминание бота")
-    if _RARE_SCRIPT.search(text) or _SYMBOL_IN_WORD.search(text):
-        score += 25; reasons.append("обфускация текста")
-    elif _HOMOGLYPH_WORD.search(text):
-        score += 15; reasons.append("гомоглифы в тексте")
+    if _SHORTENER.search(text):
+        score += 20; reasons.append("ссылка через сокращатель")
+
+    words = _wordy_part(text)
+    cosmetic = 0
+    if _RARE_SCRIPT.search(words) or _SYMBOL_IN_WORD.search(words):
+        cosmetic += 25; reasons.append("обфускация текста")
+    elif _HOMOGLYPH_WORD.search(words):
+        cosmetic += 15; reasons.append("гомоглифы в тексте")
+    if _SPLIT_WORD.search(words):
+        cosmetic += 20; reasons.append("слово через разделители")
+    if _digit_in_word(words):
+        cosmetic += 15; reasons.append("цифры вместо букв")
+    if _CHAR_RUN.search(words):
+        cosmetic += 10; reasons.append("растянутые буквы")
+    score += min(cosmetic, TEXT_COSMETIC_CAP)
+
+    if cosmetic and _REAL_LINK.search(text):
+        score += OBFUSCATION_BOOST
+        reasons.append("кривой текст вместе со ссылкой")
     return score, reasons
 
 
-def score_buttons(urls: list[str]) -> tuple[int, list[str]]:
-    """Оценка кнопок под сообщением: в рекламе вся суть висит именно на них."""
+# Ссылка вида t.me/<кто-то>[/что-то][?start=…]. Нужна, чтобы отличать инвайт
+# в чужой чат от безобидной дип-ссылки бота на самого себя.
+_TG_URL = re.compile(r"(?:https?://)?(?:t|telegram)\.me/([^/?#\s]+)([^\s]*)", re.I)
+
+
+def _button_kind(url: str, self_bot: str | None) -> str | None:
+    """Что за ссылка на кнопке: graph | invite | chat | deeplink | self | None."""
+    if re.search(r"(telegra\.ph|graph\.org)/", url, re.I):
+        return "graph"
+    m = _TG_URL.search(url)
+    if not m:
+        return None
+    name, tail = m.group(1), m.group(2) or ""
+    if name.startswith("+") or name.lower() == "joinchat":
+        return "invite"
+    if "start=" in tail.lower():
+        # инлайн-боты вешают на кнопку ссылку в личку самих себя («Please wait…»)
+        # — это их обычная работа, а не увод аудитории
+        return "self" if self_bot and name.lower() == self_bot.lstrip("@").lower() else "deeplink"
+    return "chat"
+
+
+# вес и подпись для каждого вида кнопки
+_BUTTON_WEIGHTS = {
+    "graph": (30, "кнопка на telegra.ph"),
+    "invite": (25, "кнопка-инвайт в чат"),
+    "chat": (25, "кнопка на чат/канал"),
+    "deeplink": (5, "кнопка в личку бота"),
+    "self": (0, ""),
+}
+
+
+def score_buttons(urls: list[str], self_bot: str | None = None) -> tuple[int, list[str]]:
+    """Оценка кнопок под сообщением: в рекламе вся суть висит именно на них.
+
+    self_bot — юзернейм бота, который это сообщение и отдал: ссылку на самого
+    себя ему не засчитываем.
+    """
     score, reasons = 0, []
     if urls:
         score += 20
         reasons.append("кнопки со ссылками")
-    if any(re.search(r"(telegra\.ph|graph\.org|t\.me/)", u, re.I) for u in urls):
-        score += 30
-        reasons.append("кнопка на telegra.ph/чат")
+    seen = set()
+    for url in urls:
+        kind = _button_kind(url, self_bot)
+        if kind is None or kind in seen:
+            continue
+        seen.add(kind)
+        weight, label = _BUTTON_WEIGHTS[kind]
+        if weight:
+            score += weight
+            reasons.append(label)
     return score, reasons
 
 
-def score_content(text: str, urls: list[str] | None = None) -> tuple[int, list[str]]:
+def score_content(text: str, urls: list[str] | None = None,
+                  self_bot: str | None = None) -> tuple[int, list[str]]:
     """Текст плюс кнопки — общая оценка содержимого сообщения."""
     urls = urls or []
     score, reasons = score_message(text + " " + " ".join(urls))
-    b_score, b_reasons = score_buttons(urls)
+    b_score, b_reasons = score_buttons(urls, self_bot)
     return score + b_score, reasons + b_reasons
 
 
@@ -144,29 +270,54 @@ async def check_user(bot, chat, user, settings, message=None) -> None:
     """Полный цикл наблюдения: скоринг профиля (+сообщения), бан или карточка.
 
     Профиль скорится один раз на версию профиля (изменился — пересчёт).
-    Сообщение скорится каждый раз, очки складываются.
+    Очки за сообщения складываются в копилку: спам выгодно дробить на порции
+    ниже порога, и без накопления такая рассылка проходила бы насквозь.
+    Копилка обнуляется, если человек сутки не давал поводов.
     """
+    import time
+
     from .. import config, db, utils
     from . import moderation
-
-    sig = profile_sig(user.first_name, user.last_name, user.username)
-    row = await db.watch_get(chat.id, user.id)
-    profile_changed = row is None or row["sig"] != sig
 
     p_score, p_reasons = score_profile(user.first_name, user.last_name, user.username)
     m_score, m_reasons = (0, [])
     if message is not None:
         m_score, m_reasons = score_message(message.text or message.caption or "")
+    # чисто? тогда и в базу лезть незачем — на каждое сообщение это лишний запрос
+    if not p_score and not m_score:
+        return
 
-    total = p_score + m_score
+    sig = profile_sig(user.first_name, user.last_name, user.username)
+    row = await db.watch_get(chat.id, user.id)
+    profile_changed = row is None or row["sig"] != sig
+
+    now = int(time.time())
+    saved = 0
+    if row is not None and now - (row["score_ts"] or 0) <= SCORE_WINDOW:
+        saved = row["score"] or 0
+    pot = min(saved + m_score, SCORE_MAX)
+
+    total = p_score + pot
     reasons = p_reasons + m_reasons
+    if saved:
+        reasons.append(f"копилка за сутки: {saved}")
+    # Не участник чата (комментатор под постом канала) — тот же текст от него
+    # весит больше: почти вся реклама приходит именно оттуда. Спрашиваем статус
+    # только когда очки уже набежали, иначе это запрос на каждое сообщение.
+    if 0 < total < settings.watch_suspect:
+        from . import adm_cache
+        if not await adm_cache.is_member(bot, chat.id, user.id):
+            total += GUEST_BOOST
+            reasons.append("автор не состоит в чате")
     # текст сообщения — только если человек что-то писал: на входе в чат его нет.
     # Ссылку даём: при подозрении сообщение остаётся в чате, его можно открыть.
     body = moderation.message_body(message, with_link=True)
     body_gone = moderation.message_body(message)   # для автобана: сообщение удалим
     if total < settings.watch_suspect:
-        if profile_changed:
-            await db.watch_set(chat.id, user.id, sig, False)
+        await db.watch_set(chat.id, user.id, sig,
+                           bool(row["flagged"]) if row is not None and not profile_changed
+                           else False,
+                           score=pot)
         return
 
     who = utils.mention(user.id, user.full_name, user.username)
@@ -182,7 +333,7 @@ async def check_user(bot, chat, user, settings, message=None) -> None:
         pid = await moderation.apply_punishment(
             bot, chat.id, user, "ban", 0, f"наблюдение: {why} ({total})", None
         )
-        await db.watch_set(chat.id, user.id, sig, True)
+        await db.watch_set(chat.id, user.id, sig, True, score=0, card_score=total)
         card = (
             f"⛔ <b>Бан (наблюдение)</b> · {utils.esc(chat.title)}\n"
             f"👤 {who} (<code>{user.id}</code>)\n"
@@ -193,10 +344,15 @@ async def check_user(bot, chat, user, settings, message=None) -> None:
         await moderation.send_card(bot, chat.id, config.BIT_WATCH, card, pid, "ban", user.id)
         return
 
-    # подозрение: карточка один раз на версию профиля
-    if row is not None and row["flagged"] and not profile_changed:
+    # Подозрение: карточку не повторяем на каждое сообщение, но и не замолкаем
+    # навсегда — если счёт заметно вырос, шлём ещё одну. Иначе рост 40 -> 75
+    # оставался бы незамеченным до самого бана.
+    seen = (row["card_score"] or 0) if row is not None else 0
+    if (row is not None and row["flagged"] and not profile_changed
+            and total < seen + RECARD_STEP):
+        await db.watch_set(chat.id, user.id, sig, True, score=pot)
         return
-    await db.watch_set(chat.id, user.id, sig, True)
+    await db.watch_set(chat.id, user.id, sig, True, score=pot, card_score=total)
     card = (
         f"👁 <b>Подозрительный аккаунт</b> · {utils.esc(chat.title)}\n"
         f"👤 {who} (<code>{user.id}</code>)\n"
@@ -205,17 +361,15 @@ async def check_user(bot, chat, user, settings, message=None) -> None:
         + body
     )
     await db.add_event(chat.id, "watch", f"suspect: {user.full_name} ({user.id}) — {why} ({total})")
-    s = await db.get_settings(chat.id)
-    if s.cards_on and s.log_chat_id and (s.card_mask & config.BIT_WATCH):
-        from aiogram.utils.keyboard import InlineKeyboardBuilder
-        b = InlineKeyboardBuilder()
-        b.button(text="⛔ Забанить", callback_data=f"k:ban:{chat.id}:{user.id}")
-        b.button(text="🕊 Не трогать", callback_data="k:wok")
-        b.adjust(2)
-        try:
-            await bot.send_message(s.log_chat_id, card, reply_markup=b.as_markup())
-        except Exception:
-            logger.warning("suspect card failed for chat %s", chat.id, exc_info=True)
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    b = InlineKeyboardBuilder()
+    b.button(text="⛔ Забанить", callback_data=f"k:ban:{chat.id}:{user.id}")
+    b.button(text="🕊 Не трогать", callback_data="k:wok")
+    b.adjust(2)
+    # через send_card: он сам сверится с настройками карточек, отправит копию
+    # в глобальный лог и свяжет обе, чтобы кнопки гасли разом
+    await moderation.send_card(bot, chat.id, config.BIT_WATCH, card,
+                               markup=b.as_markup())
 
 
 if __name__ == "__main__":
@@ -248,4 +402,50 @@ if __name__ == "__main__":
     # а спрятанный символ в обычном тексте — по-прежнему сигнал
     s, _ = score_message("текст‮со скрытым разворотом")
     assert s >= 30
+    # кнопки: дип-ссылка инлайн-бота на самого себя — не спам
+    s, r = score_content("https://www.deezer.com/track/2610505422",
+                         ["https://t.me/deezload2bot?start=deezertrack2610505422"],
+                         self_bot="deezload2bot")
+    assert s == 20, (s, r)                       # только «кнопки со ссылками»
+    s, r = score_content("", ["https://t.me/somechat"])
+    assert s == 45, (s, r)                       # ссылка на чужой чат — сигнал
+    s, r = score_content("", ["https://t.me/+AbCdEf"])
+    assert s == 45, (s, r)                       # инвайт тоже
+    s, r = score_content("", ["https://telegra.ph/AKTUAL-07-10"])
+    assert s >= 50, (s, r)                       # telegra.ph на кнопке — бан
+    s, r = score_content("", ["https://t.me/otherbot?start=x"], self_bot="deezload2bot")
+    assert s == 25, (s, r)                       # чужой бот — слабый сигнал
+
+    # кривопись: сама по себе до порога подозрения (40) не дотягивает
+    for text in ("прив3т, как дела", "нуууу такое", "с-п-а-с-и-б-о всем",
+                 "ставка 2-0 в пользу наших", "заказ №12345 приехал"):
+        s, r = score_message(text)
+        assert s < 40, (text, s, r)
+    # а рядом со ссылкой та же кривопись — уже обход фильтра
+    for text in ("каzино с бонусом, переходи t.me/luckyplay",
+                 "к.а.з.и.н.о бонус https://bit.ly/x",
+                 "п0рн0 архив тут https://t.me/+AbCd"):
+        s, r = score_message(text)
+        assert s >= 40, (text, s, r)
+    # цифры и точки внутри адреса — не кривопись, ссылки из проверки выкидываем
+    for text in ("смотри https://www.deezer.com/track/2610505422",
+                 "видео на youtube.com/watch?v=dQw4w9WgXcQ глянь"):
+        s, r = score_message(text)
+        assert s == 0, (text, s, r)
+    # техническая речь: цифра с краю слова или короткое слово — не обфускация
+    for text in ("смотри 3D модель https://sketchfab.com/x",
+                 "в 1С провёл, вот выгрузка https://disk.yandex.ru/y",
+                 "купил Wi-Fi 6E роутер, обзор тут https://dns-shop.ru/z",
+                 "COVID19 статистика https://who.int/a"):
+        s, r = score_message(text)
+        assert s == 0, (text, s, r)
+    # @упоминание человека — не ссылка, усилитель включать нельзя
+    for text in ("прив3т @vasya_petrov, ты где", "нуууу @kolya сегодня не смогу"):
+        s, r = score_message(text)
+        assert s < 40 and "кривой текст вместе со ссылкой" not in r, (text, s, r)
+    # сокращатели — самостоятельный сигнал
+    s, r = score_message("бонус тут https://bit.ly/xyz")
+    assert s == 20, (s, r)
+    s, r = score_message("сliiiв базы, жми https://vk.cc/x")
+    assert s >= 60, (s, r)                       # сокращатель + кривопись + ссылка
     print("watch self-check OK")

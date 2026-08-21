@@ -788,7 +788,8 @@ async def moderate(message: Message, bot: Bot) -> None:
         # вещи, а правило одно. Поэтому за спам-содержимое наказание ужесточаем.
         if s.inline_spam:
             score, why = watch.score_content(
-                message.text or message.caption or "", moderation.button_urls(message)
+                message.text or message.caption or "", moderation.button_urls(message),
+                self_bot=message.via_bot.username,
             )
             if score >= s.inline_spam:
                 kind, mute_min = "ban", 0

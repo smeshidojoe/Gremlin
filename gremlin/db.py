@@ -134,6 +134,9 @@ CREATE TABLE IF NOT EXISTS watch_profiles(
     user_id INTEGER NOT NULL,
     sig     TEXT NOT NULL,          -- подпись профиля (имя|фамилия|username)
     flagged INTEGER NOT NULL DEFAULT 0,  -- карточка «подозрительный» уже отправлена
+    score      INTEGER NOT NULL DEFAULT 0,  -- накопленные очки за сообщения
+    score_ts   INTEGER NOT NULL DEFAULT 0,  -- когда копилку последний раз трогали
+    card_score INTEGER NOT NULL DEFAULT 0,  -- с каким счётом ушла последняя карточка
     PRIMARY KEY (chat_id, user_id)
 );
 CREATE TABLE IF NOT EXISTS whitelist(
@@ -349,6 +352,9 @@ _TABLE_MIGRATIONS = {
     "whitelist": {"title": "TEXT"},
     "punishments": {"was_member": "INTEGER NOT NULL DEFAULT 1"},
     "answers": {"last_used": "INTEGER NOT NULL DEFAULT 0"},
+    "watch_profiles": {"score": "INTEGER NOT NULL DEFAULT 0",
+                       "score_ts": "INTEGER NOT NULL DEFAULT 0",
+                       "card_score": "INTEGER NOT NULL DEFAULT 0"},
 }
 
 
@@ -1227,11 +1233,21 @@ async def watch_get(chat_id: int, user_id: int) -> aiosqlite.Row | None:
     return await cur.fetchone()
 
 
-async def watch_set(chat_id: int, user_id: int, sig: str, flagged: bool) -> None:
+async def watch_set(chat_id: int, user_id: int, sig: str, flagged: bool,
+                    score: int | None = None, card_score: int | None = None) -> None:
+    """Состояние наблюдения. score/card_score трогаем, только если переданы."""
     await _db.execute(
-        """INSERT INTO watch_profiles (chat_id, user_id, sig, flagged) VALUES (?, ?, ?, ?)
-           ON CONFLICT(chat_id, user_id) DO UPDATE SET sig = excluded.sig, flagged = excluded.flagged""",
-        (chat_id, user_id, sig, int(flagged)),
+        """INSERT INTO watch_profiles (chat_id, user_id, sig, flagged, score, score_ts,
+                                       card_score)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(chat_id, user_id) DO UPDATE SET
+               sig = excluded.sig,
+               flagged = excluded.flagged,
+               score = COALESCE(?, watch_profiles.score),
+               score_ts = CASE WHEN ? IS NULL THEN watch_profiles.score_ts ELSE ? END,
+               card_score = COALESCE(?, watch_profiles.card_score)""",
+        (chat_id, user_id, sig, int(flagged), score or 0, _now() if score else 0,
+         card_score or 0, score, score, _now(), card_score),
     )
     await _db.commit()
 

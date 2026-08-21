@@ -105,9 +105,9 @@ def find_caller(chat_id: int, bot_username: str | None) -> tuple | None:
     return rec
 
 
-def score_bot_message(message) -> tuple[int, list[str]]:
+def score_bot_message(message, self_bot: str | None = None) -> tuple[int, list[str]]:
     """Насколько сообщение стороннего бота похоже на спам."""
-    return watch.score_content(message.text or "", _button_urls(message))
+    return watch.score_content(message.text or "", _button_urls(message), self_bot)
 
 
 async def _handle_bot_spam(bot: Bot, chat_id: int, message, sender) -> None:
@@ -115,7 +115,7 @@ async def _handle_bot_spam(bot: Bot, chat_id: int, message, sender) -> None:
     s = await db.get_settings(chat_id)
     if not s.watch_on:
         return
-    score, reasons = score_bot_message(message)
+    score, reasons = score_bot_message(message, getattr(sender, "username", None))
     if score < s.watch_suspect:
         return
 

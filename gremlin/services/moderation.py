@@ -405,14 +405,15 @@ async def unban_pass_valid(chat_id: int, uid: int) -> bool:
 
 async def send_card(bot: Bot, chat_id: int, bit: int, text: str,
                     pid: int | None = None, kind: str = "delete",
-                    user_id: int | None = None) -> None:
+                    user_id: int | None = None,
+                    markup: InlineKeyboardMarkup | None = None) -> None:
     """Карточка события: в лог-чат этого чата и в глобальный лог владельца бота.
 
     Лог чата слушается настройками самого чата, глобальный — нет: он общий и
     собирает всё подряд, иначе смысла в нём мало.
     """
     s = await db.get_settings(chat_id)
-    kb = card_kb(pid, kind, chat_id, user_id)
+    kb = markup if markup is not None else card_kb(pid, kind, chat_id, user_id)
     no_preview = LinkPreviewOptions(is_disabled=True)
     targets = []
     if s.cards_on and s.log_chat_id and (s.card_mask & bit):

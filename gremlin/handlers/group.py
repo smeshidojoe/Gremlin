@@ -9,7 +9,9 @@ from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .. import config, db, utils
-from ..services import adm_cache, filters, moderation, resolve, triggers, watch
+from ..services import (
+    adm_cache, filters, moderation, net, resolve, triggers, trust, watch,
+)
 
 logger = logging.getLogger("gremlin.group")
 
@@ -145,7 +147,11 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
     card = _manual_card_text(
         kind, message.chat.title, target, reason, until, message.from_user, body,
     )
-    await moderation.send_card(bot, message.chat.id, bit, card, pid, kind)
+    sent = await moderation.send_card(bot, message.chat.id, bit, card, pid, kind)
+    asyncio.create_task(net.spread_and_note(
+        bot, sent, message.chat.id, target, kind, mute_min, reason,
+        message.from_user.id,
+    ))
     await db.add_event(
         message.chat.id, "manual",
         f"{kind}: {target.full_name} ({target.id}) — {reason} | by {message.from_user.id}",
@@ -249,8 +255,10 @@ async def cmd_warn(message: Message, bot: Bot) -> None:
         f"📎 Причина: {utils.esc(reason)}\n"
         f"👮 Кем: {admin}" + body
     )
-    await moderation.send_card(bot, message.chat.id, config.BIT_WARN, card,
-                               user_id=target.id)
+    sent = await moderation.send_card(bot, message.chat.id, config.BIT_WARN, card,
+                                      user_id=target.id)
+    asyncio.create_task(net.warn_and_note(bot, sent, message.chat.id, target, reason,
+                                          message.from_user.id))
     await db.add_event(
         message.chat.id, "warn",
         f"варн {count}/{s.warns_limit}: {target.full_name} ({target.id}) — {reason} "
@@ -262,6 +270,9 @@ async def cmd_warn(message: Message, bot: Bot) -> None:
     # лимит добит: наказываем и гасим счётчик, чтобы отсчёт пошёл заново
     await db.warn_reset(message.chat.id, target.id)
     kind = s.warns_punish
+    if s.trust_on:
+        kind = trust.soften(kind, await trust.level(bot, message.chat.id, target.id, s),
+                            s, config.TRUST_S_WARN)
     if kind == "delete":
         return                       # «удаление» уже случилось выше
     pid = await moderation.apply_punishment(
@@ -276,7 +287,11 @@ async def cmd_warn(message: Message, bot: Bot) -> None:
         kind, message.chat.title, target, f"набрано {s.warns_limit} варнов",
         until, message.from_user,
     )
-    await moderation.send_card(bot, message.chat.id, bit, punish_card, pid, kind)
+    sent = await moderation.send_card(bot, message.chat.id, bit, punish_card, pid, kind)
+    asyncio.create_task(net.spread_and_note(
+        bot, sent, message.chat.id, target, kind, s.warns_mute_min,
+        f"набрано {s.warns_limit} варнов", message.from_user.id,
+    ))
     await db.add_event(
         message.chat.id, "manual",
         f"{kind}: {target.full_name} ({target.id}) — лимит варнов | by {message.from_user.id}",
@@ -337,6 +352,7 @@ async def cmd_lift(message: Message, bot: Bot) -> None:
 
     await db.deactivate_user_punishments(message.chat.id, uid)
     adm_cache.invalidate_member(message.chat.id, uid)
+    trust.invalidate(message.chat.id, uid)
     try:
         await message.delete()
     except Exception:
@@ -351,7 +367,8 @@ async def cmd_lift(message: Message, bot: Bot) -> None:
         f"{tail}"
     )
     bit = config.BIT_BAN if unban else config.BIT_MUTE
-    await moderation.send_card(bot, message.chat.id, bit, card)
+    sent = await moderation.send_card(bot, message.chat.id, bit, card)
+    asyncio.create_task(net.lift_and_note(bot, sent, message.chat.id, uid))
     await db.add_event(
         message.chat.id, "manual",
         f"{'unban' if unban else 'unmute'}: {uid} | by {message.from_user.id}",
@@ -472,8 +489,12 @@ async def _link_punish(bot: Bot, chat_id: int, user_id: int, s,
     """
     mine = (getattr(s, f"lp_{kind}"), getattr(s, f"lm_{kind}"))
     guest = (getattr(s, f"gp_{kind}"), getattr(s, f"gm_{kind}"))
-    if mine == guest:
+    if mine == guest and not s.trust_on:
         return mine
+    if s.trust_on:
+        lvl = await trust.level(bot, chat_id, user_id, s)
+        punish, minutes = guest if lvl == trust.GUEST else mine
+        return trust.soften(punish, lvl, s, config.TRUST_LINK_BIT[kind]), minutes
     return mine if await adm_cache.is_member(bot, chat_id, user_id) else guest
 
 
@@ -617,7 +638,11 @@ async def on_join(message: Message, bot: Bot) -> None:
                         f"🤖 Кем: Gremlin (автомод)"
                     )
                     await db.add_event(message.chat.id, "watch", f"бан бота @{user.username} ({user.id})")
-                    await moderation.send_card(bot, message.chat.id, config.BIT_WATCH, card, pid, "ban")
+                    sent = await moderation.send_card(
+                        bot, message.chat.id, config.BIT_WATCH, card, pid, "ban")
+                    asyncio.create_task(net.spread_and_note(
+                        bot, sent, message.chat.id, user, "ban", 0,
+                        "чужой бот добавлен не-админом", None))
                 continue
             # профиль новичка-человека
             if not user.is_bot and user.id not in admins and user.id not in config.ADMIN_IDS:
@@ -783,6 +808,9 @@ async def moderate(message: Message, bot: Bot) -> None:
             and not await db.inline_wl_allowed(
                 chat.id, message.via_bot.username, message.via_bot.id)):
         kind, mute_min = s.inline_punish, s.inline_mute_min
+        if s.trust_on:
+            kind = trust.soften(kind, await trust.level(bot, chat.id, user.id, s),
+                                s, config.TRUST_S_INLINE)
         detail = f"@{message.via_bot.username}"
         # Гифка через @gif и рекламная простыня с кнопками на telegra.ph — разные
         # вещи, а правило одно. Поэтому за спам-содержимое наказание ужесточаем.
@@ -895,25 +923,34 @@ async def moderate(message: Message, bot: Bot) -> None:
         if word and s.words_guests and await adm_cache.is_member(bot, chat.id, user.id):
             word = None
         if word:
+            kind = s.words_punish
+            if s.trust_on:
+                kind = trust.soften(kind, await trust.level(bot, chat.id, user.id, s),
+                                    s, config.TRUST_S_WORDS)
             await moderation.violation(
                 bot, message, config.BIT_WORDS, "стоп-слово",
-                s.words_punish, s.words_mute_min, word,
+                kind, s.words_mute_min, word,
             )
             return
 
     # --- антифлуд (только новые сообщения, не редактирования) ---
     if s.flood_on and message.edit_date is None and "flood" not in scopes:
         if filters.flood_hit(chat.id, user.id, s.flood_msgs, s.flood_window):
+            kind = "mute"
+            if s.trust_on:
+                kind = trust.soften(kind, await trust.level(bot, chat.id, user.id, s),
+                                    s, config.TRUST_S_FLOOD)
             await moderation.violation(
                 bot, message, config.BIT_FLOOD, "флуд",
-                "mute", s.flood_mute_min,
+                kind, s.flood_mute_min,
                 f"{s.flood_msgs} сообщений за {s.flood_window} сек",
             )
             return
 
     # --- наблюдение за профилями (специфичные правила уже отработали) ---
     if s.watch_on and "watch" not in scopes:
-        await watch.check_user(bot, chat, user, s, message)
+        lvl = await trust.level(bot, chat.id, user.id, s) if s.trust_on else None
+        await watch.check_user(bot, chat, user, s, message, lvl)
 
     # --- триггеры (последними: на удалённое модерацией не отвечаем) ---
     await fire_trigger(bot, message, s)

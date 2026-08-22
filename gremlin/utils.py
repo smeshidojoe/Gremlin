@@ -167,6 +167,19 @@ def mention(user_id: int, name: str | None, username: str | None = None) -> str:
     return f'<a href="tg://user?id={user_id}">{label}</a>'
 
 
+def plural(n: int, one: str, few: str, many: str) -> str:
+    """Русское склонение по числу: 1 чат, 2 чата, 5 чатов."""
+    n = abs(n) % 100
+    if 11 <= n <= 14:
+        return many
+    n %= 10
+    if n == 1:
+        return one
+    if 2 <= n <= 4:
+        return few
+    return many
+
+
 def esc(text: str | None) -> str:
     return html.escape(text or "")
 

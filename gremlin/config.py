@@ -80,6 +80,61 @@ BIT_CAPTCHA = 512 # капча
 BIT_WATCH = 1024  # наблюдение за профилями
 BIT_WARN = 2048   # варны от админов
 
+# Доверие: чем дольше человек в чате и чем чище его история, тем мягче правила.
+# Уровни: 0 гость, 1 новичок, 2 свой, 3 ветеран.
+TRUST_DAYS_PRESETS = (1, 3, 7, 14, 30)
+TRUST_MSGS_PRESETS = (5, 20, 50, 100, 300)
+TRUST_VET_DAYS = 30          # ветеран: столько дней в чате
+TRUST_VET_MSGS = 300         # ...и столько сообщений за месяц
+TRUST_LABELS = {0: "гость", 1: "новичок", 2: "свой", 3: "ветеран"}
+# множитель порогов наблюдения: гостю строже, ветерану мягче
+TRUST_WATCH_FACTOR = {0: 0.7, 1: 1.0, 2: 1.5, 3: 2.0}
+# на сколько ступеней смягчать наказание (бан -> мут -> удаление)
+TRUST_SOFTEN = {0: 0, 1: 0, 2: 1, 3: 2}
+
+# какие проверки смягчать своим — галочки в подменю «Что смягчать»
+TRUST_S_WORDS = 1
+TRUST_S_TG = 2
+TRUST_S_EXT = 4
+TRUST_S_MEN = 8
+TRUST_S_FWD = 16
+TRUST_S_INLINE = 32
+TRUST_S_FLOOD = 64
+TRUST_S_WARN = 128
+
+TRUST_BITS = (
+    (TRUST_S_WORDS, "Стоп-слова"),
+    (TRUST_S_TG, "ТГ-ссылки"),
+    (TRUST_S_EXT, "Внешние ссылки"),
+    (TRUST_S_MEN, "Упоминания"),
+    (TRUST_S_FWD, "Пересылки"),
+    (TRUST_S_INLINE, "Инлайн-боты"),
+    (TRUST_S_FLOOD, "Антифлуд"),
+    (TRUST_S_WARN, "Лимит варнов"),
+)
+# по умолчанию мягче относимся к тому, где чаще всего ошибаются живые люди
+TRUST_MASK_DEFAULT = TRUST_S_WORDS | TRUST_S_TG | TRUST_S_EXT | TRUST_S_MEN | TRUST_S_FWD
+
+# какая галочка отвечает за какой тип ссылок
+TRUST_LINK_BIT = {"tg": TRUST_S_TG, "ext": TRUST_S_EXT,
+                  "men": TRUST_S_MEN, "fwd": TRUST_S_FWD}
+
+# Сетка чатов: что расходится по чатам одного владельца.
+NET_BAN = 1
+NET_MUTE = 2
+NET_WARN = 4
+NET_LIFT = 8
+
+NET_BITS = (
+    (NET_BAN, "Баны"),
+    (NET_MUTE, "Муты"),
+    (NET_WARN, "Варны"),
+    (NET_LIFT, "Снятия"),
+)
+NET_LIMIT = 3          # сеток на одного владельца
+NET_MASK_DEFAULT = NET_BAN | NET_LIFT      # муты и варны — дело каждого чата
+NET_DELAY = 1.0                            # пауза между чатами, как в массовых операциях
+
 CARD_BITS = (
     (BIT_BAN, "Баны"),
     (BIT_MUTE, "Муты"),

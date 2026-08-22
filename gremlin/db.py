@@ -18,8 +18,18 @@ CREATE TABLE IF NOT EXISTS chats(
     username  TEXT,
     owner_id  INTEGER,
     added_at  INTEGER,
-    active    INTEGER NOT NULL DEFAULT 1
+    active    INTEGER NOT NULL DEFAULT 1,
+    net_id    INTEGER                     -- сетка, в которой состоит чат
 );
+CREATE TABLE IF NOT EXISTS nets(
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id  INTEGER NOT NULL,         -- сетки принадлежат владельцу чатов
+    title     TEXT    NOT NULL,
+    sync_mask INTEGER NOT NULL DEFAULT 9,   -- NET_BAN | NET_LIFT
+    lift_mode TEXT    NOT NULL DEFAULT 'any',  -- any | source: кто снимает наказание
+    created   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_nets_owner ON nets(owner_id);
 CREATE TABLE IF NOT EXISTS settings(
     chat_id         INTEGER PRIMARY KEY,
     inline_on       INTEGER NOT NULL DEFAULT 1,
@@ -84,6 +94,11 @@ CREATE TABLE IF NOT EXISTS settings(
     warns_punish    TEXT    NOT NULL DEFAULT 'mute',
     warns_mute_min  INTEGER NOT NULL DEFAULT 1440,
     rules_on        INTEGER NOT NULL DEFAULT 0,
+    trust_on        INTEGER NOT NULL DEFAULT 0,
+    trust_soften    INTEGER NOT NULL DEFAULT 1,
+    trust_days      INTEGER NOT NULL DEFAULT 3,
+    trust_msgs      INTEGER NOT NULL DEFAULT 20,
+    trust_mask      INTEGER NOT NULL DEFAULT 31,
     cards_on        INTEGER NOT NULL DEFAULT 1,
     card_mask       INTEGER NOT NULL DEFAULT 4095,
     log_chat_id     INTEGER
@@ -282,6 +297,11 @@ class Settings:
     warns_punish: str = "mute"
     warns_mute_min: int = 1440
     rules_on: int = 0
+    trust_on: int = 0
+    trust_soften: int = 1
+    trust_days: int = 3
+    trust_msgs: int = 20
+    trust_mask: int = 31
     cards_on: int = 1
     card_mask: int = 4095
     log_chat_id: int | None = None
@@ -316,6 +336,11 @@ _SETTINGS_MIGRATIONS = {
     "warns_punish": "TEXT NOT NULL DEFAULT 'mute'",
     "warns_mute_min": "INTEGER NOT NULL DEFAULT 1440",
     "rules_on": "INTEGER NOT NULL DEFAULT 0",
+    "trust_on": "INTEGER NOT NULL DEFAULT 0",
+    "trust_soften": "INTEGER NOT NULL DEFAULT 1",
+    "trust_days": "INTEGER NOT NULL DEFAULT 3",
+    "trust_msgs": "INTEGER NOT NULL DEFAULT 20",
+    "trust_mask": "INTEGER NOT NULL DEFAULT 31",
     "links_guest_punish": "TEXT NOT NULL DEFAULT 'delete'",
     "links_guest_mute_min": "INTEGER NOT NULL DEFAULT 60",
     "lp_tg": "TEXT NOT NULL DEFAULT 'delete'",
@@ -352,6 +377,7 @@ _TABLE_MIGRATIONS = {
     "whitelist": {"title": "TEXT"},
     "punishments": {"was_member": "INTEGER NOT NULL DEFAULT 1"},
     "answers": {"last_used": "INTEGER NOT NULL DEFAULT 0"},
+    "chats": {"net_id": "INTEGER"},
     "watch_profiles": {"score": "INTEGER NOT NULL DEFAULT 0",
                        "score_ts": "INTEGER NOT NULL DEFAULT 0",
                        "card_score": "INTEGER NOT NULL DEFAULT 0"},
@@ -359,6 +385,40 @@ _TABLE_MIGRATIONS = {
 
 
 async def _migrate() -> None:
+    # первая версия сеток была одна на владельца: таблица nets с owner_id вместо
+    # id и флаг chats.net_on. Перетаскиваем в именованные сетки.
+    cur = await _db.execute("PRAGMA table_info(nets)")
+    net_cols = {r["name"] for r in await cur.fetchall()}
+    if net_cols and "id" not in net_cols:
+        cur = await _db.execute("PRAGMA table_info(chats)")
+        if "net_id" not in {r["name"] for r in await cur.fetchall()}:
+            await _db.execute("ALTER TABLE chats ADD COLUMN net_id INTEGER")
+        await _db.execute("ALTER TABLE nets RENAME TO nets_old")
+        await _db.execute("""
+            CREATE TABLE nets(
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id  INTEGER NOT NULL,
+                title     TEXT    NOT NULL,
+                sync_mask INTEGER NOT NULL DEFAULT 9,
+                lift_mode TEXT    NOT NULL DEFAULT 'any',
+                created   INTEGER NOT NULL
+            )""")
+        cur = await _db.execute("SELECT * FROM nets_old")
+        for row in await cur.fetchall():
+            await _db.execute(
+                """INSERT INTO nets (owner_id, title, sync_mask, lift_mode, created)
+                   VALUES (?, 'Моя сетка', ?, ?, ?)""",
+                (row["owner_id"], row["sync_mask"], row["lift_mode"], row["created"]),
+            )
+            cur2 = await _db.execute("SELECT last_insert_rowid() AS id")
+            new_id = (await cur2.fetchone())["id"]
+            await _db.execute(
+                "UPDATE chats SET net_id = ? WHERE owner_id = ? AND net_on = 1",
+                (new_id, row["owner_id"]),
+            )
+        await _db.execute("DROP TABLE nets_old")
+        await _db.commit()
+
     cur = await _db.execute("PRAGMA table_info(settings)")
     cols = {r["name"] for r in await cur.fetchall()}
     for name, ddl in _SETTINGS_MIGRATIONS.items():
@@ -1194,6 +1254,34 @@ async def msg_inc(chat_id: int, user_id: int, username: str | None = None,
     await _db.commit()
 
 
+async def trust_facts(chat_id: int, user_id: int) -> dict:
+    """Сырые факты для уровня доверия: стаж, активность, наказания.
+
+    Всё берём из своей базы — ни одного запроса в Telegram.
+    """
+    day = utils.day_num()
+
+    async def one(q: str, args) -> int:
+        cur = await _db.execute(q, args)
+        return (await cur.fetchone())[0] or 0
+
+    msgs30 = await one(
+        "SELECT SUM(cnt) FROM msg_stats WHERE chat_id = ? AND user_id = ? AND day >= ?",
+        (chat_id, user_id, day - 29))
+    first_day = await one(
+        "SELECT MIN(day) FROM msg_stats WHERE chat_id = ? AND user_id = ?",
+        (chat_id, user_id))
+    row = await get_user(user_id)
+    seen = row["first_seen"] if row and row["first_seen"] else None
+    days_known = (day - first_day) if first_day else 0
+    if seen:
+        days_known = max(days_known, (_now() - seen) // 86400)
+    pun30 = await one(
+        "SELECT COUNT(*) FROM punishments WHERE chat_id = ? AND user_id = ? AND created >= ?",
+        (chat_id, user_id, _now() - 30 * 86400))
+    return {"days": int(days_known), "msgs": int(msgs30), "pun": int(pun30)}
+
+
 async def chat_stats(chat_id: int) -> dict:
     day = utils.day_num()
 
@@ -1286,6 +1374,94 @@ async def kv_get(key: str) -> str | None:
     cur = await _db.execute("SELECT v FROM kv WHERE k = ?", (key,))
     row = await cur.fetchone()
     return row["v"] if row else None
+
+
+# ---------- сетки чатов ----------
+#
+# Сетка — это именованная группа чатов одного владельца, между которыми
+# разъезжаются наказания. Сеток у владельца может быть несколько (лимит
+# config.NET_LIMIT): чаты разных сообществ не должны делить баны.
+
+async def nets_of(owner_id: int) -> list[aiosqlite.Row]:
+    cur = await _db.execute(
+        "SELECT * FROM nets WHERE owner_id = ? ORDER BY created", (owner_id,))
+    return await cur.fetchall()
+
+
+async def net_get(net_id: int | None) -> aiosqlite.Row | None:
+    if not net_id:
+        return None
+    cur = await _db.execute("SELECT * FROM nets WHERE id = ?", (net_id,))
+    return await cur.fetchone()
+
+
+async def net_create(owner_id: int, title: str) -> int | None:
+    """Завести сетку. None — упёрлись в лимит."""
+    if len(await nets_of(owner_id)) >= config.NET_LIMIT:
+        return None
+    cur = await _db.execute(
+        """INSERT INTO nets (owner_id, title, sync_mask, lift_mode, created)
+           VALUES (?, ?, ?, 'any', ?)""",
+        (owner_id, title.strip()[:40], config.NET_MASK_DEFAULT, _now()),
+    )
+    await _db.commit()
+    return cur.lastrowid
+
+
+async def net_delete(net_id: int) -> None:
+    await _db.execute("UPDATE chats SET net_id = NULL WHERE net_id = ?", (net_id,))
+    await _db.execute("DELETE FROM nets WHERE id = ?", (net_id,))
+    await _db.commit()
+
+
+async def net_set(net_id: int, field: str, value) -> None:
+    if field not in ("sync_mask", "lift_mode", "title"):
+        raise ValueError(field)
+    await _db.execute(f"UPDATE nets SET {field} = ? WHERE id = ?", (value, net_id))
+    await _db.commit()
+
+
+async def net_chats(net_id: int) -> list[aiosqlite.Row]:
+    cur = await _db.execute(
+        "SELECT * FROM chats WHERE net_id = ? AND active = 1 ORDER BY added_at",
+        (net_id,),
+    )
+    return await cur.fetchall()
+
+
+async def net_assign(chat_id: int, net_id: int | None) -> None:
+    await _db.execute("UPDATE chats SET net_id = ? WHERE chat_id = ?", (net_id, chat_id))
+    await _db.commit()
+
+
+async def net_of_chat(chat_id: int) -> aiosqlite.Row | None:
+    """Сетка, в которой состоит чат. Чужую сетку не отдаём: если владелец чата
+    сменился, старое членство считается недействительным."""
+    ch = await get_chat(chat_id)
+    if ch is None or not ch["net_id"]:
+        return None
+    net = await net_get(ch["net_id"])
+    if net is None or net["owner_id"] != ch["owner_id"]:
+        return None
+    return net
+
+
+async def net_peers(chat_id: int) -> list[aiosqlite.Row]:
+    """Остальные чаты той же сетки — куда разъезжается наказание.
+
+    Лог-чаты сюда не попадают: бот в них сидит, но модерировать там некого.
+    """
+    net = await net_of_chat(chat_id)
+    if net is None:
+        return []
+    logs = {c["log_chat_id"] for c in await _log_chat_ids() if c["log_chat_id"]}
+    return [c for c in await net_chats(net["id"])
+            if c["chat_id"] != chat_id and c["chat_id"] not in logs]
+
+
+async def _log_chat_ids() -> list[aiosqlite.Row]:
+    cur = await _db.execute("SELECT log_chat_id FROM settings")
+    return await cur.fetchall()
 
 
 GLOBAL_LOG_KEY = "global_log"

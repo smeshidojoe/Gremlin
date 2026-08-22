@@ -186,6 +186,8 @@ async def apply_punishment(bot: Bot, chat_id: int, user: User, kind: str,
     except Exception:
         logger.warning("punish %s failed in %s for %s", kind, chat_id, user.id, exc_info=True)
         return None
+    from . import trust
+    trust.invalidate(chat_id, user.id)      # уровень доверия сразу падает
     return await db.add_punishment(
         chat_id, user.id, user.username, user.full_name, kind, reason, until, by_id,
         was_member=member,
@@ -406,7 +408,7 @@ async def unban_pass_valid(chat_id: int, uid: int) -> bool:
 async def send_card(bot: Bot, chat_id: int, bit: int, text: str,
                     pid: int | None = None, kind: str = "delete",
                     user_id: int | None = None,
-                    markup: InlineKeyboardMarkup | None = None) -> None:
+                    markup: InlineKeyboardMarkup | None = None) -> list:
     """Карточка события: в лог-чат этого чата и в глобальный лог владельца бота.
 
     Лог чата слушается настройками самого чата, глобальный — нет: он общий и
@@ -432,6 +434,30 @@ async def send_card(bot: Bot, chat_id: int, bit: int, text: str,
                            exc_info=True)
     if len(sent) > 1:
         await link_twins(sent)
+    return sent
+
+
+async def append_to_cards(bot: Bot, sent: list, line: str) -> None:
+    """Дописать строку к уже отправленным карточкам, кнопки сохранить.
+
+    Нужно для итогов, которые известны позже самой карточки: рассылка по сетке
+    идёт с паузами и заканчивается через несколько секунд после события.
+    """
+    for chat_id, msg_id in sent:
+        try:
+            msg = await bot.edit_message_reply_markup(chat_id=chat_id, message_id=msg_id)
+        except Exception:
+            msg = None
+        try:
+            await bot.edit_message_text(
+                (msg.html_text if msg else "") + line,
+                chat_id=chat_id, message_id=msg_id,
+                reply_markup=msg.reply_markup if msg else None,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+        except Exception:
+            logger.warning("не вышло дописать итог в карточку %s/%s", chat_id, msg_id,
+                           exc_info=True)
 
 
 # Одно и то же событие уходит и в лог чата, и в глобальный. Кнопки живут в обеих
@@ -532,4 +558,8 @@ async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
         chat.id, feature_label,
         f"{applied}: {user.full_name} ({user.id}) — {reason}",
     )
-    await send_card(bot, chat.id, feature_bit, card, pid, applied, user.id)
+    sent = await send_card(bot, chat.id, feature_bit, card, pid, applied, user.id)
+    if applied != "delete":
+        from . import net
+        asyncio.create_task(net.spread_and_note(bot, sent, chat.id, user, applied,
+                                                mute_min, reason, None))

@@ -1,4 +1,5 @@
 """Кнопки на карточках в лог-чате: снять наказание / подтвердить."""
+import asyncio
 import logging
 
 from aiogram import Bot, F, Router
@@ -49,6 +50,13 @@ async def card_lift(cb: CallbackQuery, bot: Bot) -> None:
         await moderation.remember_unban_card(
             p["chat_id"], p["user_id"], cb.message.chat.id, cb.message.message_id, clean
         )
+    if p is not None:
+        # снятие тоже расходится по сетке, если так настроено
+        from ..services import net
+        asyncio.create_task(net.lift_and_note(
+            bot, [(cb.message.chat.id, cb.message.message_id)],
+            p["chat_id"], p["user_id"],
+        ))
     await db.add_event(
         p["chat_id"] if p else None, "card",
         f"снято наказание #{pid} юзером {cb.from_user.id}",
@@ -75,6 +83,11 @@ async def card_ban(cb: CallbackQuery, bot: Bot) -> None:
     )
     await db.add_event(chat_id, "card", f"бан из карточки: {user_id} by {cb.from_user.id}")
     await _mark(cb, "\n\n⛔ <b>Забанен</b>")
+    from ..services import net
+    asyncio.create_task(net.spread_id_and_note(
+        bot, [(cb.message.chat.id, cb.message.message_id)], chat_id, user_id,
+        "ban", 0, "бан из карточки", cb.from_user.id,
+    ))
     await cb.answer("Забанен")
 
 

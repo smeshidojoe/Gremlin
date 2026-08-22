@@ -89,6 +89,7 @@ async def report() -> str:
         f"🐍 Python <b>{platform.python_version()}</b> · aiogram <b>{aiogram.__version__}</b>",
         "",
         f"💬 Чатов: <b>{len(chats)}</b>" + (f" (+{logs} лог-чата)" if logs else "")
+        + f" · в сетках: <b>{sum(1 for c in chats if c['net_id'])}</b>"
         + f" · наказаний активно: <b>{counts['punishments_active']}</b>",
         f"🧨 Стоп-слов: <b>{counts['words']}</b> · вайтлист: <b>{counts['whitelist']}</b> · "
         f"триггеров: <b>{counts['triggers']}</b> · счётчиков: <b>{counts['chat_cmds']}</b>",

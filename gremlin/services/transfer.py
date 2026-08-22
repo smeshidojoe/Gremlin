@@ -36,6 +36,8 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
     "media": ("🖼 Медиа-фильтры", ("media_on", "media_mask")),
     "triggers": ("🎯 Триггеры", ("trig_on",)),
     "cmds": ("🔢 Счётчики", ("cmds_on", "cmds_guest_cd", "cmds_anywhere")),
+    "trust": ("🎖 Доверие", ("trust_on", "trust_soften", "trust_days",
+                              "trust_msgs", "trust_mask")),
     "warns": ("⚠️ Варны", ("warns_on", "warns_limit", "warns_punish",
                              "warns_mute_min")),
     "rules": ("📜 Правила в постах", ("rules_on",)),

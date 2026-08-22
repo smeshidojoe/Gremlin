@@ -290,7 +290,7 @@ def profile_sig(first_name: str | None, last_name: str | None, username: str | N
     return f"{first_name or ''}|{last_name or ''}|{username or ''}"
 
 
-async def check_user(bot, chat, user, settings, message=None) -> None:
+async def check_user(bot, chat, user, settings, message=None, lvl=None) -> None:
     """Полный цикл наблюдения: скоринг профиля (+сообщения), бан или карточка.
 
     Профиль скорится один раз на версию профиля (изменился — пересчёт).
@@ -315,6 +315,10 @@ async def check_user(bot, chat, user, settings, message=None) -> None:
     row = await db.watch_get(chat.id, user.id)
     profile_changed = row is None or row["sig"] != sig
 
+    # пороги зависят от доверия: гостю строже, ветерану мягче
+    from . import trust as trust_svc
+    suspect, ban_at = trust_svc.watch_thresholds(settings, lvl if lvl is not None else 1)
+
     now = int(time.time())
     saved = 0
     if row is not None and now - (row["score_ts"] or 0) <= SCORE_WINDOW:
@@ -330,16 +334,20 @@ async def check_user(bot, chat, user, settings, message=None) -> None:
     # Не участник чата (комментатор под постом канала) — тот же текст от него
     # весит больше: почти вся реклама приходит именно оттуда. Спрашиваем статус
     # только когда очки уже набежали, иначе это запрос на каждое сообщение.
-    if 0 < total < settings.watch_suspect:
+    if lvl is None and 0 < total < suspect:
+        # при включённом доверии надбавка не нужна: гостю уже занижен порог,
+        # и статус в чате там спрошен один раз на десять минут
         from . import adm_cache
         if not await adm_cache.is_member(bot, chat.id, user.id):
             total += GUEST_BOOST
             reasons.append("автор не состоит в чате")
+    if lvl is not None:
+        reasons.append(f"доверие: {trust_svc.label(lvl)}")
     # текст сообщения — только если человек что-то писал: на входе в чат его нет.
     # Ссылку даём: при подозрении сообщение остаётся в чате, его можно открыть.
     body = moderation.message_body(message, with_link=True)
     body_gone = moderation.message_body(message)   # для автобана: сообщение удалим
-    if total < settings.watch_suspect:
+    if total < suspect:
         await db.watch_set(chat.id, user.id, sig,
                            bool(row["flagged"]) if row is not None and not profile_changed
                            else False,
@@ -350,7 +358,7 @@ async def check_user(bot, chat, user, settings, message=None) -> None:
     why = ", ".join(reasons)
 
     # автобан по порогу
-    if settings.watch_ban and total >= settings.watch_ban:
+    if ban_at and total >= ban_at:
         if message is not None:
             try:
                 await message.delete()

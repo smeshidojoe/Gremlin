@@ -253,6 +253,19 @@ _DEATHS = (
 )
 
 
+# Уже выпавшая причина почти не повторяется: на пятерых игроков одна и та же
+# «бочка с огурцами» четыре раза выглядит как поломка, а не как шутка.
+REPEAT_WEIGHT = 0.05
+
+
+def _death(used: set[str]) -> str:
+    """Причина выбывания: свежая — обычный шанс, повторная — 5%."""
+    weights = [REPEAT_WEIGHT if d in used else 1.0 for d in _DEATHS]
+    pick = random.choices(_DEATHS, weights=weights, k=1)[0]
+    used.add(pick)
+    return pick
+
+
 @router.message(F.text.regexp(r"^!(битва|battle)(\s|$)"))
 async def cmd_battle(message: Message, bot: Bot) -> None:
     if not await _allowed(bot, message, config.GAME_BATTLE):
@@ -264,7 +277,7 @@ async def cmd_battle(message: Message, bot: Bot) -> None:
     sent = await message.answer(
         f"🏝 <b>Королевская битва!</b>\n\nВыживет один. Первый выбывший получает "
         f"{prize_label(kind, minutes)}, последний — славу.\n\n"
-        f"⏳ Сбор: {config.BATTLE_JOIN} сек\n👥 Бойцов: 0",
+        f"👥 Бойцов: 0\n⏳ До начала матча: {config.BATTLE_JOIN} сек",
         reply_markup=b.as_markup(),
     )
     key = (message.chat.id, sent.message_id)
@@ -286,6 +299,17 @@ async def cb_battle(cb: CallbackQuery, bot: Bot) -> None:
     await cb.answer("Ты на арене 🏝")
 
 
+async def _battle_draw(bot: Bot, chat_id: int, msg_id: int, log: list,
+                       left: int) -> None:
+    """Перерисовать сводку матча с таймером до следующего события."""
+    tail = f"\n\n⏳ Следующее событие через {left} сек" if left else ""
+    try:
+        await bot.edit_message_text("\n".join(log[-12:]) + tail, chat_id=chat_id,
+                                    message_id=msg_id, reply_markup=None)
+    except Exception:
+        pass          # текст не изменился или сообщение удалили
+
+
 async def _battle_run(bot: Bot, key: tuple[int, int]) -> None:
     chat_id, msg_id = key
     s = await db.get_settings(chat_id)
@@ -300,7 +324,8 @@ async def _battle_run(bot: Bot, key: tuple[int, int]) -> None:
         left -= min(10, left)
         try:
             await bot.edit_message_text(
-                f"{head}\n\n⏳ Сбор: {left} сек\n👥 Бойцов: {len(_battles.get(key, ()))}",
+                f"{head}\n\n👥 Бойцов: {len(_battles.get(key, ()))}\n"
+                f"⏳ До начала матча: {left} сек",
                 chat_id=chat_id, message_id=msg_id, reply_markup=b.as_markup())
         except Exception:
             pass
@@ -317,22 +342,26 @@ async def _battle_run(bot: Bot, key: tuple[int, int]) -> None:
         _later(bot, chat_id, msg_id)
         return
 
-    log = [f"🏝 <b>Королевская битва</b>\n\nНа арене {len(fighters)} "
+    used: set[str] = set()
+    log = ["🏝 <b>Сводка матча:</b>\n",
+           f"На арене {len(fighters)} "
            f"{utils.plural(len(fighters), 'боец', 'бойца', 'бойцов')}."]
     first_out = None
     while len(fighters) > 1:
-        await asyncio.sleep(config.BATTLE_TICK)
+        # тикаем чаще, чем выбиваем: внизу живой таймер до следующего события
+        for left in range(config.BATTLE_TICK, 0, -config.BATTLE_REFRESH):
+            await asyncio.sleep(min(config.BATTLE_REFRESH, left))
+            await _battle_draw(bot, chat_id, msg_id, log,
+                               max(0, left - config.BATTLE_REFRESH))
         dead = fighters.pop()
         first_out = first_out or dead
-        log.append(f"💀 {await _who(dead)} {random.choice(_DEATHS)}")
-        try:
-            await bot.edit_message_text("\n".join(log[-12:]), chat_id=chat_id,
-                                        message_id=msg_id, reply_markup=None)
-        except Exception:
-            pass
+        log.append(f"💀 {await _who(dead)} {_death(used)}")
+        await _battle_draw(bot, chat_id, msg_id, log,
+                           config.BATTLE_TICK if len(fighters) > 1 else 0)
 
     winner = fighters[0]
     tail = f"\n\n👑 Победитель: {await _who(winner)}"
+    log = [line for line in log if not line.startswith("⏳")]
     if first_out and await _can_target(bot, chat_id, first_out):
         ok = await _punish(bot, chat_id, first_out, kind, minutes,
                            "выбыл первым в королевской битве")
@@ -372,8 +401,7 @@ async def cmd_court(message: Message, bot: Bot) -> None:
         f"⚖️ <b>Народный суд</b>\n\n"
         f"Подсудимый: {utils.mention(accused.id, accused.full_name, accused.username)}\n"
         f"Обвинение: {utils.esc(charge)}\n\n"
-        f"⏳ Голосование {config.COURT_VOTE} сек · нужно минимум "
-        f"{config.COURT_MIN_VOTES} голосов\n👎 0 · 👍 0",
+        f"⏳ Голосование {config.COURT_VOTE} сек\n👎 0 · 👍 0",
         reply_markup=b.as_markup(),
     )
     key = (message.chat.id, sent.message_id)
@@ -381,8 +409,15 @@ async def cmd_court(message: Message, bot: Bot) -> None:
     asyncio.create_task(_court_run(bot, key))
 
 
+_CHEATS = (
+    "Дважды за одно и то же? В зале суда так не делают. Минута молчания — тебе.",
+    "Попытка накрутить голос замечена. Присяжный удаляется на минуту.",
+    "Один человек — один голос. За жульничество минута тишины.",
+)
+
+
 @router.callback_query(F.data.startswith("g:court:"))
-async def cb_court(cb: CallbackQuery) -> None:
+async def cb_court(cb: CallbackQuery, bot: Bot) -> None:
     key = (cb.message.chat.id, cb.message.message_id)
     court = _courts.get(key)
     if court is None:
@@ -391,8 +426,24 @@ async def cb_court(cb: CallbackQuery) -> None:
     if cb.from_user.id == court["accused"]:
         await cb.answer("Подсудимый не голосует.", show_alert=True)
         return
-    court["votes"][cb.from_user.id] = cb.data.endswith("1")
-    await cb.answer("Голос учтён")
+    guilty = cb.data.endswith("1")
+    was = court["votes"].get(cb.from_user.id)
+    if was is not None and was == guilty:
+        # жмёт свою же кнопку второй раз — накрутка
+        await cb.answer(random.choice(_CHEATS), show_alert=True)
+        if await _can_target(bot, key[0], cb.from_user.id):
+            await _punish(bot, key[0], cb.from_user.id, "mute",
+                          config.COURT_CHEAT_MUTE, "жульничал на голосовании")
+        return
+    court["votes"][cb.from_user.id] = guilty
+    await cb.answer("Голос изменён" if was is not None else "Голос учтён")
+
+
+async def _punish_by_court(bot: Bot, chat_id: int, court: dict) -> bool:
+    s = await db.get_settings(chat_id)
+    kind, minutes = await prize(s, config.GAME_COURT)
+    return await _punish(bot, chat_id, court["accused"], kind, minutes,
+                         f"приговор чата: {court['charge']}")
 
 
 async def _court_run(bot: Bot, key: tuple[int, int]) -> None:
@@ -409,13 +460,26 @@ async def _court_run(bot: Bot, key: tuple[int, int]) -> None:
             f"Обвинение: {utils.esc(court['charge'])}\n\n"
             f"👎 {guilty} · 👍 {innocent}\n\n")
 
-    if len(votes) < config.COURT_MIN_VOTES:
-        text = head + "Кворум не собрался — дело закрыто."
+    if not votes:
+        text = head + "Присяжные разошлись по домам. Дело закрыто за отсутствием суда."
+    elif len(votes) == 1:
+        voter, verdict = next(iter(votes.items()))
+        who_voted = await _who(voter)
+        if random.random() < 0.5:
+            text = (head + f"Голосовал ровно один человек ({who_voted}), и суд "
+                    f"счёл это несерьёзным. Дело закрыто.")
+        elif verdict:
+            ok = await _punish_by_court(bot, chat_id, court)
+            text = head + (f"Решением большинства (1 человека, {who_voted}) "
+                           f"подсудимый признан <b>виновным</b>." if ok
+                           else "🔨 Виновен, но приговор не исполнить — нет прав.")
+        else:
+            text = (head + f"Решением большинства (1 человека, {who_voted}) "
+                    f"подсудимый <b>оправдан</b>.")
     elif guilty > innocent:
+        ok = await _punish_by_court(bot, chat_id, court)
         s = await db.get_settings(chat_id)
         kind, minutes = await prize(s, config.GAME_COURT)
-        ok = await _punish(bot, chat_id, court["accused"], kind, minutes,
-                           f"приговор чата: {court['charge']}")
         text = head + (f"🔨 <b>Виновен!</b> Приговор — {prize_label(kind, minutes)}."
                        if ok
                        else "🔨 <b>Виновен!</b> Но приговор не исполнить — нет прав.")
@@ -432,41 +496,52 @@ async def _court_run(bot: Bot, key: tuple[int, int]) -> None:
 # ---------- титулы недели ----------
 
 async def titles_text(chat_id: int) -> str | None:
-    """Итоги недели по статистике сообщений. None — награждать некого."""
+    """Итоги недели по статистике сообщений. None — награждать некого.
+
+    Служебные аккаунты пропускаем: «Telegram» приносит в обсуждение посты
+    канала и по счётчику легко обгоняет живых людей.
+    """
     day = utils.day_num()
     people = {uid: f for uid, f in (await db.week_activity(chat_id)).items()
-              if f["week"] > 0}
+              if f["week"] > 0 and uid not in config.SERVICE_IDS}
     if not people:
         return None
 
     lines = ["🏆 <b>Титулы недели</b>\n"]
     top = max(people.items(), key=lambda kv: kv[1]["week"])
-    lines.append(f"🥇 <b>Болтун недели</b> — {await _who(top[0])} "
-                 f"({top[1]['week']} сообщений)")
+    lines.append(f"🥇 <b>Болтун недели</b> — {await _who(top[0])}\n"
+                 f"    больше всех сообщений за неделю: {top[1]['week']}")
 
     quiet = min(people.items(), key=lambda kv: kv[1]["week"])
     if quiet[0] != top[0]:
-        lines.append(f"🐢 <b>Молчун недели</b> — {await _who(quiet[0])} "
-                     f"({quiet[1]['week']} — но ведь был!)")
+        lines.append(f"🐢 <b>Молчун недели</b> — {await _who(quiet[0])}\n"
+                     f"    заходил, но сказал всего {quiet[1]['week']}")
 
-    rookies = {u: f for u, f in people.items() if (f["first_day"] or 0) >= day - 6}
+    rookies = {u: f for u, f in people.items()
+               if (f["first_day"] or 0) >= day - 6 and u != top[0]}
     if rookies:
         rookie = max(rookies.items(), key=lambda kv: kv[1]["week"])
-        lines.append(f"🌱 <b>Новичок недели</b> — {await _who(rookie[0])} "
-                     f"(ворвался с {rookie[1]['week']})")
+        lines.append(f"🌱 <b>Новичок недели</b> — {await _who(rookie[0])}\n"
+                     f"    впервые заговорил на этой неделе и сразу "
+                     f"{rookie[1]['week']}")
 
     grown = {u: f for u, f in people.items() if f["week"] > f["prev"] and f["prev"]}
     if grown:
         best = max(grown.items(), key=lambda kv: kv[1]["week"] - kv[1]["prev"])
-        delta = best[1]["week"] - best[1]["prev"]
-        lines.append(f"📈 <b>Прорыв недели</b> — {await _who(best[0])} (+{delta})")
+        was, now = best[1]["prev"], best[1]["week"]
+        lines.append(f"📈 <b>Прорыв недели</b> — {await _who(best[0])}\n"
+                     f"    разошёлся сильнее прошлой недели: было {was}, стало {now}")
 
     steady = [u for u, f in people.items() if f["days"] >= 7]
     if steady:
-        lines.append(f"🎯 <b>Железная дисциплина</b> — "
-                     f"{', '.join([await _who(u) for u in steady[:3]])} "
-                     f"(писали каждый день)")
+        who = ", ".join([await _who(u) for u in steady[:3]])
+        tail = f" и ещё {len(steady) - 3}" if len(steady) > 3 else ""
+        lines.append(f"🎯 <b>Железная дисциплина</b> — {who}{tail}\n"
+                     f"    не пропустили ни одного дня недели")
     return "\n".join(lines)
+
+
+TITLES_KEY = "titles_sent"       # метка недели, чтобы не разослать дважды
 
 
 async def titles_scheduler(bot: Bot) -> None:
@@ -481,6 +556,14 @@ async def titles_scheduler(bot: Bot) -> None:
         from datetime import timedelta
         target += timedelta(days=days_ahead)
         await asyncio.sleep(max(60, (target - now).total_seconds()))
+        # сон мог кончиться чуть раньше срока: тогда следующий круг проснётся
+        # снова в это же воскресенье. Метка недели не даёт разослать дважды.
+        stamp = utils.local_now().strftime("%G-%V")
+        if await db.kv_get(TITLES_KEY) == stamp:
+            continue
+        if utils.local_now().weekday() != 6:
+            continue                     # проснулись не в тот день — ждём дальше
+        await db.kv_set(TITLES_KEY, stamp)
         try:
             await send_titles(bot)
         except Exception:

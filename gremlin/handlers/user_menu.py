@@ -60,6 +60,7 @@ async def view_home(user_id: int, bot: Bot) -> tuple[str, InlineKeyboardMarkup]:
     """Единое меню — одинаковое для всех допущенных."""
     b = InlineKeyboardBuilder()
     b.button(text="💬 Чаты", callback_data="u:chats")
+    b.button(text="🕸 Сетки чатов", callback_data="u:netsh")
     if user_id in config.ADMIN_IDS:
         # служебные разделы и управление доступом — только владельцу бота
         b.button(text="📜 Лог событий", callback_data="a:log")
@@ -68,7 +69,7 @@ async def view_home(user_id: int, bot: Bot) -> tuple[str, InlineKeyboardMarkup]:
         b.button(text="👥 Доступ к боту", callback_data="u:acc")
         b.button(text="🎪 Приколы", callback_data="f:home")
     b.button(text="✖️ Закрыть", callback_data="u:close")
-    b.adjust(1, 2, 1, 1, 1, 1)
+    b.adjust(1, 1, 2, 1, 1, 1, 1)
     return _HOME_TEXT, b.as_markup()
 
 
@@ -278,7 +279,7 @@ async def view_chat(cid: int, viewer_id: int) -> tuple[str, InlineKeyboardMarkup
     b.button(text=f"📍 Лог-чат: {log_name}", callback_data=f"u:logsel:{cid}")
     net = await db.net_of_chat(cid)
     b.button(text=f"🕸 Сетка: {net['title'][:18] if net else 'нет'}",
-             callback_data=f"u:net:{cid}")
+             callback_data=f"u:netc:{cid}")
     b.button(text="📥 Перенести настройки", callback_data=f"u:cp:{cid}")
     b.button(text="🚪 Убрать бота из чата", callback_data=f"a:leave:{cid}")
     b.button(text="⬅️ Назад", callback_data="u:chats")
@@ -934,246 +935,343 @@ async def cb_game_access(cb: CallbackQuery) -> None:
 
 _LIFT_LABEL = {"any": "любой чат", "source": "только тот, где выдали"}
 
+NET_CHATS_PER_PAGE = 8
 
-async def view_net(cid: int) -> tuple[str, InlineKeyboardMarkup]:
-    """Сетки чатов: наказание в одном чате сетки применяется в остальных её чатах."""
-    ch = await db.get_chat(cid)
-    owner = ch["owner_id"] if ch else None
-    net = await db.net_of_chat(cid)
-    b = InlineKeyboardBuilder()
 
+async def _my_nets(viewer_id: int) -> list:
+    """Сетки, которыми человек вправе управлять."""
+    if viewer_id in config.ADMIN_IDS:
+        return await db.nets_all()
+    return await db.nets_of(viewer_id)
+
+
+async def _net_guard(cb: CallbackQuery, net_id: int):
+    """Сетка + проверка прав. None — чужая или удалена."""
+    net = await db.net_get(net_id)
+    if net is None:
+        await cb.answer("Сетка удалена.", show_alert=True)
+        return None
+    if cb.from_user.id != net["owner_id"] and cb.from_user.id not in config.ADMIN_IDS:
+        await cb.answer("Это чужая сетка.", show_alert=True)
+        return None
+    return net
+
+
+# Откуда человек вошёл в сетки: 0 — из главного меню, иначе id чата. Нужно,
+# чтобы «Назад» возвращал туда же, откуда пришли, а не всегда в главное меню.
+_net_origin: dict[int, int] = {}
+
+
+def _net_back(viewer_id: int) -> str:
+    cid = _net_origin.get(viewer_id, 0)
+    return f"u:c:{cid}" if cid else "u:home"
+
+
+async def view_nets(viewer_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Список сеток: отсюда всё и настраивается."""
+    nets = await _my_nets(viewer_id)
+    mine = [n for n in nets if n["owner_id"] == viewer_id]
     lines = [
         "<b>🕸 Сетки чатов</b>\n",
-        "Наказание, выданное в одном чате сетки, автоматически применяется "
-        "в остальных её чатах. Сеток может быть несколько — чаты разных "
-        "сообществ не обязаны делить баны.\n",
+        "Сетка — группа ваших чатов, между которыми разъезжаются наказания: "
+        "бан в одном применяется во всех остальных. Чат состоит ровно в одной "
+        "сетке или ни в одной.\n",
     ]
-    if owner is None:
-        lines.append("⚠️ У чата не отмечен владелец — сетки недоступны.")
-        b.row(_btn("⬅️ Назад", f"u:c:{cid}"))
-        return "\n".join(lines), b.as_markup()
+    b = InlineKeyboardBuilder()
+    if not nets:
+        lines.append("Пока ни одной сетки.")
+    for n in nets:
+        chats = await db.net_chats(n["id"])
+        tag = ""
+        if viewer_id in config.ADMIN_IDS and n["owner_id"] != viewer_id:
+            tag = f" · {await db.user_handle(n['owner_id'])}"
+        lines.append(f"• <b>{utils.esc(n['title'])}</b> — "
+                     f"{len(chats)} {utils.plural(len(chats), 'чат', 'чата', 'чатов')}{tag}")
+        b.row(_btn(f"🕸 {n['title'][:26]} ({len(chats)}){tag}",
+                   f"u:netv:{n['id']}"))
+    if len(mine) < config.NET_LIMIT:
+        b.row(InlineKeyboardButton(text="🆕 Создать сетку",
+                                   callback_data="u:netnew",
+                                   style="success"))
+    else:
+        lines.append(f"\n<i>Лимит: {config.NET_LIMIT} сетки на человека.</i>")
+    b.row(_btn("⬅️ Назад", _net_back(viewer_id)))
+    return "\n".join(lines), b.as_markup()
 
-    nets = await db.nets_of(owner)
+
+async def view_net(net_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Одна сетка: её чаты и что между ними синхронизируется."""
+    net = await db.net_get(net_id)
+    b = InlineKeyboardBuilder()
     if net is None:
-        lines.append("Этот чат <b>вне сеток</b>.")
-        if nets:
-            lines.append("\nВыберите, куда его добавить:")
-        for n in nets:
-            mates = len(await db.net_chats(n["id"]))
-            b.row(_btn(f"➕ {n['title'][:24]} ({mates})", f"u:netpick:{cid}:{n['id']}"))
-        if len(nets) < config.NET_LIMIT:
-            b.row(InlineKeyboardButton(text="🆕 Создать сетку",
-                                       callback_data=f"u:netnew:{cid}", style="success"))
-        else:
-            lines.append(f"\n<i>Лимит сеток: {config.NET_LIMIT}. Чтобы завести новую, "
-                         f"удалите лишнюю в одном из её чатов.</i>")
-        lines.append(f"\n<i>Сеток у вас: {len(nets)} из {config.NET_LIMIT}.</i>")
-        b.row(_btn("⬅️ Назад", f"u:c:{cid}"))
-        return "\n".join(lines), b.as_markup()
+        b.row(_btn("⬅️ К сеткам", "u:nets"))
+        return "Сетка удалена.", b.as_markup()
 
-    mates = await db.net_chats(net["id"])
-    lines.append(f"Сеток у вас: <b>{len(nets)}</b> из {config.NET_LIMIT}\n")
-    lines.append(f"Сетка: <b>{utils.esc(net['title'])}</b> · "
-                 f"{len(mates)} {utils.plural(len(mates), 'чат', 'чата', 'чатов')}")
-    lines += [f"• {utils.esc(c['title'] or c['chat_id'])}"
-              + (" ← этот" if c["chat_id"] == cid else "") for c in mates[:15]]
-    if len(mates) > 15:
-        lines.append(f"…и ещё {len(mates) - 15}")
-    if len(mates) < 2:
-        lines.append("\n<i>Пока в сетке один чат, рассылать некуда.</i>")
+    chats = await db.net_chats(net_id)
+    lines = [
+        f"<b>🕸 {utils.esc(net['title'])}</b>\n",
+        f"Чатов в сетке: <b>{len(chats)}</b>",
+    ]
+    if not chats:
+        lines.append("\nПока пусто — добавьте чаты кнопкой ниже.")
+    elif len(chats) == 1:
+        lines.append("\n<i>Пока чат один, рассылать некуда.</i>")
 
+    for c in chats:
+        b.row(_btn(f"❌ {(c['title'] or c['chat_id'])}"[:40],
+                   f"u:netrm:{net_id}:{c['chat_id']}"))
+    b.row(InlineKeyboardButton(text="➕ Добавить чат",
+                               callback_data=f"u:netadd:{net_id}:0", style="success"))
     row = []
     for bit, label in config.NET_BITS:
         mark = "✅" if net["sync_mask"] & bit else "🚫"
-        row.append(_btn(f"{mark} {label}", f"u:netb:{cid}:{bit}"))
+        row.append(_btn(f"{mark} {label}", f"u:netb:{net_id}:{bit}"))
         if len(row) == 2:
             b.row(*row)
             row = []
     if row:
         b.row(*row)
-    b.row(_btn(f"🔓 Снимать может: {_LIFT_LABEL[net['lift_mode']]}", f"u:netl:{cid}"))
-    b.row(_btn("✏️ Переименовать", f"u:netren:{cid}"))
-    # переезд в другую сетку и создание новой доступны и отсюда: иначе, когда все
-    # чаты уже в одной сетке, вторую негде было бы завести
-    others = [n for n in await db.nets_of(owner) if n["id"] != net["id"]]
-    for n in others:
-        mates_n = len(await db.net_chats(n["id"]))
-        b.row(_btn(f"🔀 Перенести в «{n['title'][:20]}» ({mates_n})",
-                   f"u:netpick:{cid}:{n['id']}"))
-    if len(others) + 1 < config.NET_LIMIT:
-        b.row(_btn("🆕 Создать ещё сетку и перенести сюда чат", f"u:netnew:{cid}"))
-    if len(mates) > 1:
-        b.row(_btn("📥 Применить активные баны сетки", f"u:netim:{cid}"))
-    b.row(InlineKeyboardButton(text="🚪 Убрать чат из сетки",
-                               callback_data=f"u:netout:{cid}", style="danger"))
-    b.row(InlineKeyboardButton(text="🗑 Удалить сетку целиком",
-                               callback_data=f"u:netdel:{cid}", style="danger"))
-    b.row(_btn("⬅️ Назад", f"u:c:{cid}"))
+    b.row(_btn(f"🔓 Снимать может: {_LIFT_LABEL[net['lift_mode']]}", f"u:netl:{net_id}"))
+    b.row(_btn("✏️ Переименовать", f"u:netren:{net_id}"))
+    if len(chats) > 1:
+        b.row(_btn("📥 Разослать активные баны по сетке", f"u:netim:{net_id}"))
+    b.row(InlineKeyboardButton(text="🗑 Удалить сетку", callback_data=f"u:netdel:{net_id}",
+                               style="danger"))
+    b.row(_btn("⬅️ К сеткам", "u:nets"))
     return "\n".join(lines), b.as_markup()
 
 
-async def _net_or_none(cb: CallbackQuery, cid: int):
-    """Сетка чата с проверкой прав. None — делать нечего."""
-    if not await _guard(cb, cid):
-        return None
-    net = await db.net_of_chat(cid)
+async def view_net_add(net_id: int, viewer_id: int,
+                       page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """Какие чаты можно положить в эту сетку."""
+    net = await db.net_get(net_id)
+    b = InlineKeyboardBuilder()
     if net is None:
-        await cb.answer("Чат не в сетке.", show_alert=True)
-    return net
+        b.row(_btn("⬅️ К сеткам", "u:nets"))
+        return "Сетка удалена.", b.as_markup()
+
+    # только чаты того же владельца: чужие в сетку не затащить
+    free = [c for c in await db.chats_for(viewer_id)
+            if c["owner_id"] == net["owner_id"] and c["net_id"] != net_id]
+    pages = max(1, -(-len(free) // NET_CHATS_PER_PAGE))
+    page = max(0, min(page, pages - 1))
+    lines = [f"<b>➕ В сетку «{utils.esc(net['title'])}»</b>\n"]
+    if not free:
+        lines.append("Все ваши чаты уже здесь.")
+    else:
+        lines.append("Выберите чат. Если он состоит в другой сетке, то переедет "
+                     "сюда — чат может быть только в одной.")
+    for c in free[page * NET_CHATS_PER_PAGE:(page + 1) * NET_CHATS_PER_PAGE]:
+        busy = await db.net_get(c["net_id"]) if c["net_id"] else None
+        mark = f" · сейчас в «{busy['title'][:14]}»" if busy else ""
+        b.row(_btn(f"{(c['title'] or c['chat_id'])}"[:30] + mark,
+                   f"u:netput:{net_id}:{c['chat_id']}"))
+    if pages > 1:
+        b.row(_btn("◀", f"u:netadd:{net_id}:{(page - 1) % pages}"),
+              _btn(f"{page + 1}/{pages}", f"u:netadd:{net_id}:{page}"),
+              _btn("▶", f"u:netadd:{net_id}:{(page + 1) % pages}"))
+    b.row(_btn("⬅️ Назад", f"u:netv:{net_id}"))
+    return "\n".join(lines), b.as_markup()
 
 
-async def _net_redraw(cb: CallbackQuery, cid: int, note: str = "") -> None:
-    text, kb = await view_net(cid)
+async def _net_redraw(cb: CallbackQuery, net_id: int, note: str = "") -> None:
+    text, kb = await view_net(net_id)
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer(note)
 
 
-@router.callback_query(F.data.startswith("u:net:"))
-async def cb_net(cb: CallbackQuery, state: FSMContext) -> None:
+@router.callback_query(F.data == "u:netsh")
+async def cb_nets_home(cb: CallbackQuery, state: FSMContext) -> None:
+    """Вход из главного меню: дальше «Назад» ведёт туда же."""
+    _net_origin[cb.from_user.id] = 0
+    await cb_nets(cb, state)
+
+
+@router.callback_query(F.data == "u:nets")
+async def cb_nets(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    text, kb = await view_nets(cb.from_user.id)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:netc:"))
+async def cb_net_of_chat(cb: CallbackQuery) -> None:
+    """Кнопка из карточки чата: открыть его сетку или общий список."""
     cid = int(cb.data.split(":")[2])
     if not await _guard(cb, cid):
+        return
+    _net_origin[cb.from_user.id] = cid          # «Назад» вернёт в карточку чата
+    net = await db.net_of_chat(cid)
+    if net is None:
+        text, kb = await view_nets(cb.from_user.id)
+    else:
+        text, kb = await view_net(net["id"])
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:netv:"))
+async def cb_net_view(cb: CallbackQuery, state: FSMContext) -> None:
+    net = await _net_guard(cb, int(cb.data.split(":")[2]))
+    if net is None:
         return
     await state.clear()
-    await _net_redraw(cb, cid)
+    await _net_redraw(cb, net["id"])
 
 
-@router.callback_query(F.data.startswith("u:netpick:"))
-async def cb_net_pick(cb: CallbackQuery) -> None:
-    _, _, cid, net_id = cb.data.split(":")
-    cid, net_id = int(cid), int(net_id)
-    if not await _guard(cb, cid):
+@router.callback_query(F.data.startswith("u:netadd:"))
+async def cb_net_add(cb: CallbackQuery) -> None:
+    _, _, net_id, page = cb.data.split(":")
+    net = await _net_guard(cb, int(net_id))
+    if net is None:
         return
+    text, kb = await view_net_add(net["id"], cb.from_user.id, int(page))
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:netput:"))
+async def cb_net_put(cb: CallbackQuery) -> None:
+    _, _, net_id, cid = cb.data.split(":")
+    net = await _net_guard(cb, int(net_id))
+    if net is None:
+        return
+    cid = int(cid)
     ch = await db.get_chat(cid)
-    net = await db.net_get(net_id)
-    if net is None or net["owner_id"] != ch["owner_id"]:
-        await cb.answer("Это чужая сетка.", show_alert=True)
+    if ch is None or ch["owner_id"] != net["owner_id"]:
+        await cb.answer("Этот чат не ваш.", show_alert=True)
         return
-    await db.net_assign(cid, net_id)
-    await _net_redraw(cb, cid, "Чат в сетке")
+    await db.net_assign(cid, net["id"])
+    text, kb = await view_net_add(net["id"], cb.from_user.id, 0)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer("Чат в сетке")
 
 
-@router.callback_query(F.data.startswith("u:netout:"))
-async def cb_net_out(cb: CallbackQuery) -> None:
-    cid = int(cb.data.split(":")[2])
-    if not await _guard(cb, cid):
+@router.callback_query(F.data.startswith("u:netrm:"))
+async def cb_net_remove(cb: CallbackQuery) -> None:
+    _, _, net_id, cid = cb.data.split(":")
+    net = await _net_guard(cb, int(net_id))
+    if net is None:
         return
-    await db.net_assign(cid, None)
-    await _net_redraw(cb, cid, "Убран из сетки")
+    await db.net_assign(int(cid), None)
+    await _net_redraw(cb, net["id"], "Чат убран из сетки")
 
 
-@router.callback_query(F.data.startswith("u:netnew:"))
+@router.callback_query(F.data == "u:netnew")
 async def cb_net_new(cb: CallbackQuery, state: FSMContext) -> None:
-    cid = int(cb.data.split(":")[2])
-    if not await _guard(cb, cid):
+    if len(await db.nets_of(cb.from_user.id)) >= config.NET_LIMIT:
+        await cb.answer(f"Больше {config.NET_LIMIT} сеток нельзя.", show_alert=True)
         return
     await _ask(
         cb, state, Input.net_title,
         "<b>🕸 Новая сетка</b>\n\nПришлите название — по нему вы будете узнавать её "
-        "в других чатах. Например: <code>Основные</code> или <code>Игровые</code>.",
-        f"u:net:{cid}", cid=cid, net_id=0,
+        "в списке. Например: <code>Основные</code> или <code>Игровые</code>.\n"
+        "Чаты добавите следующим шагом.",
+        "u:nets", net_id=0,
     )
 
 
 @router.callback_query(F.data.startswith("u:netren:"))
 async def cb_net_rename(cb: CallbackQuery, state: FSMContext) -> None:
-    cid = int(cb.data.split(":")[2])
-    net = await _net_or_none(cb, cid)
+    net = await _net_guard(cb, int(cb.data.split(":")[2]))
     if net is None:
         return
     await _ask(
         cb, state, Input.net_title,
         f"<b>🕸 Название сетки</b>\n\nСейчас: <code>{utils.esc(net['title'])}</code>\n"
         f"Пришлите новое.",
-        f"u:net:{cid}", cid=cid, net_id=net["id"],
+        f"u:netv:{net['id']}", net_id=net["id"],
     )
 
 
 @router.message(StateFilter(Input.net_title))
 async def net_title_input(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
-    cid, net_id = data["cid"], data["net_id"]
+    net_id = data.get("net_id") or 0
     title = (message.text or "").strip()
     if title == "/cancel" or not title:
-        await _done(message, bot, state, await view_net(cid))
+        view = await (view_net(net_id) if net_id else view_nets(message.from_user.id))
+        await _done(message, bot, state, view)
         return
-    ch = await db.get_chat(cid)
     if net_id:
         await db.net_set(net_id, "title", title[:40])
-        note = "✅ Переименовано.\n\n"
-    else:
-        new_id = await db.net_create(ch["owner_id"], title)
-        if new_id is None:
-            await _done(message, bot, state, await view_net(cid),
-                        f"⚠️ Больше {config.NET_LIMIT} сеток нельзя.\n\n")
-            return
-        await db.net_assign(cid, new_id)
-        note = "✅ Сетка создана, чат в ней.\n\n"
-    await _done(message, bot, state, await view_net(cid), note)
+        await _done(message, bot, state, await view_net(net_id), "✅ Переименовано.\n\n")
+        return
+    new_id = await db.net_create(message.from_user.id, title)
+    if new_id is None:
+        await _done(message, bot, state, await view_nets(message.from_user.id),
+                    f"⚠️ Больше {config.NET_LIMIT} сеток нельзя.\n\n")
+        return
+    await _done(message, bot, state, await view_net(new_id),
+                "✅ Сетка создана. Теперь добавьте в неё чаты.\n\n")
 
 
 @router.callback_query(F.data.startswith("u:netdel:"))
 async def cb_net_delete(cb: CallbackQuery) -> None:
-    cid = int(cb.data.split(":")[2])
-    net = await _net_or_none(cb, cid)
+    net = await _net_guard(cb, int(cb.data.split(":")[2]))
     if net is None:
         return
     await db.net_delete(net["id"])
-    await _net_redraw(cb, cid, "Сетка удалена")
+    text, kb = await view_nets(cb.from_user.id)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer("Сетка удалена")
 
 
 @router.callback_query(F.data.startswith("u:netb:"))
 async def cb_net_bit(cb: CallbackQuery) -> None:
-    _, _, cid, bit = cb.data.split(":")
-    cid, bit = int(cid), int(bit)
-    net = await _net_or_none(cb, cid)
+    _, _, net_id, bit = cb.data.split(":")
+    net = await _net_guard(cb, int(net_id))
     if net is None:
         return
-    await db.net_set(net["id"], "sync_mask", net["sync_mask"] ^ bit)
-    await _net_redraw(cb, cid)
+    await db.net_set(net["id"], "sync_mask", net["sync_mask"] ^ int(bit))
+    await _net_redraw(cb, net["id"])
 
 
 @router.callback_query(F.data.startswith("u:netl:"))
 async def cb_net_lift(cb: CallbackQuery) -> None:
-    cid = int(cb.data.split(":")[2])
-    net = await _net_or_none(cb, cid)
+    net = await _net_guard(cb, int(cb.data.split(":")[2]))
     if net is None:
         return
     await db.net_set(net["id"], "lift_mode",
                      "source" if net["lift_mode"] == "any" else "any")
-    await _net_redraw(cb, cid)
+    await _net_redraw(cb, net["id"])
 
 
 @router.callback_query(F.data.startswith("u:netim:"))
 async def cb_net_import(cb: CallbackQuery, bot: Bot) -> None:
-    """Разовый завоз: применить в этом чате активные баны остальных чатов сетки.
+    """Свести активные баны сетки: у кого где висит — применить во всех её чатах.
 
-    Только вручную: чат мог жить своей жизнью, и внезапная пачка чужих банов
+    Только вручную: чаты могли жить своей жизнью, и внезапная пачка чужих банов
     должна быть осознанным решением.
     """
     from ..services import moderation, net as netsvc
-    cid = int(cb.data.split(":")[2])
-    if not await _guard(cb, cid):
+    net = await _net_guard(cb, int(cb.data.split(":")[2]))
+    if net is None:
         return
-    await cb.answer("Завожу баны сетки, это займёт время…")
+    await cb.answer("Свожу баны сетки, это займёт время…")
+    chats = await db.net_chats(net["id"])
     seen: dict[int, str] = {}
-    for peer in await db.net_peers(cid):
-        for p in await db.active_punishments(peer["chat_id"], limit=MASS_LIMIT):
+    for c in chats:
+        for p in await db.active_punishments(c["chat_id"], limit=MASS_LIMIT):
             if p["kind"] == "ban" and p["user_id"] > 0:
                 seen.setdefault(p["user_id"], p["reason"] or "бан в сетке")
     done = failed = 0
     for uid, reason in list(seen.items())[:MASS_LIMIT]:
-        if await db.active_punishment_of(cid, uid, "ban") is not None:
-            continue
-        await asyncio.sleep(config.NET_DELAY)
         user = await netsvc.user_stub(uid)
-        pid = await moderation.apply_punishment(bot, cid, user, "ban", 0,
-                                                f"сетка: {reason}", cb.from_user.id)
-        if pid:
-            done += 1
-        else:
-            failed += 1
-    await db.add_event(cid, "manual", f"завоз банов сетки: {done} шт.")
-    text, kb = await view_net(cid)
+        for c in chats:
+            if await db.active_punishment_of(c["chat_id"], uid, "ban") is not None:
+                continue
+            await asyncio.sleep(config.NET_DELAY)
+            pid = await moderation.apply_punishment(
+                bot, c["chat_id"], user, "ban", 0, f"сетка: {reason}", cb.from_user.id)
+            if pid:
+                done += 1
+            else:
+                failed += 1
+    for c in chats:
+        await db.add_event(c["chat_id"], "manual", "сведение банов сетки")
+    text, kb = await view_net(net["id"])
     await cb.message.edit_text(
         text + f"\n\n📥 Заведено банов: <b>{done}</b>"
         + (f" · не удалось: {failed}" if failed else ""),
@@ -1710,12 +1808,16 @@ async def cb_welcome_text(cb: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(StateFilter(Input.welcome))
 async def welcome_input(message: Message, state: FSMContext, bot: Bot) -> None:
-    text = (message.text or "").strip()
+    # html_text сохраняет разметку и премиум-эмодзи так, как их набрали
+    text = (message.html_text if message.text else "").strip()
     data = await state.get_data()
     cid = data["cid"]
+    note = ""
     if text != "/cancel":
         await db.set_setting(cid, "welcome_text", None if text == "-" else text)
-    await _done(message, bot, state, await view_section(cid, "welcome"))
+        if utils.has_premium_emoji(text):
+            note = "✨ Премиум-эмодзи сохранены.\n\n"
+    await _done(message, bot, state, await view_section(cid, "welcome"), note)
 
 
 
@@ -2281,7 +2383,9 @@ async def cb_answer_add(cb: CallbackQuery, state: FSMContext) -> None:
     if len(await db.ans_list(ANS_OWNER[code], oid)) >= ANS_LIMIT:
         await cb.answer(f"Лимит {ANS_LIMIT} вариантов.", show_alert=True)
         return
-    hint = ("Пришлите текст, медиа или медиа с подписью."
+    hint = ("Пришлите текст, медиа или медиа с подписью.\n"
+            "Форматирование и премиум-эмодзи сохраняются; вставить премиум-эмодзи "
+            "может только человек с Telegram Premium."
             if code in ("t", "r") else "Пришлите текст ответа. Число в скобках бот допишет сам.")
     await _ask(
         cb, state, Input.ans_new,
@@ -2316,7 +2420,10 @@ async def ans_new_input(message: Message, state: FSMContext, bot: Bot) -> None:
                          "<b>🎲 Новый вариант ответа</b>\n\n⚠️ Не смог скачать файл, попробуйте ещё раз.")
             return
     await db.ans_add(ANS_OWNER[code], oid, text or None, path, media.kind if media else None)
-    await _done(message, bot, state, await view_answers(cid, code, oid, 0), "✅ Вариант добавлен.\n\n")
+    note = "✅ Вариант добавлен."
+    if utils.has_premium_emoji(text):
+        note += " ✨ Премиум-эмодзи сохранены."
+    await _done(message, bot, state, await view_answers(cid, code, oid, 0), note + "\n\n")
 
 
 @router.callback_query(F.data.startswith("u:cml:"))

@@ -180,6 +180,16 @@ def plural(n: int, one: str, few: str, many: str) -> str:
     return many
 
 
+def has_premium_emoji(text: str | None) -> bool:
+    """Есть ли в сохранённом тексте премиум-эмодзи.
+
+    Telegram отдаёт их отдельной сущностью, а aiogram разворачивает в тег
+    <tg-emoji>. Если тега нет — значит отправитель прислал обычный эмодзи:
+    ставить премиум-эмодзи умеют только люди с подпиской.
+    """
+    return "<tg-emoji" in (text or "")
+
+
 def esc(text: str | None) -> str:
     return html.escape(text or "")
 

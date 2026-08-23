@@ -214,7 +214,8 @@ async def _candidates(bot: Bot, chat_id: int) -> list[int]:
     me = (await bot.me()).id
     out = []
     for uid in await db.active_writers(chat_id, ACTIVE_DAYS):
-        if uid in admins or uid == me or uid in config.ADMIN_IDS or uid < 0:
+        if (uid in admins or uid == me or uid in config.ADMIN_IDS or uid < 0
+                or uid in config.SERVICE_IDS):
             continue
         row = await db.get_user(uid)
         if row and row["banned"]:

@@ -712,7 +712,8 @@ async def on_join(message: Message, bot: Bot) -> None:
                 # во время капчи оставлял человека немым навсегда. Срок ставим с
                 # запасом — обычно мут снимает кнопка или кик по таймауту.
                 await bot.restrict_chat_member(
-                    message.chat.id, user.id, permissions=moderation.MUTE_PERMS,
+                    message.chat.id, user.id,
+                    permissions=moderation.mute_perms(s.mute_reactions),
                     until_date=int(time.time()) + s.captcha_timeout + 60,
                 )
             except Exception:
@@ -779,7 +780,10 @@ async def moderate(message: Message, bot: Bot) -> None:
     user = message.from_user
 
     # статистику ведём и по бэклогу: сообщения-то были
-    if user is not None and not user.is_bot and message.edit_date is None:
+    if (user is not None and not user.is_bot and message.edit_date is None
+            and user.id not in config.SERVICE_IDS):
+        # служебный аккаунт Telegram приносит в обсуждение посты канала —
+        # это не человек, и в статистике чата его быть не должно
         await db.msg_inc(chat.id, user.id, user.username, user.first_name)
 
     # а вот модерировать задним числом не надо — админы уже всё разрулили

@@ -41,7 +41,7 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
     "warns": ("⚠️ Варны", ("warns_on", "warns_limit", "warns_punish",
                              "warns_mute_min")),
     "rules": ("📜 Правила в постах", ("rules_on",)),
-    "punish_cfg": ("⚙️ Настройки наказаний", ("misuse_mute",)),
+    "punish_cfg": ("⚙️ Настройки наказаний", ("misuse_mute", "mute_reactions")),
     "games": ("🎪 Приколы", ("games_on", "games_adm", "rus_punish", "rus_min",
                "duel_punish", "duel_min", "battle_punish", "battle_min",
                "court_punish", "court_min")),

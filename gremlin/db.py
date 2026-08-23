@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS settings(
     service_leave   INTEGER NOT NULL DEFAULT 0,
     service_other   INTEGER NOT NULL DEFAULT 0,
     misuse_mute     INTEGER NOT NULL DEFAULT 5,
+    mute_reactions  INTEGER NOT NULL DEFAULT 1,
     warns_on        INTEGER NOT NULL DEFAULT 0,
     warns_limit     INTEGER NOT NULL DEFAULT 3,
     warns_punish    TEXT    NOT NULL DEFAULT 'mute',
@@ -302,6 +303,7 @@ class Settings:
     service_leave: int = 0
     service_other: int = 0
     misuse_mute: int = 5
+    mute_reactions: int = 1
     warns_on: int = 0
     warns_limit: int = 3
     warns_punish: str = "mute"
@@ -351,6 +353,7 @@ _SETTINGS_MIGRATIONS = {
     "inline_spam": "INTEGER NOT NULL DEFAULT 40",
     "cmds_anywhere": "INTEGER NOT NULL DEFAULT 0",
     "misuse_mute": "INTEGER NOT NULL DEFAULT 5",
+    "mute_reactions": "INTEGER NOT NULL DEFAULT 1",
     "warns_on": "INTEGER NOT NULL DEFAULT 0",
     "warns_limit": "INTEGER NOT NULL DEFAULT 3",
     "warns_punish": "TEXT NOT NULL DEFAULT 'mute'",
@@ -1448,6 +1451,12 @@ async def kv_get(key: str) -> str | None:
 async def nets_of(owner_id: int) -> list[aiosqlite.Row]:
     cur = await _db.execute(
         "SELECT * FROM nets WHERE owner_id = ? ORDER BY created", (owner_id,))
+    return await cur.fetchall()
+
+
+async def nets_all() -> list[aiosqlite.Row]:
+    """Все сетки всех владельцев — это видит только владелец бота."""
+    cur = await _db.execute("SELECT * FROM nets ORDER BY owner_id, created")
     return await cur.fetchall()
 
 

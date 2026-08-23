@@ -30,6 +30,7 @@ UNMUTE_PERMS = ChatPermissions(
 )
 
 MUTE_PERMS = ChatPermissions(
+    can_react_to_messages=False,
     can_send_messages=False,
     can_send_audios=False,
     can_send_documents=False,
@@ -41,6 +42,11 @@ MUTE_PERMS = ChatPermissions(
     can_send_other_messages=False,
     can_add_web_page_previews=False,
 )
+
+def mute_perms(reactions: bool) -> ChatPermissions:
+    """Права замученного. Реакции оставляем, если чат так настроен."""
+    return MUTE_PERMS.model_copy(update={"can_react_to_messages": bool(reactions)})
+
 
 KIND_EMOJI = {"ban": "⛔", "mute": "🔇", "delete": "🗑", "banchan": "📛"}
 KIND_LABEL = {"ban": "Бан", "mute": "Мут", "delete": "Удаление", "banchan": "Бан отправителя-канала"}
@@ -203,8 +209,10 @@ async def punish_ex(bot: Bot, chat_id: int, user: User, kind: str, mute_min: int
     member = await adm_cache.is_member(bot, chat_id, user.id)
     try:
         if kind == "mute":
+            s = await db.get_settings(chat_id)
             await bot.restrict_chat_member(
-                chat_id, user.id, permissions=MUTE_PERMS, until_date=until
+                chat_id, user.id, permissions=mute_perms(s.mute_reactions),
+                until_date=until,
             )
         elif kind == "ban":
             await bot.ban_chat_member(chat_id, user.id)
@@ -232,8 +240,10 @@ async def apply_punishment(bot: Bot, chat_id: int, user: User, kind: str,
     member = await adm_cache.is_member(bot, chat_id, user.id)
     try:
         if kind == "mute":
+            s = await db.get_settings(chat_id)
             await bot.restrict_chat_member(
-                chat_id, user.id, permissions=MUTE_PERMS, until_date=until
+                chat_id, user.id, permissions=mute_perms(s.mute_reactions),
+                until_date=until,
             )
         elif kind == "ban":
             await bot.ban_chat_member(chat_id, user.id)

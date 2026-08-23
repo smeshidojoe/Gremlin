@@ -99,6 +99,16 @@ CREATE TABLE IF NOT EXISTS settings(
     trust_days      INTEGER NOT NULL DEFAULT 3,
     trust_msgs      INTEGER NOT NULL DEFAULT 20,
     trust_mask      INTEGER NOT NULL DEFAULT 31,
+    games_on        INTEGER NOT NULL DEFAULT 0,
+    games_adm       INTEGER NOT NULL DEFAULT 0,
+    rus_punish      TEXT    NOT NULL DEFAULT 'mute',
+    rus_min         INTEGER NOT NULL DEFAULT 5,
+    duel_punish     TEXT    NOT NULL DEFAULT 'mute',
+    duel_min        INTEGER NOT NULL DEFAULT 10,
+    battle_punish   TEXT    NOT NULL DEFAULT 'mute',
+    battle_min      INTEGER NOT NULL DEFAULT 5,
+    court_punish    TEXT    NOT NULL DEFAULT 'mute',
+    court_min       INTEGER NOT NULL DEFAULT 15,
     cards_on        INTEGER NOT NULL DEFAULT 1,
     card_mask       INTEGER NOT NULL DEFAULT 4095,
     log_chat_id     INTEGER
@@ -302,6 +312,16 @@ class Settings:
     trust_days: int = 3
     trust_msgs: int = 20
     trust_mask: int = 31
+    games_on: int = 0
+    games_adm: int = 0
+    rus_punish: str = "mute"
+    rus_min: int = 5
+    duel_punish: str = "mute"
+    duel_min: int = 10
+    battle_punish: str = "mute"
+    battle_min: int = 5
+    court_punish: str = "mute"
+    court_min: int = 15
     cards_on: int = 1
     card_mask: int = 4095
     log_chat_id: int | None = None
@@ -341,6 +361,16 @@ _SETTINGS_MIGRATIONS = {
     "trust_days": "INTEGER NOT NULL DEFAULT 3",
     "trust_msgs": "INTEGER NOT NULL DEFAULT 20",
     "trust_mask": "INTEGER NOT NULL DEFAULT 31",
+    "games_on": "INTEGER NOT NULL DEFAULT 0",
+    "games_adm": "INTEGER NOT NULL DEFAULT 0",
+    "rus_punish": "TEXT NOT NULL DEFAULT 'mute'",
+    "rus_min": "INTEGER NOT NULL DEFAULT 5",
+    "duel_punish": "TEXT NOT NULL DEFAULT 'mute'",
+    "duel_min": "INTEGER NOT NULL DEFAULT 10",
+    "battle_punish": "TEXT NOT NULL DEFAULT 'mute'",
+    "battle_min": "INTEGER NOT NULL DEFAULT 5",
+    "court_punish": "TEXT NOT NULL DEFAULT 'mute'",
+    "court_min": "INTEGER NOT NULL DEFAULT 15",
     "links_guest_punish": "TEXT NOT NULL DEFAULT 'delete'",
     "links_guest_mute_min": "INTEGER NOT NULL DEFAULT 60",
     "lp_tg": "TEXT NOT NULL DEFAULT 'delete'",
@@ -1252,6 +1282,39 @@ async def msg_inc(chat_id: int, user_id: int, username: str | None = None,
         (user_id, username, first_name, now, now),
     )
     await _db.commit()
+
+
+async def week_activity(chat_id: int) -> dict[int, dict]:
+    """Кто и сколько писал за прошедшую неделю — сырьё для титулов.
+
+    На человека: сколько сообщений за 7 дней, за сколько разных дней он
+    отметился, сколько было неделей раньше и с какого дня мы его вообще знаем.
+    """
+    day = utils.day_num()
+    cur = await _db.execute(
+        """SELECT user_id,
+                  SUM(CASE WHEN day >= ? THEN cnt ELSE 0 END)      AS week,
+                  COUNT(DISTINCT CASE WHEN day >= ? THEN day END)  AS days,
+                  SUM(CASE WHEN day BETWEEN ? AND ? THEN cnt ELSE 0 END) AS prev,
+                  MIN(day) AS first_day
+           FROM msg_stats WHERE chat_id = ? AND user_id > 0
+           GROUP BY user_id""",
+        (day - 6, day - 6, day - 13, day - 7, chat_id),
+    )
+    return {r["user_id"]: {"week": r["week"] or 0, "days": r["days"] or 0,
+                           "prev": r["prev"] or 0, "first_day": r["first_day"]}
+            for r in await cur.fetchall()}
+
+
+async def active_writers(chat_id: int, days: int) -> list[int]:
+    """Кто писал в чат за последние N суток. Список участников Bot API не даёт,
+    поэтому «живые» люди чата — это те, кого мы видели в статистике."""
+    cur = await _db.execute(
+        """SELECT DISTINCT user_id FROM msg_stats
+           WHERE chat_id = ? AND day >= ? AND user_id > 0""",
+        (chat_id, utils.day_num() - days + 1),
+    )
+    return [r["user_id"] for r in await cur.fetchall()]
 
 
 async def trust_facts(chat_id: int, user_id: int) -> dict:

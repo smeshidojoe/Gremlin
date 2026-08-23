@@ -8,7 +8,7 @@ from aiogram.enums import ParseMode
 from aiogram.types import ErrorEvent, MenuButtonCommands
 
 from . import config, db, userbot
-from .handlers import admin_menu, cards, events, group, user_menu
+from .handlers import admin_menu, cards, events, fun, games, group, user_menu
 from .middlewares import TrackingMiddleware
 from .services import backup, digest, errorlog, moderation
 
@@ -61,6 +61,8 @@ async def main() -> None:
     # порядок важен: специфичные роутеры до группового catch-all
     dp.include_routers(
         admin_menu.router,
+        fun.router,
+        games.router,
         user_menu.router,
         cards.router,
         events.router,
@@ -68,6 +70,7 @@ async def main() -> None:
     )
 
     digest_task = asyncio.create_task(digest.scheduler(bot))
+    titles_task = asyncio.create_task(games.titles_scheduler(bot))
     backup_task = asyncio.create_task(backup.scheduler())
     sweeper_task = asyncio.create_task(moderation.card_sweeper(bot))
     try:
@@ -86,6 +89,7 @@ async def main() -> None:
         )
     finally:
         digest_task.cancel()
+        titles_task.cancel()
         backup_task.cancel()
         sweeper_task.cancel()
         if ub is not None:

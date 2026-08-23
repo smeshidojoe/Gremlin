@@ -106,17 +106,32 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
     """Общая логика !mute / !ban."""
     if stale(message):
         return  # команда из бэклога — админ уже всё разрулил сам
-    if not message.reply_to_message or not message.reply_to_message.from_user:
-        await message.reply("Команда работает ответом на сообщение нарушителя.")
-        return
     if not await _is_chat_admin(bot, message.chat.id, message.from_user.id):
         return  # молча игнорим не-админов
-    target = message.reply_to_message.from_user
+
+    parts = (message.text or "").split()[1:]
+    reply = message.reply_to_message
+    if reply is not None and reply.from_user is None and reply.sender_chat is not None:
+        # сообщение написано «от имени канала» — человека за ним не видно,
+        # такому можно только запретить писать сюда как каналу
+        await _punish_sender_chat(message, bot, kind, reply)
+        return
+    if reply and reply.from_user:
+        target = reply.from_user
+    else:
+        # без реплая цель можно назвать: !mute @vasya 30 или !ban 12345 спам
+        uid, _who = await _lift_target(message, bot)
+        if uid is None or uid < 0:
+            await message.reply(
+                "Кого наказать? Ответьте на сообщение или укажите @ник или id."
+            )
+            return
+        target = await net.user_stub(uid)
+        parts = parts[1:]                       # первым словом шла цель
     if target.id == bot.id or await _is_chat_admin(bot, message.chat.id, target.id):
         await message.reply("Этого юзера наказать нельзя.")
         return
 
-    parts = (message.text or "").split()[1:]
     mute_min = config.MANUAL_MUTE_DEFAULT      # срок не указали — сутки
     if kind == "mute" and parts:
         parsed = utils.parse_duration(parts[0])
@@ -125,19 +140,21 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
             parts = parts[1:]
     reason = " ".join(parts) or "без причины"
     # текст берём до удаления — он уходит в карточку
-    body = moderation.message_body(message.reply_to_message)
+    body = moderation.message_body(message.reply_to_message)  # None -> пусто
 
-    pid = await moderation.apply_punishment(
+    pid, err = await moderation.punish_ex(
         bot, message.chat.id, target, kind, mute_min, reason, message.from_user.id
     )
     if pid is None:
-        await message.reply("Не получилось — проверь права бота.")
+        await message.reply(f"Не получилось: {utils.esc(err or 'Telegram отказал')}.")
         return
     until = utils.until_ts(mute_min) if kind == "mute" else None
 
     # В чат ничего не пишем: наказание и так видно в лог-чате, а сообщение
     # нарушителя вместе с командой убираем, чтобы лента осталась чистой.
     for msg in (message.reply_to_message, message):
+        if msg is None:
+            continue
         try:
             await msg.delete()
         except Exception:
@@ -156,6 +173,39 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
         message.chat.id, "manual",
         f"{kind}: {target.full_name} ({target.id}) — {reason} | by {message.from_user.id}",
     )
+
+
+async def _punish_sender_chat(message: Message, bot: Bot, kind: str, reply) -> None:
+    """!ban на сообщение от имени канала — бан самого канала-отправителя."""
+    chan = reply.sender_chat
+    if kind != "ban":
+        await message.reply("Это сообщение от имени канала — мут тут не работает, "
+                            "только <code>!ban</code>.")
+        return
+    try:
+        await bot.ban_chat_sender_chat(message.chat.id, chan.id)
+    except Exception as e:
+        await message.reply(f"Не получилось: {utils.esc(moderation.human_error(e))}.")
+        return
+    pid = await db.add_punishment(
+        message.chat.id, chan.id, chan.username, chan.title or str(chan.id),
+        "banchan", "бан канала-отправителя", None, message.from_user.id,
+        was_member=False,
+    )
+    for msg in (reply, message):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+    card = (
+        f"📛 <b>Бан отправителя-канала</b> · {utils.esc(message.chat.title)}\n"
+        f"📢 {utils.esc(chan.title or chan.id)} (<code>{chan.id}</code>)\n"
+        f"📎 Причина: бан командой\n"
+        f"👮 Кем: {utils.mention(message.from_user.id, message.from_user.full_name, message.from_user.username)}"
+    )
+    await moderation.send_card(bot, message.chat.id, config.BIT_ANON, card, pid, "banchan")
+    await db.add_event(message.chat.id, "manual",
+                       f"banchan: {chan.title} ({chan.id}) | by {message.from_user.id}")
 
 
 @router.message(F.text.regexp(r"^!(mute|мут)(\s|$)"))

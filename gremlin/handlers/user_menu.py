@@ -66,8 +66,9 @@ async def view_home(user_id: int, bot: Bot) -> tuple[str, InlineKeyboardMarkup]:
         b.button(text="🐞 Ошибки", callback_data="a:errors")
         b.button(text="⚙️ Состояние", callback_data="a:health")
         b.button(text="👥 Доступ к боту", callback_data="u:acc")
+        b.button(text="🎪 Приколы", callback_data="f:home")
     b.button(text="✖️ Закрыть", callback_data="u:close")
-    b.adjust(1, 2, 1, 1, 1)
+    b.adjust(1, 2, 1, 1, 1, 1)
     return _HOME_TEXT, b.as_markup()
 
 
@@ -261,6 +262,7 @@ async def view_chat(cid: int, viewer_id: int) -> tuple[str, InlineKeyboardMarkup
     from ..services import digest as _dg
     if _dg.tracked_chat() == cid:          # подробная статистика — только этот чат
         b.button(text="📊 Недельная сводка", callback_data=f"u:s:{cid}:digest")
+    b.button(text="🎪 Приколы", callback_data=f"u:games:{cid}")
     b.button(text="🎖 Доверие", callback_data=f"u:s:{cid}:trust")
     b.button(text="⚠️ Варны", callback_data=f"u:s:{cid}:warns")
     b.button(text="📜 Правила в постах", callback_data=f"u:s:{cid}:rules")
@@ -280,7 +282,7 @@ async def view_chat(cid: int, viewer_id: int) -> tuple[str, InlineKeyboardMarkup
     b.button(text="📥 Перенести настройки", callback_data=f"u:cp:{cid}")
     b.button(text="🚪 Убрать бота из чата", callback_data=f"a:leave:{cid}")
     b.button(text="⬅️ Назад", callback_data="u:chats")
-    b.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1)
+    b.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1)
     return text, b.as_markup()
 
 
@@ -786,6 +788,150 @@ async def view_words(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup
     return "\n".join(lines), b.as_markup()
 
 
+async def view_games(cid: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Игры чата: каждую можно включить и решить, кому она доступна."""
+    s = await db.get_settings(cid)
+    lines = [
+        "<b>🎪 Приколы</b>\n",
+        "Игры для этого чата. Наказания настоящие — снимаются как обычные, "
+        "в разделе «🚫 Наказания». Админов и бота игры не трогают, а итоговое "
+        "сообщение партии само исчезает через 10 минут.\n",
+        "Левая кнопка включает игру, правая решает, кому её можно звать: "
+        "<b>всем</b> или <b>только админам</b>.\n",
+    ]
+    b = InlineKeyboardBuilder()
+    for bit, label, how, about in config.GAME_BITS:
+        on = bool(s.games_on & bit)
+        adm = bool(s.games_adm & bit)
+        # у титулов команды нет, бот шлёт их сам — выбирать «кому можно» нечего
+        by_hand = bit != config.GAME_TITLES
+        prize_line = ""
+        if by_hand:
+            kind = getattr(s, config.GAME_FIELDS[bit][0])
+            minutes = getattr(s, config.GAME_FIELDS[bit][1])
+            prize_line = ("бан" if kind == "ban"
+                          else f"мут на {utils.fmt_minutes(minutes)}")
+            prize_line = f" · приз: <b>{prize_line}</b>"
+        lines.append(
+            f"{'✅' if on else '🚫'} <b>{label}</b> · <code>{how}</code>"
+            + (" · только админы" if on and adm and by_hand else "")
+            + prize_line
+            + f"\n<i>{about}</i>\n"
+        )
+        toggle = _btn(f"{'✅' if on else '🚫'} {label}", f"u:gb:{cid}:{bit}")
+        if by_hand:
+            kind, minutes = getattr(s, config.GAME_FIELDS[bit][0]), \
+                getattr(s, config.GAME_FIELDS[bit][1])
+            prize = "бан" if kind == "ban" else utils.fmt_minutes(minutes)
+            b.row(toggle, _btn("🛡 админы" if adm else "👥 все", f"u:ga:{cid}:{bit}"),
+                  _btn(f"🔨 {prize}", f"u:gp:{cid}:{bit}"))
+        else:
+            b.row(toggle)
+    b.row(_btn("⬅️ Назад", f"u:c:{cid}"))
+    return "\n".join(lines), b.as_markup()
+
+
+@router.callback_query(F.data.startswith("u:games:"))
+async def cb_games(cb: CallbackQuery) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    text, kb = await view_games(cid)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:gb:"))
+async def cb_game_toggle(cb: CallbackQuery) -> None:
+    _, _, cid, bit = cb.data.split(":")
+    cid, bit = int(cid), int(bit)
+    if not await _guard(cb, cid):
+        return
+    s = await db.get_settings(cid)
+    await db.set_setting(cid, "games_on", s.games_on ^ bit)
+    text, kb = await view_games(cid)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+async def view_game_prize(cid: int, bit: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Приз проигравшему в конкретной игре."""
+    s = await db.get_settings(cid)
+    label = next(x[1] for x in config.GAME_BITS if x[0] == bit)
+    kind_field, min_field = config.GAME_FIELDS[bit]
+    kind, minutes = getattr(s, kind_field), getattr(s, min_field)
+    text = (
+        f"<b>🔨 {utils.esc(label)} · приз</b>\n\n"
+        "Что достаётся проигравшему. Бан выдаётся навсегда — снимать вручную "
+        "в разделе «🚫 Наказания».\n\n"
+        f"Сейчас: <b>{'бан' if kind == 'ban' else 'мут ' + utils.fmt_minutes(minutes)}</b>"
+    )
+    b = InlineKeyboardBuilder()
+    b.row(_btn(f"🔨 Наказание: {'бан' if kind == 'ban' else 'мут'}",
+               f"u:gpk:{cid}:{bit}"))
+    if kind == "mute":
+        b.row(_btn("◀", f"u:gpm:{cid}:{bit}:-"),
+              _btn(f"⏰ {utils.fmt_minutes(minutes)}", f"u:gpm:{cid}:{bit}:+"),
+              _btn("▶", f"u:gpm:{cid}:{bit}:+"))
+    b.row(_btn("⬅️ Назад", f"u:games:{cid}"))
+    return text, b.as_markup()
+
+
+@router.callback_query(F.data.startswith("u:gp:"))
+async def cb_game_prize(cb: CallbackQuery) -> None:
+    _, _, cid, bit = cb.data.split(":")
+    cid, bit = int(cid), int(bit)
+    if not await _guard(cb, cid):
+        return
+    text, kb = await view_game_prize(cid, bit)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:gpk:"))
+async def cb_game_prize_kind(cb: CallbackQuery) -> None:
+    _, _, cid, bit = cb.data.split(":")
+    cid, bit = int(cid), int(bit)
+    if not await _guard(cb, cid):
+        return
+    field = config.GAME_FIELDS[bit][0]
+    s = await db.get_settings(cid)
+    await db.set_setting(cid, field, "ban" if getattr(s, field) == "mute" else "mute")
+    text, kb = await view_game_prize(cid, bit)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:gpm:"))
+async def cb_game_prize_min(cb: CallbackQuery) -> None:
+    _, _, cid, bit, way = cb.data.split(":")
+    cid, bit = int(cid), int(bit)
+    if not await _guard(cb, cid):
+        return
+    field = config.GAME_FIELDS[bit][1]
+    s = await db.get_settings(cid)
+    presets = list(config.MUTE_PRESETS)
+    cur = presets.index(getattr(s, field)) if getattr(s, field) in presets else 0
+    step = 1 if way == "+" else -1
+    await db.set_setting(cid, field, presets[(cur + step) % len(presets)])
+    text, kb = await view_game_prize(cid, bit)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:ga:"))
+async def cb_game_access(cb: CallbackQuery) -> None:
+    _, _, cid, bit = cb.data.split(":")
+    cid, bit = int(cid), int(bit)
+    if not await _guard(cb, cid):
+        return
+    s = await db.get_settings(cid)
+    await db.set_setting(cid, "games_adm", s.games_adm ^ bit)
+    text, kb = await view_games(cid)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
 _LIFT_LABEL = {"any": "любой чат", "source": "только тот, где выдали"}
 
 
@@ -821,10 +967,12 @@ async def view_net(cid: int) -> tuple[str, InlineKeyboardMarkup]:
         else:
             lines.append(f"\n<i>Лимит сеток: {config.NET_LIMIT}. Чтобы завести новую, "
                          f"удалите лишнюю в одном из её чатов.</i>")
+        lines.append(f"\n<i>Сеток у вас: {len(nets)} из {config.NET_LIMIT}.</i>")
         b.row(_btn("⬅️ Назад", f"u:c:{cid}"))
         return "\n".join(lines), b.as_markup()
 
     mates = await db.net_chats(net["id"])
+    lines.append(f"Сеток у вас: <b>{len(nets)}</b> из {config.NET_LIMIT}\n")
     lines.append(f"Сетка: <b>{utils.esc(net['title'])}</b> · "
                  f"{len(mates)} {utils.plural(len(mates), 'чат', 'чата', 'чатов')}")
     lines += [f"• {utils.esc(c['title'] or c['chat_id'])}"
@@ -845,6 +993,15 @@ async def view_net(cid: int) -> tuple[str, InlineKeyboardMarkup]:
         b.row(*row)
     b.row(_btn(f"🔓 Снимать может: {_LIFT_LABEL[net['lift_mode']]}", f"u:netl:{cid}"))
     b.row(_btn("✏️ Переименовать", f"u:netren:{cid}"))
+    # переезд в другую сетку и создание новой доступны и отсюда: иначе, когда все
+    # чаты уже в одной сетке, вторую негде было бы завести
+    others = [n for n in await db.nets_of(owner) if n["id"] != net["id"]]
+    for n in others:
+        mates_n = len(await db.net_chats(n["id"]))
+        b.row(_btn(f"🔀 Перенести в «{n['title'][:20]}» ({mates_n})",
+                   f"u:netpick:{cid}:{n['id']}"))
+    if len(others) + 1 < config.NET_LIMIT:
+        b.row(_btn("🆕 Создать ещё сетку и перенести сюда чат", f"u:netnew:{cid}"))
     if len(mates) > 1:
         b.row(_btn("📥 Применить активные баны сетки", f"u:netim:{cid}"))
     b.row(InlineKeyboardButton(text="🚪 Убрать чат из сетки",

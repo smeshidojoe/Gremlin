@@ -167,6 +167,60 @@ def card_text(kind: str, chat_title: str | None, user_id: int, who: str,
     return "\n".join(lines) + body
 
 
+# ответы Telegram, которые стоит переводить: админ должен понимать, что пошло не так
+_ERRORS_RU = (
+    ("not enough rights", "у бота нет права ограничивать участников"),
+    ("CHAT_ADMIN_REQUIRED", "у бота нет прав администратора"),
+    ("USER_ADMIN_INVALID", "нельзя тронуть админа чата"),
+    ("PARTICIPANT_ID_INVALID", "неверная цель — это не человек из этого чата"),
+    ("USER_ID_INVALID", "такого пользователя не существует"),
+    ("PEER_ID_INVALID", "неверный id"),
+    ("USER_NOT_PARTICIPANT", "в чате не состоит"),
+    ("method is available for supergroup", "в обычной группе так нельзя — "
+                                           "нужен супергруппа-чат"),
+    ("Too Many Requests", "Telegram просит подождать"),
+)
+
+
+def human_error(e: Exception) -> str:
+    text = str(e)
+    for needle, human in _ERRORS_RU:
+        if needle.lower() in text.lower():
+            return human
+    return text[:120]
+
+
+async def punish_ex(bot: Bot, chat_id: int, user: User, kind: str, mute_min: int,
+                    reason: str, by_id: int | None) -> tuple[int | None, str | None]:
+    """То же, что apply_punishment, но возвращает и текст ошибки Telegram.
+
+    Нужен там, где ответ видит живой админ: «не получилось» без причины
+    отправляет искать несуществующую проблему с правами.
+    """
+    if kind == "delete":
+        return None, None
+    until = utils.until_ts(mute_min) if kind == "mute" else None
+    member = await adm_cache.is_member(bot, chat_id, user.id)
+    try:
+        if kind == "mute":
+            await bot.restrict_chat_member(
+                chat_id, user.id, permissions=MUTE_PERMS, until_date=until
+            )
+        elif kind == "ban":
+            await bot.ban_chat_member(chat_id, user.id)
+    except Exception as e:
+        logger.warning("punish %s failed in %s for %s", kind, chat_id, user.id,
+                       exc_info=True)
+        return None, human_error(e)
+    from . import trust
+    trust.invalidate(chat_id, user.id)
+    pid = await db.add_punishment(
+        chat_id, user.id, user.username, user.full_name, kind, reason, until, by_id,
+        was_member=member,
+    )
+    return pid, None
+
+
 async def apply_punishment(bot: Bot, chat_id: int, user: User, kind: str,
                            mute_min: int, reason: str, by_id: int | None) -> int | None:
     """Применить mute/ban к юзеру, записать в базу. Вернуть id наказания (None если delete)."""

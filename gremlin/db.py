@@ -493,11 +493,13 @@ async def _migrate() -> None:
             )
         await _db.execute("INSERT INTO kv (k, v) VALUES ('mig_links_split', '1')")
 
-    # таблицы удалённых функций: варны, список для жалоб, отдельный вайтлист анонимов
-    # (его содержимое давно переехало в общий whitelist)
+    # таблицы удалённых функций: список для жалоб и отдельный вайтлист анонимов
+    # (его содержимое давно переехало в общий whitelist).
+    # warns тут когда-то тоже был, но функция вернулась: на свежей базе эта
+    # чистка сносила только что созданную таблицу, и варны падали с ошибкой.
     cur = await _db.execute("SELECT v FROM kv WHERE k = 'mig_drop_dead'")
     if await cur.fetchone() is None:
-        for dead in ("warns", "report_wl", "anon_wl"):
+        for dead in ("report_wl", "anon_wl"):
             await _db.execute(f"DROP TABLE IF EXISTS {dead}")
         await _db.execute("INSERT INTO kv (k, v) VALUES ('mig_drop_dead', '1')")
 
@@ -1286,6 +1288,8 @@ async def msg_inc(chat_id: int, user_id: int, username: str | None = None,
     )
     await _db.commit()
 
+
+# ---------- лорбук ----------
 
 async def week_activity(chat_id: int) -> dict[int, dict]:
     """Кто и сколько писал за прошедшую неделю — сырьё для титулов.

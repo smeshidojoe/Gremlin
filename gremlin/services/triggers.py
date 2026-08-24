@@ -92,38 +92,49 @@ async def send(message: Message, row) -> None:
     await send_answer(message, ans)
 
 
-async def send_answer(message: Message, ans) -> None:
+async def send_answer(message: Message, ans, reply: bool = True,
+                      subs: dict | None = None):
     """Отправить один вариант ответа: текст или медиа с диска.
 
     Текст лежит с разметкой (жирный, курсив, ссылки — как их набрали в Telegram),
     поэтому уходит как HTML. Битая разметка -> повтор обычным текстом.
+
+    reply=False — обычным сообщением, а не ответом: приветствию новичка
+    отвечать не на что. subs — подстановки вроде {name}.
     """
+    text = ans["text"] or ""
+    for key, val in (subs or {}).items():
+        text = text.replace(key, val)
+    no_preview = LinkPreviewOptions(is_disabled=True)
+    send_text = message.reply if reply else message.answer
+
     if not ans["file_path"]:
-        # превью ссылок гасим: ответ триггера должен выглядеть так, как его
-        # написали, а не тащить за собой картинку с чужого сайта
-        no_preview = LinkPreviewOptions(is_disabled=True)
+        # превью ссылок гасим: ответ должен выглядеть так, как его написали,
+        # а не тащить за собой картинку с чужого сайта
         try:
-            await message.reply(ans["text"], link_preview_options=no_preview)
+            return await send_text(text, link_preview_options=no_preview)
         except Exception as e:
             if utils.msg_gone(e):
-                return                        # исходное сообщение удалили
-            await message.reply(html.escape(ans["text"] or ""), parse_mode=None,
-                                link_preview_options=no_preview)
-        return
+                return None                   # исходное сообщение удалили
+            return await send_text(html.escape(text), parse_mode=None,
+                                   link_preview_options=no_preview)
+
     kind = ans["media_type"]
     if kind not in MEDIA_KINDS or not os.path.exists(ans["file_path"]):
         logger.warning("trigger media missing: %s", ans["file_path"])
-        return
+        return None
     _ext, method, has_caption = MEDIA_KINDS[kind]
-    kwargs = {"reply_to_message_id": message.message_id}
-    if has_caption and ans["text"]:
-        kwargs["caption"] = ans["text"]
+    kwargs = {}
+    if reply:
+        kwargs["reply_to_message_id"] = message.message_id
+    if has_caption and text:
+        kwargs["caption"] = text
     try:
-        await getattr(message, method)(FSInputFile(ans["file_path"]), **kwargs)
+        return await getattr(message, method)(FSInputFile(ans["file_path"]), **kwargs)
     except Exception as e:
         if utils.msg_gone(e):
-            return
+            return None
         if "caption" in kwargs:               # подпись с битой разметкой
-            kwargs["caption"] = html.escape(ans["text"])
+            kwargs["caption"] = html.escape(text)
             kwargs["parse_mode"] = None
-        await getattr(message, method)(FSInputFile(ans["file_path"]), **kwargs)
+        return await getattr(message, method)(FSInputFile(ans["file_path"]), **kwargs)

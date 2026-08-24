@@ -6,6 +6,13 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends tini \
  && rm -rf /var/lib/apt/lists/*
 
+# cloudflared: бот сам поднимает им быстрый туннель для веб-панели.
+# Аккаунт и токен не нужны, адрес выдаётся на лету. Не нужен туннель —
+# TUNNEL_ON=0, бинарник просто не запускается.
+ARG TARGETARCH=amd64
+ADD https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${TARGETARCH} /usr/local/bin/cloudflared
+RUN chmod 0755 /usr/local/bin/cloudflared
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     TZ=Europe/Moscow

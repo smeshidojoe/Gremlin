@@ -1,0 +1,259 @@
+/* Панель Gremlin. Цвета берём у Telegram: тема клиента — она же тема панели. */
+:root {
+  --bg: var(--tg-theme-bg-color, #17212b);
+  --card: var(--tg-theme-secondary-bg-color, #232e3c);
+  --text: var(--tg-theme-text-color, #ffffff);
+  --hint: var(--tg-theme-hint-color, #7d8b99);
+  --accent: var(--tg-theme-button-color, #5288c1);
+  --accent-text: var(--tg-theme-button-text-color, #ffffff);
+  --link: var(--tg-theme-link-color, #6ab3f3);
+  --danger: #e2574c;
+  --ok: #4dbd74;
+  --line: color-mix(in srgb, var(--hint) 25%, transparent);
+  --radius: 12px;
+}
+
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+body {
+  margin: 0;
+  padding: 0 0 32px;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+/* ---------- шапка ---------- */
+
+header {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+
+#back {
+  border: 0;
+  background: none;
+  color: var(--link);
+  font-size: 28px;
+  line-height: 1;
+  padding: 0 6px;
+  cursor: pointer;
+}
+
+#title { font-weight: 600; font-size: 17px; flex: 1; }
+
+#spin {
+  width: 16px; height: 16px;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+main { padding: 12px; max-width: 720px; margin: 0 auto; }
+
+.loading, .empty { color: var(--hint); text-align: center; padding: 24px 8px; }
+
+/* ---------- блоки ---------- */
+
+.card {
+  background: var(--card);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  margin-bottom: 12px;
+}
+
+.card h2 { font-size: 15px; margin: 0 0 8px; }
+
+.intro { color: var(--hint); font-size: 13px; line-height: 1.5; }
+.intro i { font-style: normal; color: var(--text); opacity: .85; }
+
+.muted { color: var(--hint); font-size: 13px; }
+.mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+.right { margin-left: auto; }
+.nowrap { white-space: nowrap; }
+.wrap { display: flex; flex-wrap: wrap; gap: 6px; }
+.spread { display: flex; align-items: center; gap: 10px; }
+
+/* ---------- плитки разделов ---------- */
+
+.tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+@media (max-width: 380px) { .tiles { grid-template-columns: 1fr; } }
+
+.tile {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--card);
+  border: 0;
+  border-radius: var(--radius);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  padding: 12px;
+  cursor: pointer;
+  min-height: 52px;
+}
+.tile:active { opacity: .7; }
+.tile .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--hint); flex: none; }
+.tile .dot.on { background: var(--ok); }
+.tile .dot.off { background: color-mix(in srgb, var(--danger) 70%, transparent); }
+.tile small { display: block; color: var(--hint); font-size: 12px; }
+
+/* ---------- строки списков ---------- */
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+.row:last-child { border-bottom: 0; }
+.row .label { flex: 1; min-width: 0; }
+.row .label small { display: block; color: var(--hint); font-size: 12px; }
+.row .value { color: var(--hint); font-size: 13px; }
+
+.item { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--line); }
+.item:last-child { border-bottom: 0; }
+.item .body { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.item .body small { display: block; color: var(--hint); font-size: 12px; }
+
+/* ---------- элементы управления ---------- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 0;
+  border-radius: 10px;
+  background: var(--accent);
+  color: var(--accent-text);
+  font: inherit;
+  font-weight: 500;
+  padding: 10px 14px;
+  cursor: pointer;
+}
+.btn:active { opacity: .75; }
+.btn.wide { width: 100%; }
+.btn.ghost { background: color-mix(in srgb, var(--hint) 20%, transparent); color: var(--text); }
+.btn.danger { background: var(--danger); color: #fff; }
+.btn.small { padding: 6px 10px; font-size: 13px; border-radius: 8px; }
+.btn[disabled] { opacity: .5; pointer-events: none; }
+
+.x {
+  border: 0;
+  background: none;
+  color: var(--danger);
+  font-size: 18px;
+  line-height: 1;
+  padding: 4px 6px;
+  cursor: pointer;
+}
+
+select, input[type=text], input[type=number], textarea {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 8px 10px;
+  font: inherit;
+  max-width: 60%;
+}
+textarea { width: 100%; max-width: 100%; min-height: 110px; resize: vertical; }
+input[type=text], input[type=number] { width: 100%; max-width: 100%; }
+
+.switch { position: relative; width: 46px; height: 27px; flex: none; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.switch span {
+  position: absolute; inset: 0;
+  background: color-mix(in srgb, var(--hint) 40%, transparent);
+  border-radius: 27px;
+  transition: background .15s;
+}
+.switch span::before {
+  content: ""; position: absolute;
+  width: 21px; height: 21px; left: 3px; top: 3px;
+  background: #fff; border-radius: 50%;
+  transition: transform .15s;
+}
+.switch input:checked + span { background: var(--ok); }
+.switch input:checked + span::before { transform: translateX(19px); }
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: color-mix(in srgb, var(--hint) 18%, transparent);
+  border: 0;
+  border-radius: 999px;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 11px;
+  cursor: pointer;
+}
+.chip.on { background: color-mix(in srgb, var(--ok) 30%, transparent); }
+.chip.stat { cursor: default; }
+.chip.off { opacity: .55; }
+
+/* ---------- всплывашки ---------- */
+
+#toast {
+  position: fixed;
+  left: 50%;
+  bottom: 22px;
+  transform: translateX(-50%);
+  background: #000c;
+  color: #fff;
+  padding: 10px 16px;
+  border-radius: 10px;
+  font-size: 14px;
+  z-index: 20;
+  max-width: 90%;
+  text-align: center;
+}
+
+/* Атрибут hidden выключается любым author-правилом с display, а у этих блоков
+   оно есть — без явного правила ниже полотно модалки висело бы поверх страницы
+   всегда и съедало все нажатия. */
+#modal[hidden], #toast[hidden], #spin[hidden] { display: none; }
+
+#modal {
+  position: fixed;
+  inset: 0;
+  background: #0008;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  z-index: 30;
+}
+#modal .sheet {
+  background: var(--bg);
+  width: 100%;
+  max-width: 720px;
+  border-radius: 16px 16px 0 0;
+  padding: 16px 16px 22px;
+}
+#modal h3 { margin: 0 0 4px; font-size: 16px; }
+#modal .hint { color: var(--hint); font-size: 13px; margin-bottom: 10px; }
+#modal .btns { display: flex; gap: 8px; margin-top: 12px; }
+#modal .btns .btn { flex: 1; }
+
+pre.log {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+  margin: 0;
+  color: var(--text);
+}

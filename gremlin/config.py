@@ -275,3 +275,26 @@ WL_SCOPE_LABELS = {
     "watch": "наблюдение",
     "anon": "сообщения от имени канала",
 }
+
+# ---------- Мини-приложение (веб-панель) ----------
+#
+# Панель — это то же меню бота, только страницей внутри Telegram. Поднимается
+# в том же процессе на своём порту, а наружу её выводит туннель.
+#
+# По умолчанию туннель бот поднимает сам (cloudflared, быстрый туннель: ни
+# аккаунта, ни токена, ни домена) и берёт выданный адрес в рантайме. Свой
+# постоянный адрес — WEBAPP_URL, тогда туннель не нужен и не запускается.
+WEBAPP_URL = (os.getenv("WEBAPP_URL") or "").rstrip("/")
+WEB_HOST = os.getenv("WEB_HOST") or "0.0.0.0"
+WEB_PORT = int(os.getenv("WEB_PORT") or 8081)
+TUNNEL_ON = (os.getenv("TUNNEL_ON") or "1") not in ("0", "false", "no")
+CLOUDFLARED_BIN = os.getenv("CLOUDFLARED_BIN") or "cloudflared"
+# панель поднимается, если есть свой адрес либо разрешён туннель
+WEB_ON = bool(WEBAPP_URL) or TUNNEL_ON
+
+# Сколько живёт подпись initData от Telegram. Клиент обновляет её при каждом
+# открытии панели, так что сутки — с запасом.
+WEB_INITDATA_TTL = int(os.getenv("WEB_INITDATA_TTL") or 86400)
+
+# Потолок на загрузку файла в панели (лорбук, медиа-ответ), байт.
+WEB_UPLOAD_MAX = 20 * 1024 * 1024

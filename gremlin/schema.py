@@ -193,7 +193,9 @@ SECTIONS: list[Section] = [
         "welcome", "👋 Приветствие",
         "<i>Зачем:</i> встретить новичка, чтобы чат не выглядел безлюдным.\n"
         "<i>Как:</i> приветствие шлётся при входе, <code>{name}</code> заменяется на имя "
-        "новичка. Прошлое приветствие удаляется, чтобы они не копились в ленте.",
+        "новичка. Прошлое приветствие удаляется, чтобы они не копились в ленте.\n"
+        "Заготовок может быть несколько — бот берёт случайную. Каждая может быть "
+        "текстом, медиа или медиа с подписью.",
         fields=[Field("welcome_on", "toggle", "Приветствие")],
         widgets=["welcome_text"],
     ),
@@ -422,18 +424,32 @@ def validate(field_key: str, value):
     raise ValueError(f"неизвестное поле {field_key}")
 
 
+def field_dict(f: Field, settings_obj) -> dict:
+    """Одно поле для панели: значение плюс готовые подписи вариантов.
+
+    Подписи считаем здесь, а не в браузере: правила вроде «1440 = сутки»
+    живут в utils, и дублировать их на javascript значит однажды разойтись.
+    """
+    val = getattr(settings_obj, f.key)
+    return {
+        "key": f.key, "kind": f.kind, "label": f.label,
+        "value": val, "value_label": value_label(f, val),
+        "options": [{"value": v, "label": value_label(f, v)} for v in (f.values or [])],
+        "fmt": f.fmt, "visible": visible(f, settings_obj),
+    }
+
+
+def section_dict(s: Section, settings_obj) -> dict:
+    """Раздел целиком. main — главный тумблер, по нему рисуется точка в списке."""
+    main = next((f.key for f in s.fields if f.kind == "toggle"), None)
+    return {
+        "key": s.key, "title": s.title, "intro": s.intro,
+        "widgets": s.widgets, "back": s.back, "main": main,
+        "on": bool(getattr(settings_obj, main)) if main else None,
+        "fields": [field_dict(f, settings_obj) for f in s.fields],
+    }
+
+
 def to_dict(settings_obj) -> dict:
     """JSON-описание всех разделов с текущими значениями — для mini app."""
-    out = []
-    for s in SECTIONS:
-        fields = []
-        for f in s.fields:
-            fields.append({
-                "key": f.key, "kind": f.kind, "label": f.label,
-                "value": getattr(settings_obj, f.key),
-                "values": f.values, "value_labels": f.value_labels,
-                "fmt": f.fmt, "visible": visible(f, settings_obj),
-            })
-        out.append({"key": s.key, "title": s.title, "intro": s.intro,
-                    "fields": fields, "widgets": s.widgets})
-    return {"sections": out}
+    return {"sections": [section_dict(s, settings_obj) for s in SECTIONS]}

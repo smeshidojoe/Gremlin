@@ -5,9 +5,10 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import ErrorEvent, MenuButtonCommands
+from aiogram.types import (ErrorEvent, MenuButtonCommands, MenuButtonWebApp,
+                           WebAppInfo)
 
-from . import config, db, userbot
+from . import config, db, runtime, userbot
 from .handlers import admin_menu, cards, events, fun, games, group, user_menu
 from .middlewares import TrackingMiddleware
 from .services import backup, digest, errorlog, moderation
@@ -39,6 +40,23 @@ async def _on_error(event: ErrorEvent) -> None:
     logger.exception("update error", exc_info=event.exception)
 
 
+async def _menu_button(bot: Bot, url: str | None) -> None:
+    """Кнопка рядом с полем ввода: панель, если её адрес известен.
+
+    Адрес приходит либо из .env, либо от туннеля — и во втором случае меняется
+    при каждом его перезапуске, поэтому кнопку переставляем на лету.
+    """
+    runtime.set_webapp_url(url)
+    try:
+        if url:
+            await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(
+                text="Панель", web_app=WebAppInfo(url=url)))
+        else:
+            await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    except Exception:
+        logger.warning("не выставить кнопку меню", exc_info=True)
+
+
 async def main() -> None:
     _setup_logging()
     if not config.BOT_TOKEN:
@@ -56,7 +74,11 @@ async def main() -> None:
     dp.callback_query.middleware(TrackingMiddleware())
     dp.errors.register(_on_error)
 
-    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    await _menu_button(bot, config.WEBAPP_URL or None)
+
+    # наблюдению нужен наш юзернейм: обращение к боту — не спам-сигнал
+    from .services import watch as watch_svc
+    watch_svc.set_self((await bot.me()).username)
 
     # порядок важен: специфичные роутеры до группового catch-all
     dp.include_routers(
@@ -68,6 +90,23 @@ async def main() -> None:
         events.router,
         group.router,
     )
+
+    web_runner = None
+    tunnel_task = None
+    if config.WEB_ON:
+        from .web import server as web_server
+        try:
+            web_runner = await web_server.start(bot)
+        except Exception:
+            logger.warning("панель не поднялась", exc_info=True)
+        else:
+            if not config.WEBAPP_URL and config.TUNNEL_ON:
+                from .services import tunnel
+
+                async def _got_url(url: str | None) -> None:
+                    await _menu_button(bot, url)
+
+                tunnel_task = asyncio.create_task(tunnel.supervisor(_got_url))
 
     digest_task = asyncio.create_task(digest.scheduler(bot))
     titles_task = asyncio.create_task(games.titles_scheduler(bot))
@@ -92,6 +131,11 @@ async def main() -> None:
         titles_task.cancel()
         backup_task.cancel()
         sweeper_task.cancel()
+        if tunnel_task is not None:
+            tunnel_task.cancel()
+        if web_runner is not None:
+            from .web import server as web_server
+            await web_server.stop(web_runner)
         if ub is not None:
             await ub.disconnect()
         await db.close()

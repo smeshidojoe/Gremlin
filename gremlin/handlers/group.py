@@ -645,7 +645,7 @@ async def on_join(message: Message, bot: Bot) -> None:
         adm_cache.invalidate_member(message.chat.id, user.id)
         if not user.is_bot:
             await db.add_event(message.chat.id, "join", f"{user.full_name} ({user.id})")
-    if s.welcome_on and s.welcome_text:
+    if s.welcome_on:
         humans = [u for u in message.new_chat_members or [] if not u.is_bot]
         if humans:
             names = ", ".join(
@@ -657,11 +657,9 @@ async def on_join(message: Message, bot: Bot) -> None:
                     await bot.delete_message(message.chat.id, old)
                 except Exception:
                     pass
-            try:
-                sent = await message.answer(s.welcome_text.replace("{name}", names))
-                _last_welcome[message.chat.id] = sent.message_id
-            except Exception:
-                logger.warning("welcome failed in %s", message.chat.id, exc_info=True)
+            sent = await _welcome(message, s, names)
+            if sent is not None:
+                _last_welcome[message.chat.id] = sent
     if s.watch_on:
         admins = await adm_cache.chat_admin_ids(bot, message.chat.id)
         adder = message.from_user
@@ -735,6 +733,26 @@ async def on_join(message: Message, bot: Bot) -> None:
             await message.delete()
         except Exception:
             pass
+
+
+async def _welcome(message: Message, s, names: str) -> int | None:
+    """Поздороваться: вариант из списка, а если его нет — старый простой текст.
+
+    Заготовки лежат там же, где ответы триггеров, поэтому умеют медиа и
+    несколько вариантов — бот берёт случайный.
+    """
+    ans = await db.ans_pick("welcome", message.chat.id)
+    try:
+        if ans is not None:
+            sent = await triggers.send_answer(message, ans, reply=False,
+                                              subs={"{name}": names})
+            return sent.message_id if sent else None
+        if s.welcome_text:
+            sent = await message.answer(s.welcome_text.replace("{name}", names))
+            return sent.message_id
+    except Exception:
+        logger.warning("welcome failed in %s", message.chat.id, exc_info=True)
+    return None
 
 
 @router.message(F.left_chat_member)
@@ -834,7 +852,7 @@ async def moderate(message: Message, bot: Bot) -> None:
         return
 
     # Ниже — только модерация, и от неё освобождены владелец бота, админы чата
-    # и вайтлист. Но триггеры — развлекательная штука, они должны работать
+    # и вайтлист. Но триггеры — развлекательная часть, они должны работать
     # для всех, поэтому перед выходом всё равно даём им сработать.
     if user.id in config.ADMIN_IDS:
         await fire_trigger(bot, message, s)

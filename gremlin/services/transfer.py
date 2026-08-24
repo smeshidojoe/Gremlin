@@ -115,6 +115,15 @@ async def copy_chat(src: int, dst: int, groups: set[str] | None = None) -> dict[
                 await db.ans_add("trig", new_id, a["text"], path, a["media_type"])
             stats["триггеров"] += 1
 
+    if "welcome" in picked:
+        await db.ans_clear("welcome", dst)
+        for a in await db.ans_list("welcome", src):
+            path = _copy_media(a["file_path"], dst) if a["file_path"] else None
+            if a["file_path"] and path is None:
+                continue
+            await db.ans_add("welcome", dst, a["text"], path, a["media_type"])
+            stats["заготовок приветствия"] =                 stats.get("заготовок приветствия", 0) + 1
+
     if "rules" in picked:
         # заготовки правил живут в answers, как варианты ответов триггеров
         await db.ans_clear("rules", dst)

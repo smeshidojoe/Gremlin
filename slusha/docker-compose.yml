@@ -1,0 +1,38 @@
+# Слюша поднимается отдельно от модератора: своя папка, свой образ, своя база.
+# Запуск отсюда:  docker compose up -d --build
+services:
+  slusha:
+    build: .
+    container_name: slusha
+    restart: unless-stopped
+
+    # .env лежит рядом. Он же монтируется внутрь: правки токена и модели
+    # подхватываются перезапуском, без пересборки образа
+    env_file: .env
+
+    environment:
+      SLUSHA_DB_PATH: /app/data/slusha.sqlite3
+      SLUSHA_LOG_PATH: /app/data/slusha.log
+
+    # чтобы контейнер видел локальную Ollama на хосте
+    # (AI_BASE_URL=http://host.docker.internal:11434)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    volumes:
+      - ./.env:/app/slusha/.env:ro   # только чтение: контейнер его не меняет
+      - ./data:/app/data             # база и лог живут рядом с ботом
+
+      # Разовый перенос характеров и лорбуков из базы модератора. Снимите
+      # комментарий, прогоните миграцию и верните обратно — постоянная связь
+      # с чужой папкой Слюше не нужна:
+      # - ../data:/gremlin-data:ro
+
+    mem_limit: 4g
+    memswap_limit: 4g
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

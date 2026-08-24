@@ -9,11 +9,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    Message, ReplyKeyboardRemove,
+    Message, ReplyKeyboardRemove, WebAppInfo,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from .. import config, db, schema, utils
+from .. import config, db, runtime, schema, utils
 from ..services import adm_cache, filters as flt, resolve, triggers
 
 logger = logging.getLogger("gremlin.user_menu")
@@ -44,6 +44,9 @@ class Input(StatesGroup):
 
 
 _HOME_TEXT = "<b>🧌 Gremlin</b>\n\nМодерация и мониторинг чатов."
+# подсказка про панель: сама кнопка живёт рядом с полем ввода, но клиент
+# подхватывает её не сразу — команда работает всегда
+_PANEL_HINT = "\n\n🖥 Панель со всеми настройками: /panel"
 
 # ---------- вьюхи (текст + клавиатура) ----------
 
@@ -58,6 +61,8 @@ _RESERVED_CMDS = {
 
 async def view_home(user_id: int, bot: Bot) -> tuple[str, InlineKeyboardMarkup]:
     """Единое меню — одинаковое для всех допущенных."""
+    # панель открывается кнопкой рядом с полем ввода (её ставит app.py),
+    # дублировать её ещё и здесь незачем
     b = InlineKeyboardBuilder()
     b.button(text="💬 Чаты", callback_data="u:chats")
     b.button(text="🕸 Сетки чатов", callback_data="u:netsh")
@@ -70,7 +75,8 @@ async def view_home(user_id: int, bot: Bot) -> tuple[str, InlineKeyboardMarkup]:
         b.button(text="🎪 Приколы", callback_data="f:home")
     b.button(text="✖️ Закрыть", callback_data="u:close")
     b.adjust(1, 1, 2, 1, 1, 1, 1)
-    return _HOME_TEXT, b.as_markup()
+    text = _HOME_TEXT + (_PANEL_HINT if runtime.webapp_url() else "")
+    return text, b.as_markup()
 
 
 CHATS_PER_PAGE = 5
@@ -283,7 +289,7 @@ async def view_chat(cid: int, viewer_id: int) -> tuple[str, InlineKeyboardMarkup
     b.button(text="📥 Перенести настройки", callback_data=f"u:cp:{cid}")
     b.button(text="🚪 Убрать бота из чата", callback_data=f"a:leave:{cid}")
     b.button(text="⬅️ Назад", callback_data="u:chats")
-    b.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1)
+    b.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1)
     return text, b.as_markup()
 
 
@@ -460,8 +466,10 @@ async def _render_widget(b: InlineKeyboardBuilder, cid: int, widget: str, s) -> 
             b.row(*row)
 
     elif widget == "welcome_text":
-        mark = "задано" if s.welcome_text else "не задано"
-        b.row(_btn(f"✏️ Текст приветствия ({mark})", f"u:wtxt:{cid}"))
+        rows = await db.ans_list("welcome", cid)
+        b.row(_btn(f"✏️ Заготовки: {len(rows)}", f"u:an:{cid}:w:{cid}:0"))
+        if s.welcome_text and not rows:
+            b.row(_btn("⤴️ Перенести старый текст в заготовки", f"u:wmig:{cid}"))
 
     elif widget == "trustsoft":
         n = sum(1 for bit, _ in config.TRUST_BITS if s.trust_mask & bit)
@@ -577,7 +585,7 @@ async def view_wl_entry(cid: int, row_id: int) -> tuple[str, InlineKeyboardMarku
 # Ответов у объекта может быть несколько, бот берёт случайный. Владельца в
 # callback пишем одной буквой: t — триггер, c — счётчик (лимит 64 байта).
 
-ANS_OWNER = {"t": "trig", "c": "cmd", "r": "rules"}
+ANS_OWNER = {"t": "trig", "c": "cmd", "r": "rules", "w": "welcome"}
 ANS_LIMIT = 60   # ответов бывает много: списки-рулетки вроде !судимости
 
 
@@ -612,6 +620,8 @@ def _ans_back(cid: int, code: str, oid: int) -> str:
         return f"u:tgv:{cid}:{oid}"
     if code == "r":
         return f"u:s:{cid}:rules"
+    if code == "w":
+        return f"u:s:{cid}:welcome"
     return f"u:cmv:{cid}:{oid}"
 
 
@@ -620,12 +630,13 @@ async def view_answers(cid: int, code: str, oid: int,
     owner = ANS_OWNER[code]
     rows = await db.ans_list(owner, oid)
     chunk, page, pages = _page_slice(rows, page)
-    title = {"t": "🎯 Триггер", "r": "📜 Правила"}.get(code, "🔢 Счётчик")
+    title = {"t": "🎯 Триггер", "r": "📜 Правила",
+             "w": "👋 Приветствие"}.get(code, "🔢 Счётчик")
     lines = [
         f"<b>{title} · варианты ответа</b>\n",
         "Вариантов несколько — бот отвечает случайным. "
         + ("Можно текст, медиа или медиа с подписью."
-           if code in ("t", "r") else "Только текст: число в скобках дописывается само."),
+           if code in ("t", "r", "w") else "Только текст: число в скобках дописывается само."),
         f"\nВсего: <b>{len(rows)}</b> из {ANS_LIMIT}"
         + (f" · страница {page + 1} из {pages}" if pages > 1 else ""),
         "",
@@ -1238,19 +1249,14 @@ async def cb_net_lift(cb: CallbackQuery) -> None:
     await _net_redraw(cb, net["id"])
 
 
-@router.callback_query(F.data.startswith("u:netim:"))
-async def cb_net_import(cb: CallbackQuery, bot: Bot) -> None:
+async def net_import_run(bot: Bot, net_id: int, by_id: int | None) -> tuple[int, int]:
     """Свести активные баны сетки: у кого где висит — применить во всех её чатах.
 
     Только вручную: чаты могли жить своей жизнью, и внезапная пачка чужих банов
-    должна быть осознанным решением.
+    должна быть осознанным решением. Возвращает (заведено, не вышло).
     """
     from ..services import moderation, net as netsvc
-    net = await _net_guard(cb, int(cb.data.split(":")[2]))
-    if net is None:
-        return
-    await cb.answer("Свожу баны сетки, это займёт время…")
-    chats = await db.net_chats(net["id"])
+    chats = await db.net_chats(net_id)
     seen: dict[int, str] = {}
     for c in chats:
         for p in await db.active_punishments(c["chat_id"], limit=MASS_LIMIT):
@@ -1264,13 +1270,23 @@ async def cb_net_import(cb: CallbackQuery, bot: Bot) -> None:
                 continue
             await asyncio.sleep(config.NET_DELAY)
             pid = await moderation.apply_punishment(
-                bot, c["chat_id"], user, "ban", 0, f"сетка: {reason}", cb.from_user.id)
+                bot, c["chat_id"], user, "ban", 0, f"сетка: {reason}", by_id)
             if pid:
                 done += 1
             else:
                 failed += 1
     for c in chats:
         await db.add_event(c["chat_id"], "manual", "сведение банов сетки")
+    return done, failed
+
+
+@router.callback_query(F.data.startswith("u:netim:"))
+async def cb_net_import(cb: CallbackQuery, bot: Bot) -> None:
+    net = await _net_guard(cb, int(cb.data.split(":")[2]))
+    if net is None:
+        return
+    await cb.answer("Свожу баны сетки, это займёт время…")
+    done, failed = await net_import_run(bot, net["id"], cb.from_user.id)
     text, kb = await view_net(net["id"])
     await cb.message.edit_text(
         text + f"\n\n📥 Заведено банов: <b>{done}</b>"
@@ -1424,6 +1440,25 @@ async def cmd_menu(message: Message, state: FSMContext, bot: Bot) -> None:
     await state.clear()
     text, kb = await view_home(message.from_user.id, bot)
     await message.answer(text, reply_markup=kb)
+
+
+@router.message(Command("panel"))
+async def cmd_panel(message: Message) -> None:
+    """Открыть панель кнопкой в сообщении.
+
+    Кнопка рядом с полем ввода ставится один раз при старте, и клиенты
+    подхватывают её только когда перечитают данные бота — то есть после
+    переоткрытия чата. Эта команда отдаёт свежий адрес сразу.
+    """
+    url = runtime.webapp_url()
+    if not url:
+        await message.answer(
+            "Панель сейчас недоступна: публичный адрес не получен. "
+            "Проверьте туннель в логах или задайте WEBAPP_URL.")
+        return
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="🖥 Открыть панель", web_app=WebAppInfo(url=url)))
+    await message.answer("Панель — то же меню, но страницей.", reply_markup=b.as_markup())
 
 
 @router.callback_query(F.data == "u:home")
@@ -1790,6 +1825,21 @@ async def cb_stats(cb: CallbackQuery) -> None:
 
 
 # ---------- приветствие и правила (FSM) ----------
+
+@router.callback_query(F.data.startswith("u:wmig:"))
+async def cb_welcome_migrate(cb: CallbackQuery) -> None:
+    """Старое приветствие одним текстом переносим в список заготовок."""
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    s = await db.get_settings(cid)
+    if s.welcome_text:
+        await db.ans_add("welcome", cid, s.welcome_text)
+        await db.set_setting(cid, "welcome_text", None)
+    text, kb = await view_section(cid, "welcome")
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer("Перенесено")
+
 
 @router.callback_query(F.data.startswith("u:wtxt:"))
 async def cb_welcome_text(cb: CallbackQuery, state: FSMContext) -> None:
@@ -2386,7 +2436,7 @@ async def cb_answer_add(cb: CallbackQuery, state: FSMContext) -> None:
     hint = ("Пришлите текст, медиа или медиа с подписью.\n"
             "Форматирование и премиум-эмодзи сохраняются; вставить премиум-эмодзи "
             "может только человек с Telegram Premium."
-            if code in ("t", "r") else "Пришлите текст ответа. Число в скобках бот допишет сам.")
+            if code in ("t", "r", "w") else "Пришлите текст ответа. Число в скобках бот допишет сам.")
     await _ask(
         cb, state, Input.ans_new,
         f"<b>🎲 Новый вариант ответа</b>\n\n{hint}",
@@ -2404,9 +2454,9 @@ async def ans_new_input(message: Message, state: FSMContext, bot: Bot) -> None:
         await _done(message, bot, state, await view_answers(cid, code, oid, 0))
         return
 
-    media = triggers.extract_media(message) if code in ("t", "r") else None
+    media = triggers.extract_media(message) if code in ("t", "r", "w") else None
     if media is None and not raw:
-        hint = ("⚠️ Нужен текст или медиа." if code in ("t", "r")
+        hint = ("⚠️ Нужен текст или медиа." if code in ("t", "r", "w")
                 else "⚠️ Нужен текст: у счётчиков ответы только текстовые.")
         await _retry(message, bot, state, f"<b>🎲 Новый вариант ответа</b>\n\n{hint}")
         return

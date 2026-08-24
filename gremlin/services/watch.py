@@ -56,6 +56,22 @@ _SHORTENER = re.compile(
     r"t\.co|rb\.gy|shorturl\.at|u\.to|qps\.ru|gg\.gg)\b", re.IGNORECASE)
 _TELEGRAPH = re.compile(r"(telegra\.ph|graph\.org)/", re.IGNORECASE)
 _BOT_MENTION = re.compile(r"@\w*bot\b", re.IGNORECASE)
+
+# Юзернейм самого Гремлина. Его упоминание — обращение к нам, а не признак
+# спама: люди зовут бота по имени, и штрафовать их за это глупо.
+SELF_USERNAME = ""
+
+
+def set_self(username: str | None) -> None:
+    global SELF_USERNAME
+    SELF_USERNAME = (username or "").lower()
+
+
+def _drop_self(text: str) -> str:
+    if not SELF_USERNAME:
+        return text
+    return re.sub(rf"@{re.escape(SELF_USERNAME)}\b", " ", text, flags=re.IGNORECASE)
+
 # кириллица и латиница внутри одного слова = гомоглифы
 _HOMOGLYPH_WORD = re.compile(r"\w*(?:[а-яё][a-z]|[a-z][а-яё])\w*", re.IGNORECASE)
 # валютные/декоративные символы внутри слов (Д€ᛠርKO€)
@@ -186,6 +202,7 @@ def message_parts(text: str) -> tuple[int, int, list[str]]:
     hard, reasons = 0, []
     if not text:
         return 0, 0, []
+    text = _drop_self(text)      # «@GremlinModBot, привет» — это к нам, не спам
     if _TELEGRAPH.search(text):
         hard += 45; reasons.append("telegra.ph-ссылка")
     if _INVISIBLE.search(_visible_part(text)):

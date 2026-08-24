@@ -17,6 +17,17 @@ services:
       BACKUP_DIR: /app/data/backups
       TG_SESSION: /app/data/audit_session
 
+    # чтобы контейнер видел локальную Ollama на хосте
+    # (AI_BASE_URL=http://host.docker.internal:11434/v1). На Docker Desktop
+    # это имя есть и так, строка нужна для докера на Linux.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # порт веб-панели. Наружу его выводит туннель (ngrok/cloudflared),
+    # публичный адрес кладётся в WEBAPP_URL. Без WEBAPP_URL панель не поднимается.
+    ports:
+      - "127.0.0.1:8081:8081"
+
     volumes:
       - ./.env:/app/.env:ro     # только чтение: контейнер его не меняет
       - ./data:/app/data        # база, сессия, медиа триггеров, логи

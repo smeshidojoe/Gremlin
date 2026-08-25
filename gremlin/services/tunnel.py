@@ -22,7 +22,7 @@ _URL = re.compile(rb"https://[a-z0-9][a-z0-9-]*\.trycloudflare\.com")
 
 RETRY_MIN = 5        # пауза перед перезапуском упавшего туннеля, сек
 RETRY_MAX = 300
-STARTUP_WAIT = 60    # сколько ждём адрес, прежде чем считать запуск неудачным
+POLL = 30            # как часто спрашиваем адрес у соседнего контейнера, сек
 
 
 async def _run_once(on_url) -> None:
@@ -57,8 +57,51 @@ async def _run_once(on_url) -> None:
     logger.warning("cloudflared завершился с кодом %s", proc.returncode)
 
 
+async def _quick_hostname() -> str | None:
+    """Спросить у соседнего cloudflared, какое имя ему выдали."""
+    import aiohttp
+    url = f"{config.TUNNEL_METRICS}/quicktunnel"
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.get(url) as resp:
+                if resp.status != 200:
+                    return None
+                # content_type=None: cloudflared отдаёт json без заголовка,
+                # и строгая проверка aiohttp иначе роняет разбор
+                data = await resp.json(content_type=None)
+                return (data.get("hostname") or "").strip() or None
+    except Exception:
+        return None
+
+
+async def watcher(on_url) -> None:
+    """Следить за адресом туннеля, который поднят отдельным контейнером.
+
+    Свой cloudflared удобен тем, что ничего не нужно настраивать, но умирает
+    вместе с ботом: каждая пересборка выдаёт новое имя, а клиенты Telegram
+    держат кнопку панели в кэше и стучатся по старому — оттуда и ошибка 1033.
+    Отдельный контейнер этим не страдает: бот пересобирается, туннель стоит.
+    """
+    last = "?"          # чтобы первая же проверка попала в лог, даже пустая
+    while True:
+        host = await _quick_hostname()
+        url = f"https://{host}" if host else None
+        if url != last:
+            if url:
+                logger.info("панель доступна по адресу %s", url)
+            else:
+                logger.warning("сосед-туннель (%s) не отвечает", config.TUNNEL_METRICS)
+            last = url
+            await on_url(url)
+        await asyncio.sleep(POLL)
+
+
 async def supervisor(on_url) -> None:
     """Держим туннель поднятым, пока жив бот. Отменяется вместе с задачей."""
+    if config.TUNNEL_METRICS:
+        await watcher(on_url)          # туннель не наш, только следим за адресом
+        return
     delay = RETRY_MIN
     while True:
         try:

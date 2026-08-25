@@ -89,10 +89,17 @@ async def _punish(bot: Bot, chat_id: int, user_id: int, kind: str, minutes: int,
 
 
 async def _can_target(bot: Bot, chat_id: int, user_id: int) -> bool:
-    """Мутить админов и самого бота нельзя — в играх тоже."""
+    """Кому игра вправе выдать наказание.
+
+    Админов и самого бота — нельзя. Тех, кто в чате не состоит, — тоже: под
+    постами привязанного канала пишут и жмут кнопки люди, которые в группу не
+    вступали, и приз им вручать некуда.
+    """
     if user_id in await adm_cache.chat_admin_ids(bot, chat_id):
         return False
-    return user_id != (await bot.me()).id
+    if user_id == (await bot.me()).id:
+        return False
+    return await adm_cache.is_member(bot, chat_id, user_id)
 
 
 # ---------- русская рулетка ----------

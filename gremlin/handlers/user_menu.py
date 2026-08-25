@@ -444,11 +444,11 @@ async def _render_widget(b: InlineKeyboardBuilder, cid: int, widget: str, s) -> 
         b.row(_btn("➕ Добавить слова", f"u:wda:{cid}"))
 
     elif widget == "wl":
+        # список отдельной страницей: при десятке записей раздел превращался
+        # в лес кнопок, за которым не видно самих настроек
+        n = len(await db.wl_entries(cid))
+        b.row(_btn(f"📋 Список: {n}", f"u:wll:{cid}:0"))
         b.row(_btn("➕ Добавить", f"u:wla:{cid}"))
-        for e in await db.wl_entries(cid):
-            who = e["title"] or await db.user_label(e["user_id"], e["username"])
-            b.row(_btn(f"👤 {who} · {_wl_scopes_label(e['scopes'])}",
-                       f"u:wle:{cid}:{e['row_id']}"))
 
     elif widget == "logsel":
         log_str = str(s.log_chat_id) if s.log_chat_id else "не задан"
@@ -549,7 +549,56 @@ def _wl_pack(on: set[str]) -> set[str]:
     return set(on)
 
 
-async def view_wl_entry(cid: int, row_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+WL_PER_PAGE = 8
+
+
+async def view_wl(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """Кто в вайтлисте. Нажатие на запись открывает её уровни игнора."""
+    rows = await db.wl_entries(cid)
+    pages = max(1, -(-len(rows) // WL_PER_PAGE))
+    page = max(0, min(page, pages - 1))
+    chunk = rows[page * WL_PER_PAGE:(page + 1) * WL_PER_PAGE]
+
+    lines = [
+        "<b>🕊 Вайтлист</b>\n",
+        "Для этих людей и каналов проверки не работают. Нажмите на запись, "
+        "чтобы выбрать, что именно им прощать.",
+        f"\nВсего: <b>{len(rows)}</b>"
+        + (f" · страница {page + 1} из {pages}" if pages > 1 else ""),
+        "",
+    ]
+    if not rows:
+        lines.append("Пусто.")
+    b = InlineKeyboardBuilder()
+    for i, e in enumerate(chunk, page * WL_PER_PAGE + 1):
+        who = e["title"] or await db.user_label(e["user_id"], e["username"])
+        lines.append(f"{i}. {utils.esc(who)} — <i>{_wl_scopes_label(e['scopes'])}</i>")
+        b.row(_btn(f"{i}. 👤 {str(who)[:28]}", f"u:wle:{cid}:{e['row_id']}:{page}"))
+    _pager(b, cid, "u:wll", page, pages)
+    b.row(_btn("➕ Добавить", f"u:wla:{cid}"))
+    b.row(_btn("⬅️ Назад", f"u:s:{cid}:wl"))
+    return "\n".join(lines), b.as_markup()
+
+
+async def _show_wl(cb: CallbackQuery, cid: int, page: int) -> None:
+    text, kb = await view_wl(cid, page)
+    await cb.message.edit_text(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("u:wll:"))
+async def cb_wl_list(cb: CallbackQuery, state: FSMContext) -> None:
+    _, _, cid, page = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    await state.clear()
+    text, kb = await view_wl(cid, int(page))
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+async def view_wl_entry(cid: int, row_id: int,
+                        page: int = 0) -> tuple[str, InlineKeyboardMarkup] | None:
     """Карточка записи вайтлиста: галочками отмечаем, что для неё не проверять."""
     e = await db.wl_entry(cid, row_id)
     if e is None:
@@ -565,18 +614,19 @@ async def view_wl_entry(cid: int, row_id: int) -> tuple[str, InlineKeyboardMarku
     )
     b = InlineKeyboardBuilder()
     b.row(_btn(f"{'✅' if 'all' in e['scopes'] else '☐'} {config.WL_SCOPE_LABELS['all']}",
-               f"u:wlt:{cid}:{row_id}:all"))
+               f"u:wlt:{cid}:{row_id}:all:{page}"))
     row = []
     for scope in WL_PARTS:
         mark = "✅" if scope in on else "☐"
-        row.append(_btn(f"{mark} {config.WL_SCOPE_LABELS[scope]}", f"u:wlt:{cid}:{row_id}:{scope}"))
+        row.append(_btn(f"{mark} {config.WL_SCOPE_LABELS[scope]}",
+                        f"u:wlt:{cid}:{row_id}:{scope}:{page}"))
         if len(row) == 2:
             b.row(*row)
             row = []
     if row:
         b.row(*row)
-    b.row(_btn("🗑 Убрать из вайтлиста", f"u:wld:{cid}:{row_id}"))
-    b.row(_btn("⬅️ Назад", f"u:s:{cid}:wl"))
+    b.row(_btn("🗑 Убрать из вайтлиста", f"u:wld:{cid}:{row_id}:{page}"))
+    b.row(_btn("⬅️ Назад", f"u:wll:{cid}:{page}"))
     return text, b.as_markup()
 
 
@@ -2842,27 +2892,31 @@ async def cb_leave_yes(cb: CallbackQuery, bot: Bot) -> None:
 @router.callback_query(F.data.startswith("u:wld:"))
 async def cb_wl_del(cb: CallbackQuery) -> None:
     """Убрать объект из вайтлиста целиком — со всеми его уровнями."""
-    _, _, cid, rid = cb.data.split(":")
-    cid = int(cid)
+    parts = cb.data.split(":")
+    cid, rid = int(parts[2]), int(parts[3])
+    page = int(parts[4]) if len(parts) > 4 else 0
     if not await _guard(cb, cid):
         return
-    e = await db.wl_entry(cid, int(rid))
+    e = await db.wl_entry(cid, rid)
     if e is not None:
         await db.wl_set_scopes(cid, e["user_id"], e["username"], e["title"], set())
-    await _rerender(cb, cid, "wl")
+    text, kb = await view_wl(cid, page)
+    await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer("Удалено")
 
 
 @router.callback_query(F.data.startswith("u:wle:"))
 async def cb_wl_entry(cb: CallbackQuery, state: FSMContext) -> None:
-    _, _, cid, rid = cb.data.split(":")
-    cid = int(cid)
+    parts = cb.data.split(":")
+    cid, rid = int(parts[2]), int(parts[3])
+    page = int(parts[4]) if len(parts) > 4 else 0
     if not await _guard(cb, cid):
         return
     await state.clear()
-    view = await view_wl_entry(cid, int(rid))
+    view = await view_wl_entry(cid, rid, page)
     if view is None:
-        await _rerender(cb, cid, "wl")
+        text, kb = await view_wl(cid, page)
+        await cb.message.edit_text(text, reply_markup=kb)
         await cb.answer("Запись не найдена", show_alert=True)
         return
     await cb.message.edit_text(view[0], reply_markup=view[1])
@@ -2873,13 +2927,14 @@ async def cb_wl_entry(cb: CallbackQuery, state: FSMContext) -> None:
 async def cb_wl_toggle(cb: CallbackQuery, bot: Bot) -> None:
     """Галочка уровня. «Полный игнор» — тумблер над всеми остальными."""
     from ..services import moderation
-    _, _, cid, rid, scope = cb.data.split(":")
-    cid, rid = int(cid), int(rid)
+    parts = cb.data.split(":")
+    cid, rid, scope = int(parts[2]), int(parts[3]), parts[4]
+    page = int(parts[5]) if len(parts) > 5 else 0
     if not await _guard(cb, cid):
         return
     e = await db.wl_entry(cid, rid)
     if e is None:
-        await _rerender(cb, cid, "wl")
+        await _show_wl(cb, cid, page)
         await cb.answer("Запись не найдена", show_alert=True)
         return
 
@@ -2893,7 +2948,7 @@ async def cb_wl_toggle(cb: CallbackQuery, bot: Bot) -> None:
 
     await db.wl_set_scopes(cid, e["user_id"], e["username"], e["title"], _wl_pack(on))
     if not on:                            # ни одной галочки — записи больше нет
-        await _rerender(cb, cid, "wl")
+        await _show_wl(cb, cid, page)
         await cb.answer("Убран из вайтлиста")
         return
 
@@ -2909,9 +2964,9 @@ async def cb_wl_toggle(cb: CallbackQuery, bot: Bot) -> None:
                 )
     # уровни перезаписаны — у строк новые id, запись ищем по самому объекту
     fresh = await db.wl_entry_by_key(cid, e["user_id"], e["username"])
-    view = await view_wl_entry(cid, fresh["row_id"]) if fresh else None
+    view = await view_wl_entry(cid, fresh["row_id"], page) if fresh else None
     if view is None:
-        await _rerender(cb, cid, "wl")
+        await _show_wl(cb, cid, page)
     else:
         await cb.message.edit_text(view[0], reply_markup=view[1])
     await cb.answer((config.WL_SCOPE_LABELS[scope] + (" ✅" if scope in on or (

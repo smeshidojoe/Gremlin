@@ -110,6 +110,35 @@ def score_bot_message(message, self_bot: str | None = None) -> tuple[int, list[s
     return watch.score_content(message.text or "", _button_urls(message), self_bot)
 
 
+async def _caller_punish(bot: Bot, chat_id: int, s, uid: int, bot_uname: str | None,
+                         score: int) -> tuple[str, int]:
+    """Что полагается тому, кто позвал спам-бота.
+
+    Это то же нарушение, что ловит раздел «Инлайн-боты»: человек дёрнул чужого
+    бота, и тот напечатал рекламу. Bot API таких сообщений боту не отдаёт, их
+    видит только юзербот — но правило должно быть одно, иначе одно и то же
+    наказывается по-разному в зависимости от того, кто первым заметил.
+
+    Раздел выключен — остаётся старое поведение наблюдения: бан с порога
+    «автобан», иначе только карточка.
+    """
+    if not s.inline_on:
+        return ("ban", 0) if s.watch_ban and score >= s.watch_ban else ("delete", 0)
+    if await db.inline_wl_allowed(chat_id, bot_uname, None):
+        return "delete", 0                     # этого бота в чате разрешили
+    scopes = await db.wl_scopes_for(chat_id, uid, None)
+    if scopes & {"all", "inline"}:
+        return "delete", 0                     # звавший в вайтлисте
+    kind, mute_min = s.inline_punish, s.inline_mute_min
+    if s.trust_on:
+        from .services import trust
+        kind = trust.soften(kind, await trust.level(bot, chat_id, uid, s),
+                            s, config.TRUST_S_INLINE)
+    if s.inline_spam and score >= s.inline_spam:
+        kind, mute_min = "ban", 0              # спам-содержимое — сразу бан
+    return kind, mute_min
+
+
 async def _handle_bot_spam(bot: Bot, chat_id: int, message, sender) -> None:
     """Сообщение от стороннего бота: удалить и наказать того, кто его позвал."""
     s = await db.get_settings(chat_id)
@@ -144,32 +173,40 @@ async def _handle_bot_spam(bot: Bot, chat_id: int, message, sender) -> None:
         f"📢 Бот: @{utils.esc(bot_uname or '—')}",
         f"📎 Сигналы: {utils.esc(why)} — <b>{score} очков</b>",
     ]
-    pid = None
+    pid, applied = None, "delete"
     if caller:
         uid, name, uname, _ = caller
         who = utils.mention(uid, name, uname)
         lines.append(f"👤 Позвал: {who} (<code>{uid}</code>)")
-        if s.watch_ban and score >= s.watch_ban:
-            try:
-                from .services import adm_cache
-                member = await adm_cache.is_member(bot, chat_id, uid)
-                await bot.ban_chat_member(chat_id, uid)
-                pid = await db.add_punishment(
-                    chat_id, uid, uname, name, "ban",
-                    f"вызов спам-бота @{bot_uname}", None, None, was_member=member,
-                )
-                lines.append("⛔ Забанен автоматически")
-            except Exception:
-                logger.warning("ban caller %s failed in %s", uid, chat_id, exc_info=True)
+        kind, mute_min = await _caller_punish(bot, chat_id, s, uid, uname, score)
+        if kind != "delete":
+            from .services import net
+            user = await net.user_stub(uid)
+            user.username, user.full_name = uname or user.username, name or user.full_name
+            pid = await moderation.apply_punishment(
+                bot, chat_id, user, kind, mute_min,
+                f"вызов спам-бота @{bot_uname}: {why} ({score})", None)
+            if pid:
+                row = await db.get_punishment(pid)
+                applied = row["kind"] if row else kind
+                lines.append("⛔ Забанен автоматически" if applied == "ban"
+                             else f"🔇 Мут на {utils.fmt_minutes(mute_min)}")
+            else:
+                lines.append("⚠️ Наказать не вышло — не хватило прав")
     else:
         lines.append("👤 Позвавшего найти не удалось")
         uid = None
 
     await db.add_event(chat_id, "watch", f"спам-бот @{bot_uname} ({score}) — {why}")
-    await moderation.send_card(
+    sent = await moderation.send_card(
         bot, chat_id, config.BIT_WATCH, "\n".join(lines) + body,
-        pid, "ban" if pid else "delete", caller[0] if caller else None,
+        pid, applied if pid else "delete", caller[0] if caller else None,
     )
+    if pid:
+        from .services import net
+        asyncio.create_task(net.spread_and_note(
+            bot, sent, chat_id, await net.user_stub(uid), applied, mute_min,
+            f"вызов спам-бота @{bot_uname}", None))
 
 
 async def refresh_members(chat_id: int | None = None) -> int:

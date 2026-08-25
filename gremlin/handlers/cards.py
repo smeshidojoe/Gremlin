@@ -27,6 +27,8 @@ async def _mark(cb: CallbackQuery, note: str) -> bool:
     except Exception:
         logger.warning("card edit failed (старше 48 часов?)", exc_info=True)
         return False
+    # кнопок на карточке больше нет — пусть и приписка сетки об этом знает
+    moderation.remember_card(cb.message.chat.id, cb.message.message_id, text, None)
     # та же карточка лежит копией в другом логе — там кнопки тоже надо убрать
     await moderation.update_twins(cb.bot, cb.message.chat.id, cb.message.message_id, text)
     return True

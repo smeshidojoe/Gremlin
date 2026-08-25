@@ -42,3 +42,24 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # Туннель для панели. Отдельный контейнер, потому что переживает пересборку
+  # бота: адрес панели тогда не меняется на каждый docker compose up, и кнопка
+  # у поля ввода (её клиент Telegram кэширует) продолжает работать.
+  #
+  # Бот берёт адрес у него через служебный порт 2000 — за это отвечает
+  # TUNNEL_METRICS в .env. Убрать эту переменную — и бот снова поднимет
+  # cloudflared внутри себя, как раньше.
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: gremlin-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --metrics 0.0.0.0:2000 --url http://gremlin:8081
+    depends_on:
+      - gremlin
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -205,8 +205,17 @@ async def punish_ex(bot: Bot, chat_id: int, user: User, kind: str, mute_min: int
     """
     if kind == "delete":
         return None, None
-    until = utils.until_ts(mute_min) if kind == "mute" else None
+    # спрашиваем до наказания: после бана статус всё равно станет «kicked»,
+    # и уже не понять, был человек в чате или писал из комментариев
     member = await adm_cache.is_member(bot, chat_id, user.id)
+    if kind == "mute" and not member:
+        # Telegram ограничивает только участников: под постами привязанного
+        # канала пишут те, кто в группу не вступал, и restrict на них падает
+        # с PARTICIPANT_ID_INVALID — наказание просто не применялось. Отпускать
+        # такого нельзя, поэтому мут превращается в бан.
+        kind = "ban"
+        reason += " · мут не-участнику невозможен, заменён баном"
+    until = utils.until_ts(mute_min) if kind == "mute" else None
     try:
         if kind == "mute":
             s = await db.get_settings(chat_id)
@@ -231,31 +240,13 @@ async def punish_ex(bot: Bot, chat_id: int, user: User, kind: str, mute_min: int
 
 async def apply_punishment(bot: Bot, chat_id: int, user: User, kind: str,
                            mute_min: int, reason: str, by_id: int | None) -> int | None:
-    """Применить mute/ban к юзеру, записать в базу. Вернуть id наказания (None если delete)."""
-    if kind == "delete":
-        return None
-    until = utils.until_ts(mute_min) if kind == "mute" else None
-    # спрашиваем до наказания: после бана статус всё равно станет «kicked»,
-    # и уже не понять, был человек в чате или писал из комментариев
-    member = await adm_cache.is_member(bot, chat_id, user.id)
-    try:
-        if kind == "mute":
-            s = await db.get_settings(chat_id)
-            await bot.restrict_chat_member(
-                chat_id, user.id, permissions=mute_perms(s.mute_reactions),
-                until_date=until,
-            )
-        elif kind == "ban":
-            await bot.ban_chat_member(chat_id, user.id)
-    except Exception:
-        logger.warning("punish %s failed in %s for %s", kind, chat_id, user.id, exc_info=True)
-        return None
-    from . import trust
-    trust.invalidate(chat_id, user.id)      # уровень доверия сразу падает
-    return await db.add_punishment(
-        chat_id, user.id, user.username, user.full_name, kind, reason, until, by_id,
-        was_member=member,
-    )
+    """Применить mute/ban к юзеру, записать в базу. Вернуть id наказания (None если delete).
+
+    Тонкая обёртка над punish_ex: текст ошибки нужен не всем, а расходиться
+    в поведении две копии одного кода рано или поздно начнут.
+    """
+    pid, _ = await punish_ex(bot, chat_id, user, kind, mute_min, reason, by_id)
+    return pid
 
 
 async def lift_punishment(bot: Bot, pid: int,
@@ -496,9 +487,27 @@ async def send_card(bot: Bot, chat_id: int, bit: int, text: str,
         except Exception:
             logger.warning("card send failed for chat %s -> %s", chat_id, target,
                            exc_info=True)
+    for target, msg_id in sent:
+        remember_card(target, msg_id, text, kb)
     if len(sent) > 1:
         await link_twins(sent)
     return sent
+
+
+# Что сейчас написано в отправленных карточках: (чат, сообщение) -> (текст, кнопки).
+# Нужно, чтобы дописать итог рассылки по сетке. Спрашивать текст у Telegram
+# нечем: getMessage в Bot API нет, а трюк с edit_message_reply_markup, которым
+# это делалось раньше, заодно снимал кнопки, а на уже поправленной карточке
+# падал — и карточка затиралась одной строчкой итога.
+_bodies: dict[tuple[int, int], tuple[str, object]] = {}
+_BODIES_MAX = 1000
+
+
+def remember_card(chat_id: int, msg_id: int, text: str, markup=None) -> None:
+    """Запомнить текущий вид карточки. Зовётся и после правок кнопками."""
+    if len(_bodies) > _BODIES_MAX:
+        _bodies.clear()          # итог приходит через секунды, старьё не нужно
+    _bodies[(chat_id, msg_id)] = (text, markup)
 
 
 async def append_to_cards(bot: Bot, sent: list, line: str) -> None:
@@ -506,22 +515,28 @@ async def append_to_cards(bot: Bot, sent: list, line: str) -> None:
 
     Нужно для итогов, которые известны позже самой карточки: рассылка по сетке
     идёт с паузами и заканчивается через несколько секунд после события.
+
+    Карточку, которую не помним (например, бот успел перезапуститься), не
+    трогаем: лучше остаться без приписки, чем затереть ею всю карточку.
     """
     for chat_id, msg_id in sent:
-        try:
-            msg = await bot.edit_message_reply_markup(chat_id=chat_id, message_id=msg_id)
-        except Exception:
-            msg = None
+        body = _bodies.get((chat_id, msg_id))
+        if body is None:
+            logger.info("карточка %s/%s не в памяти, приписку пропускаю",
+                        chat_id, msg_id)
+            continue
+        text, markup = body
+        text += line
         try:
             await bot.edit_message_text(
-                (msg.html_text if msg else "") + line,
-                chat_id=chat_id, message_id=msg_id,
-                reply_markup=msg.reply_markup if msg else None,
+                text, chat_id=chat_id, message_id=msg_id, reply_markup=markup,
                 link_preview_options=LinkPreviewOptions(is_disabled=True),
             )
         except Exception:
             logger.warning("не вышло дописать итог в карточку %s/%s", chat_id, msg_id,
                            exc_info=True)
+            continue
+        remember_card(chat_id, msg_id, text, markup)
 
 
 # Одно и то же событие уходит и в лог чата, и в глобальный. Кнопки живут в обеих
@@ -559,6 +574,8 @@ async def update_twins(bot: Bot, chat_id: int, msg_id: int, text: str) -> None:
         except Exception:
             logger.warning("twin card edit failed: %s/%s", twin_chat, twin_msg,
                            exc_info=True)
+            continue
+        remember_card(twin_chat, twin_msg, text, None)
 
 
 # Альбом (несколько фото одним постом) приходит боту как несколько отдельных
@@ -606,6 +623,13 @@ async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
     reason = f"{feature_label}: {detail}" if detail else feature_label
     pid = await apply_punishment(bot, chat.id, user, punish_kind, mute_min, reason, None)
     applied = punish_kind if pid else "delete"
+    if pid:
+        # мут не-участнику мог превратиться в бан — на карточке должно быть то,
+        # что случилось на самом деле, а не то, что задумывалось
+        row = await db.get_punishment(pid)
+        if row is not None:
+            applied = row["kind"]
+            reason = row["reason"]
 
     if key is not None:
         # ждём остальные части поста, потом рисуем одну карточку на весь альбом

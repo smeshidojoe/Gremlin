@@ -28,6 +28,7 @@ SPIN_TICKS = 8          # сколько раз крутим точки
 SPIN_STEP = 0.7         # пауза между кадрами, сек
 CLEANUP_AFTER = 15 * 60  # через сколько убрать сообщение рулетки
 ACTIVE_DAYS = 30        # кого считаем «писавшим недавно»
+MEMBER_CHECKS = 60      # сколько кандидатов максимум проверяем на членство
 
 KIND_LABEL = {"ban": "бан", "mute": "мут"}
 MODE_LABEL = {"all": "весь чат", "opt": "по кнопке"}
@@ -224,6 +225,32 @@ async def _candidates(bot: Bot, chat_id: int) -> list[int]:
     return out
 
 
+async def _in_chat(bot: Bot, chat_id: int, people: list[int]) -> list[int]:
+    """Оставить из кандидатов тех, кто в чате состоит. Не больше двух.
+
+    Статистика сообщений участником не делает: под постами привязанного канала
+    пишут те, кто в группу не вступал, а кто-то из писавших давно ушёл. Барабан
+    таких выбирал наравне со всеми — и приз уезжал человеку, которого в чате
+    нет. Проверяем членство по одному в случайном порядке и останавливаемся,
+    как только нашли двоих: первый — победитель (порядок случайный, так что
+    выбор равномерный), второй нужен лишь чтобы понять, что он не один.
+
+    Проверок не больше MEMBER_CHECKS: у Telegram на каждую уходит запрос.
+    Если за них нашёлся ровно один — считаем, что он и правда один, и разыграем
+    ему 50 на 50. Ошибиться в эту сторону мягче, чем забанить наверняка.
+    """
+    pool = list(people)
+    random.shuffle(pool)
+    found, checked = [], 0
+    for uid in pool:
+        if len(found) >= 2 or checked >= MEMBER_CHECKS:
+            break
+        checked += 1
+        if await adm_cache.is_member(bot, chat_id, uid):
+            found.append(uid)
+    return found
+
+
 async def _spin(bot: Bot, chat_id: int, msg_id: int, head: str) -> None:
     """Анимация «крутим барабан»: три точки бегают в конце строки."""
     frames = [".", "..", "..."]
@@ -310,14 +337,19 @@ async def _run_all(bot: Bot, cfg: dict, by_id: int) -> str:
     people = await _candidates(bot, chat_id)
     if not people:
         return "Некого разыгрывать: за месяц никто не писал."
+    # членство проверяем до объявления: если играть не с кем, лучше промолчать
+    members = await _in_chat(bot, chat_id, people)
+    if not members:
+        return ("Некого разыгрывать: из писавших за месяц в чате никого не "
+                "осталось — это были комментаторы под постами или уже ушедшие.")
     head = "🎯 <b>Бан-рулетка!</b>\n\nБарабан крутится, судьба выбирает жертву"
     msg = await bot.send_message(chat_id, f"{head}.")
     await _spin(bot, chat_id, msg.message_id, head)
-    if len(people) == 1:
-        await _lone_hero(bot, chat_id, msg.message_id, people[0], cfg, by_id)
+    if len(members) == 1:
+        await _lone_hero(bot, chat_id, msg.message_id, members[0], cfg, by_id)
         return "Крутанул: участник был один, шанс 50 на 50."
-    await _finish(bot, chat_id, msg.message_id, random.choice(people), cfg, by_id)
-    return f"Крутанул среди {len(people)} человек."
+    await _finish(bot, chat_id, msg.message_id, members[0], cfg, by_id)
+    return "Крутанул среди участников чата."
 
 
 async def _run_opt(bot: Bot, cfg: dict, by_id: int) -> str:
@@ -354,7 +386,8 @@ async def _collect(bot: Bot, key: tuple[int, int], cfg: dict, by_id: int,
         except Exception:
             pass          # текст не изменился или сообщение удалили — не страшно
 
-    people = list(_joined.pop(key, set()))
+    # кнопку жмут и комментаторы под постами: они в группе не состоят
+    people = await _in_chat(bot, chat_id, list(_joined.pop(key, set())))
     if not people:
         try:
             await bot.edit_message_text(
@@ -385,6 +418,10 @@ async def cb_join(cb: CallbackQuery) -> None:
         return
     if cb.from_user.id in await adm_cache.chat_admin_ids(cb.bot, key[0]):
         await cb.answer("Админам нельзя, это нечестно.", show_alert=True)
+        return
+    if not await adm_cache.is_member(cb.bot, key[0], cb.from_user.id):
+        # пишущим под постами канала кнопка видна, но приз им вручить некуда
+        await cb.answer("Ты в чате не состоишь — сначала вступи.", show_alert=True)
         return
     people.add(cb.from_user.id)
     await cb.answer("Ты в игре 🎰")

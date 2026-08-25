@@ -250,6 +250,32 @@ async def _misuse(message: Message, bot: Bot, s) -> None:
 RULES_DELAY = 2.0    # даём Telegram завести тред обсуждения под постом
 
 
+# Посты, под которыми правила уже опубликованы: (чат, тред) -> когда.
+# Живёт в памяти: и правка, и части альбома прилетают в те же секунды, а после
+# перезапуска отличить повтор от нового поста и так помогает edit_date.
+_rules_done: dict[tuple[int, int], float] = {}
+RULES_MEMORY = 6 * 3600
+
+
+def _rules_needed(message: Message) -> bool:
+    """Впервые ли видим этот пост.
+
+    Правка поста приходит отдельным апдейтом edited_message, и без проверки
+    бот дописывал правила заново на каждое исправление опечатки. Пост с
+    альбомом приходит несколькими сообщениями одного треда — там та же беда.
+    """
+    if message.edit_date is not None:
+        return False                     # это тот же пост, просто поправленный
+    now = time.time()
+    for key in [k for k, ts in _rules_done.items() if now - ts > RULES_MEMORY]:
+        _rules_done.pop(key, None)
+    key = (message.chat.id, message.message_thread_id or message.message_id)
+    if key in _rules_done:
+        return False                     # другая часть того же поста
+    _rules_done[key] = now
+    return True
+
+
 async def _post_rules(message: Message, chat_id: int) -> None:
     """Ответить на автопересылку поста заготовкой правил.
 
@@ -814,7 +840,7 @@ async def moderate(message: Message, bot: Bot) -> None:
     if message.sender_chat is not None:
         # анонимный админ этого же чата — ок; автопересылка из привязанного канала — ок
         if message.sender_chat.id == chat.id or message.is_automatic_forward:
-            if message.is_automatic_forward and s.rules_on:
+            if message.is_automatic_forward and s.rules_on and _rules_needed(message):
                 asyncio.create_task(_post_rules(message, chat.id))
             return
         anon_body = moderation.message_body(message)   # текст берём до удаления

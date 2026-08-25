@@ -289,6 +289,10 @@ WEB_HOST = os.getenv("WEB_HOST") or "0.0.0.0"
 WEB_PORT = int(os.getenv("WEB_PORT") or 8081)
 TUNNEL_ON = (os.getenv("TUNNEL_ON") or "1") not in ("0", "false", "no")
 CLOUDFLARED_BIN = os.getenv("CLOUDFLARED_BIN") or "cloudflared"
+# Если туннель поднят отдельным контейнером — адрес спрашиваем у него, а сами
+# cloudflared не запускаем. Так ссылка на панель не меняется от каждой
+# пересборки бота: живёт туннель, а не процесс рядом с ботом.
+TUNNEL_METRICS = (os.getenv("TUNNEL_METRICS") or "").rstrip("/")
 # панель поднимается, если есть свой адрес либо разрешён туннель
 WEB_ON = bool(WEBAPP_URL) or TUNNEL_ON
 

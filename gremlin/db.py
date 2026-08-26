@@ -110,6 +110,8 @@ CREATE TABLE IF NOT EXISTS settings(
     battle_min      INTEGER NOT NULL DEFAULT 5,
     court_punish    TEXT    NOT NULL DEFAULT 'mute',
     court_min       INTEGER NOT NULL DEFAULT 15,
+    nn_mode         INTEGER NOT NULL DEFAULT 1,
+    nn_threshold    INTEGER NOT NULL DEFAULT 85,
     cards_on        INTEGER NOT NULL DEFAULT 1,
     card_mask       INTEGER NOT NULL DEFAULT 4095,
     log_chat_id     INTEGER
@@ -218,6 +220,22 @@ CREATE TABLE IF NOT EXISTS warns(
     active   INTEGER NOT NULL DEFAULT 1   -- 0 = сгорел при наказании или снят вручную
 );
 CREATE INDEX IF NOT EXISTS idx_warns_chat ON warns(chat_id, user_id, active);
+CREATE TABLE IF NOT EXISTS samples(
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id  INTEGER NOT NULL,
+    user_id  INTEGER,
+    ts       INTEGER NOT NULL,
+    origin   TEXT    NOT NULL,      -- auto | card | manual | random
+    feature  TEXT,                  -- какое правило сработало
+    label    TEXT    NOT NULL,      -- spam | ok | unknown
+    pid      INTEGER,               -- наказание, к которому относится улика
+    text     TEXT    NOT NULL,
+    extra    TEXT,                  -- подписи и ссылки с кнопок
+    vec      BLOB                   -- эмбеддинг, считаем лениво
+);
+CREATE INDEX IF NOT EXISTS idx_samples_chat ON samples(chat_id, id);
+CREATE INDEX IF NOT EXISTS idx_samples_pick ON samples(label, origin);
+CREATE INDEX IF NOT EXISTS idx_samples_pid ON samples(pid);
 CREATE TABLE IF NOT EXISTS events(
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER,
@@ -324,6 +342,8 @@ class Settings:
     battle_min: int = 5
     court_punish: str = "mute"
     court_min: int = 15
+    nn_mode: int = 1
+    nn_threshold: int = 85
     cards_on: int = 1
     card_mask: int = 4095
     log_chat_id: int | None = None
@@ -364,6 +384,8 @@ _SETTINGS_MIGRATIONS = {
     "trust_days": "INTEGER NOT NULL DEFAULT 3",
     "trust_msgs": "INTEGER NOT NULL DEFAULT 20",
     "trust_mask": "INTEGER NOT NULL DEFAULT 31",
+    "nn_mode": "INTEGER NOT NULL DEFAULT 1",
+    "nn_threshold": "INTEGER NOT NULL DEFAULT 85",
     "games_on": "INTEGER NOT NULL DEFAULT 0",
     "games_adm": "INTEGER NOT NULL DEFAULT 0",
     "rus_punish": "TEXT NOT NULL DEFAULT 'mute'",
@@ -968,6 +990,127 @@ async def active_punishments_count(chat_id: int) -> int:
 
 
 # ---------- события ----------
+
+# ---------- улики для нейрофильтра ----------
+#
+# Копим тексты, за которые наказывали, и тексты, которые оказались нормальными.
+# origin говорит, откуда взялась оценка, и это важнее самой оценки:
+#   auto   — сработало правило автомода. Годится как пример спама.
+#   card   — админ нажал кнопку на карточке. Самый честный сигнал: человек
+#            посмотрел на конкретное сообщение и решил.
+#   manual — !mute/!ban руками. Причины у людей свои («заебал байтами»),
+#            к содержимому сообщения они часто отношения не имеют, поэтому
+#            в обучающую выборку такие улики НЕ идут — только в историю.
+#   random — обычное сообщение из потока, отрицательный пример.
+
+PROFILE_ORIGINS = ("auto", "card", "random")
+
+
+async def sample_add(chat_id: int, user_id: int | None, origin: str, label: str,
+                     text: str, feature: str | None = None,
+                     extra: str | None = None, pid: int | None = None) -> int | None:
+    """Запомнить улику. Пустой текст не храним — учиться на нём нечему."""
+    text = (text or "").strip()[:config.SAMPLE_TEXT_LIMIT]
+    if not text:
+        return None
+    cur = await _db.execute(
+        """INSERT INTO samples (chat_id, user_id, ts, origin, feature, label,
+                                pid, text, extra)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (chat_id, user_id, _now(), origin, feature, label, pid, text, extra),
+    )
+    await _db.commit()
+    return cur.lastrowid
+
+
+async def sample_relabel(sample_id: int, label: str, origin: str | None = None) -> None:
+    """Переставить оценку: админ снял наказание — значит это был не спам."""
+    if origin:
+        await _db.execute("UPDATE samples SET label = ?, origin = ?, vec = NULL "
+                          "WHERE id = ?", (label, origin, sample_id))
+    else:
+        await _db.execute("UPDATE samples SET label = ?, vec = NULL WHERE id = ?",
+                          (label, sample_id))
+    await _db.commit()
+
+
+async def sample_relabel_by_pid(pid: int, label: str) -> int:
+    """То же по id наказания — им помечены улики автомода."""
+    cur = await _db.execute(
+        "UPDATE samples SET label = ?, origin = 'card', vec = NULL WHERE pid = ?",
+        (label, pid))
+    await _db.commit()
+    return cur.rowcount or 0
+
+
+async def sample_last_for(chat_id: int, user_id: int, within: int = 3600):
+    """Последняя улика по человеку — к ней привязываются нажатия на карточке."""
+    cur = await _db.execute(
+        """SELECT * FROM samples WHERE chat_id = ? AND user_id = ? AND ts > ?
+           ORDER BY id DESC LIMIT 1""",
+        (chat_id, user_id, _now() - within))
+    return await cur.fetchone()
+
+
+async def samples_profile(chat_id: int | None = None,
+                          limit: int = 2000) -> list[aiosqlite.Row]:
+    """Улики, годные для сравнения: без ручных наказаний с их вольными причинами."""
+    marks = ",".join("?" * len(PROFILE_ORIGINS))
+    q = f"SELECT * FROM samples WHERE origin IN ({marks}) AND label != 'unknown'"
+    args = list(PROFILE_ORIGINS)
+    if chat_id is not None:
+        q += " AND chat_id = ?"
+        args.append(chat_id)
+    cur = await _db.execute(q + " ORDER BY id DESC LIMIT ?", (*args, limit))
+    return await cur.fetchall()
+
+
+async def samples_stats(chat_id: int | None = None) -> dict:
+    """Сколько чего накопилось — показываем в меню, чтобы было видно прогресс."""
+    q = "SELECT origin, label, COUNT(*) AS n FROM samples"
+    args: tuple = ()
+    if chat_id is not None:
+        q += " WHERE chat_id = ?"
+        args = (chat_id,)
+    cur = await _db.execute(q + " GROUP BY origin, label", args)
+    out: dict = {"spam": 0, "ok": 0, "unknown": 0, "profile": 0, "total": 0}
+    for r in await cur.fetchall():
+        out["total"] += r["n"]
+        out[r["label"]] = out.get(r["label"], 0) + r["n"]
+        if r["origin"] in PROFILE_ORIGINS and r["label"] != "unknown":
+            out["profile"] += r["n"]
+    return out
+
+
+async def samples_without_vec(limit: int = 200) -> list[aiosqlite.Row]:
+    cur = await _db.execute(
+        f"""SELECT id, text FROM samples
+            WHERE vec IS NULL AND label != 'unknown'
+              AND origin IN ({",".join("?" * len(PROFILE_ORIGINS))})
+            ORDER BY id DESC LIMIT ?""", (*PROFILE_ORIGINS, limit))
+    return await cur.fetchall()
+
+
+async def sample_set_vec(sample_id: int, vec: bytes) -> None:
+    await _db.execute("UPDATE samples SET vec = ? WHERE id = ?", (vec, sample_id))
+    await _db.commit()
+
+
+async def sample_by_id(sample_id: int):
+    cur = await _db.execute("SELECT * FROM samples WHERE id = ?", (sample_id,))
+    return await cur.fetchone()
+
+
+async def samples_trim(keep: int) -> int:
+    """Не даём копилке расти бесконечно: держим последние keep улик на чат."""
+    cur = await _db.execute(
+        """DELETE FROM samples WHERE id NOT IN (
+               SELECT id FROM samples s2
+               WHERE s2.chat_id = samples.chat_id
+               ORDER BY s2.id DESC LIMIT ?)""", (keep,))
+    await _db.commit()
+    return cur.rowcount or 0
+
 
 async def add_event(chat_id: int | None, kind: str, text: str) -> None:
     await _db.execute(

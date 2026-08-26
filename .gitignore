@@ -51,3 +51,6 @@ dist/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# веса нейрофильтра: 118 МБ, качаются скриптом tools/download_model.py
+tools/models/

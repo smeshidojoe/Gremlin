@@ -14,7 +14,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .. import config, db, runtime, schema, utils
-from ..services import adm_cache, filters as flt, resolve, triggers
+from ..services import adm_cache, filters as flt, nn, resolve, triggers
 
 logger = logging.getLogger("gremlin.user_menu")
 
@@ -453,6 +453,19 @@ async def _render_widget(b: InlineKeyboardBuilder, cid: int, widget: str, s) -> 
     elif widget == "logsel":
         log_str = str(s.log_chat_id) if s.log_chat_id else "не задан"
         b.row(_btn(f"📍 Лог-чат: {log_str}", f"u:logsel:{cid}"))
+
+    elif widget == "nn_stats":
+        st = await db.samples_stats(cid)
+        b.row(_btn(f"📊 Улик: {st['total']} · для сравнения: {st['profile']}",
+                   f"u:s:{cid}:nn"))
+        b.row(_btn(f"⛔ Спам: {st['spam']} · 🕊 Норма: {st['ok']} · "
+                   f"✋ Ручные: {st['unknown']}", f"u:s:{cid}:nn"))
+        state = nn.status()
+        b.row(_btn(f"🧠 Модель: {'загружена' if state == 'ok' else state}",
+                   f"u:s:{cid}:nn"))
+        if st["profile"] < config.NN_MIN_SAMPLES:
+            b.row(_btn(f"⏳ Для сравнения нужно хотя бы {config.NN_MIN_SAMPLES}",
+                       f"u:s:{cid}:nn"))
 
     elif widget == "cardbits":
         row = []

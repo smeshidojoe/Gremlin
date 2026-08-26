@@ -1,6 +1,7 @@
 """Групповой пайплайн: команды !mute/!ban/!warn, капча и автомодерация всех сообщений."""
 import asyncio
 import logging
+import random
 import time
 
 from aiogram import Bot, F, Router
@@ -10,7 +11,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .. import config, db, utils
 from ..services import (
-    adm_cache, filters, moderation, net, resolve, triggers, trust, watch,
+    adm_cache, filters, moderation, net, nn, resolve, triggers, trust, watch,
 )
 
 logger = logging.getLogger("gremlin.group")
@@ -96,7 +97,9 @@ def _manual_card_text(kind: str, chat_title: str | None, target, reason: str,
         f"👤 {who} (<code>{target.id}</code>)",
         f"📎 Причина: {utils.esc(reason)}",
     ]
-    if kind == "mute":
+    # срок показываем и у временного бана: мут не-участнику
+    # превращается в бан на тот же срок, и это должно быть видно
+    if kind == "mute" or until:
         lines.append(f"⏰ До: {utils.fmt_ts(until)}")
     lines.append(f"👮 Кем: {admin}")
     return "\n".join(lines) + body
@@ -149,6 +152,11 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
         await message.reply(f"Не получилось: {utils.esc(err or 'Telegram отказал')}.")
         return
     until = utils.until_ts(mute_min) if kind == "mute" else None
+    # мут не-участнику превращается в бан на тот же срок — в карточке должно
+    # быть то, что случилось, иначе админ будет искать несуществующий мут
+    row = await db.get_punishment(pid)
+    if row is not None:
+        kind, reason, until = row["kind"], row["reason"], row["until_ts"]
 
     # В чат ничего не пишем: наказание и так видно в лог-чате, а сообщение
     # нарушителя вместе с командой убираем, чтобы лента осталась чистой.
@@ -159,6 +167,19 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
             await msg.delete()
         except Exception:
             pass
+
+    # Ручное наказание тоже запоминаем, но помечаем «unknown»: причины у людей
+    # свои, к тексту сообщения они часто отношения не имеют, и учить на этом
+    # модель — верный способ научить её ерунде.
+    s = await db.get_settings(message.chat.id)
+    if s.nn_mode and message.reply_to_message is not None:
+        await db.sample_add(
+            message.chat.id, target.id, "manual", "unknown",
+            message.reply_to_message.text or message.reply_to_message.caption or "",
+            feature=kind,
+            extra="\n".join(moderation._buttons(message.reply_to_message)) or None,
+            pid=pid,
+        )
 
     bit = config.BIT_BAN if kind == "ban" else config.BIT_MUTE
     card = _manual_card_text(
@@ -261,15 +282,20 @@ def _rules_needed(message: Message) -> bool:
     """Впервые ли видим этот пост.
 
     Правка поста приходит отдельным апдейтом edited_message, и без проверки
-    бот дописывал правила заново на каждое исправление опечатки. Пост с
-    альбомом приходит несколькими сообщениями одного треда — там та же беда.
+    бот дописывал правила заново на каждое исправление опечатки.
+
+    Пост с альбомом приезжает в обсуждение отдельным сообщением на каждую
+    картинку, и тред у каждого свой — по треду их не склеить. Склеивает
+    media_group_id: он общий у всех частей одного поста.
     """
     if message.edit_date is not None:
         return False                     # это тот же пост, просто поправленный
     now = time.time()
     for key in [k for k, ts in _rules_done.items() if now - ts > RULES_MEMORY]:
         _rules_done.pop(key, None)
-    key = (message.chat.id, message.message_thread_id or message.message_id)
+    group = getattr(message, "media_group_id", None)
+    key = (message.chat.id,
+           f"g{group}" if group else message.message_thread_id or message.message_id)
     if key in _rules_done:
         return False                     # другая часть того же поста
     _rules_done[key] = now
@@ -1049,6 +1075,17 @@ async def moderate(message: Message, bot: Bot) -> None:
     if s.watch_on and "watch" not in scopes:
         lvl = await trust.level(bot, chat.id, user.id, s) if s.trust_on else None
         await watch.check_user(bot, chat, user, s, message, lvl)
+
+    # Сообщение прошло всю модерацию — изредка берём такое как образец нормы.
+    # Без отрицательных примеров сравнивать не с чем: всё будет «похоже на спам».
+    if s.nn_mode and random.randrange(config.SAMPLE_RANDOM_EVERY) == 0:
+        await db.sample_add(chat.id, user.id, "random", "ok",
+                            message.text or message.caption or "")
+
+    # Теневой прогон нейрофильтра: вердикт уходит в журнал и никого не трогает.
+    # Стоит после всей модерации — интересно именно то, что правила пропустили.
+    if s.nn_mode > 1:
+        await nn.shadow(chat.id, message, s)
 
     # --- триггеры (последними: на удалённое модерацией не отвечаем) ---
     await fire_trigger(bot, message, s)

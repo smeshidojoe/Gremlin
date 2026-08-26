@@ -23,6 +23,14 @@ _URL = re.compile(rb"https://[a-z0-9][a-z0-9-]*\.trycloudflare\.com")
 RETRY_MIN = 5        # пауза перед перезапуском упавшего туннеля, сек
 RETRY_MAX = 300
 POLL = 30            # как часто спрашиваем адрес у соседнего контейнера, сек
+# сколько проверок подряд должно провалиться, прежде чем считать адрес
+# потерянным. Одиночный промах — это переподключение соседа или его рестарт,
+# и снимать из-за него кнопку панели глупо: клиент Telegram кэширует её
+# состояние, а через полминуты адрес тот же самый
+MISS_LIMIT = 3
+# первые проверки после старта: cloudflared регистрирует имя на trycloudflare
+# секунд десять, бот поднимается быстрее — молчим, пока сосед просыпается
+WARMUP = 2
 
 
 async def _run_once(on_url) -> None:
@@ -66,12 +74,16 @@ async def _quick_hostname() -> str | None:
         async with aiohttp.ClientSession(timeout=timeout) as sess:
             async with sess.get(url) as resp:
                 if resp.status != 200:
+                    logger.debug("сосед-туннель ответил %s", resp.status)
                     return None
                 # content_type=None: cloudflared отдаёт json без заголовка,
                 # и строгая проверка aiohttp иначе роняет разбор
                 data = await resp.json(content_type=None)
                 return (data.get("hostname") or "").strip() or None
-    except Exception:
+    except Exception as e:
+        # причину держим в debug: на старте и при переподключении соседа
+        # это норма, а в обычном логе выглядело бы аварией
+        logger.debug("сосед-туннель не ответил: %s: %s", type(e).__name__, e)
         return None
 
 
@@ -84,14 +96,30 @@ async def watcher(on_url) -> None:
     Отдельный контейнер этим не страдает: бот пересобирается, туннель стоит.
     """
     last = "?"          # чтобы первая же проверка попала в лог, даже пустая
+    misses = 0          # неудачные проверки подряд
+    checks = 0
     while True:
+        checks += 1
         host = await _quick_hostname()
         url = f"https://{host}" if host else None
+
+        if url is None:
+            misses += 1
+            # пока сосед просыпается или моргнул — держим прежний адрес:
+            # кнопка панели остаётся на месте, лишней тревоги в логе нет
+            if checks <= WARMUP or misses < MISS_LIMIT:
+                logger.debug("сосед-туннель молчит (%d-я проверка подряд)", misses)
+                await asyncio.sleep(POLL)
+                continue
+        else:
+            misses = 0
+
         if url != last:
             if url:
                 logger.info("панель доступна по адресу %s", url)
             else:
-                logger.warning("сосед-туннель (%s) не отвечает", config.TUNNEL_METRICS)
+                logger.warning("сосед-туннель (%s) не отвечает %d проверок подряд — "
+                               "убираю кнопку панели", config.TUNNEL_METRICS, misses)
             last = url
             await on_url(url)
         await asyncio.sleep(POLL)

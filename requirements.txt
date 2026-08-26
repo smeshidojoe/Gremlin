@@ -1,5 +1,10 @@
-aiogram>=3.15
+aiogram>=3.30,<4
 aiosqlite>=0.20
 python-dotenv>=1.0
 telethon>=1.36
 aiohttp>=3.9
+
+# нейрофильтр: rubert-tiny2 в ONNX. torch не нужен — модель
+# экспортируется один раз на хосте через tools/export_onnx.py
+onnxruntime>=1.20
+tokenizers>=0.20

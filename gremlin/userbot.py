@@ -197,6 +197,11 @@ async def _handle_bot_spam(bot: Bot, chat_id: int, message, sender) -> None:
         lines.append("👤 Позвавшего найти не удалось")
         uid = None
 
+    if s.nn_mode:
+        await db.sample_add(chat_id, uid, "auto", "spam",
+                            getattr(message, "text", "") or "",
+                            feature="спам-бот",
+                            extra="\n".join(_button_urls(message)) or None, pid=pid)
     await db.add_event(chat_id, "watch", f"спам-бот @{bot_uname} ({score}) — {why}")
     sent = await moderation.send_card(
         bot, chat_id, config.BIT_WATCH, "\n".join(lines) + body,

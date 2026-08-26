@@ -359,6 +359,23 @@ function widgetHtml(name, w, cid, d) {
           <button class="btn small" data-act="set-log">Изменить</button></div>
       </div>`;
 
+    case 'nn_stats':
+      return `<div class="card">
+        <h2>📊 Копилка улик</h2>
+        <div class="row"><div class="label">Всего собрано</div>
+          <div class="value">${w.total}</div></div>
+        <div class="row"><div class="label">Годится для сравнения<small>без ручных наказаний</small></div>
+          <div class="value">${w.profile}</div></div>
+        <div class="row"><div class="label">⛔ Спам</div><div class="value">${w.spam}</div></div>
+        <div class="row"><div class="label">🕊 Норма</div><div class="value">${w.ok}</div></div>
+        <div class="row"><div class="label">✋ Ручные наказания<small>в сравнении не участвуют</small></div>
+          <div class="value">${w.unknown}</div></div>
+        <div class="row"><div class="label">🧠 Модель</div>
+          <div class="value">${esc(w.model === 'ok' ? 'загружена' : w.model)}</div></div>
+        ${w.profile < w.min ? `<div class="muted" style="margin-top:10px">
+          Для сравнения нужно хотя бы ${w.min} улик — пока копим.</div>` : ''}
+      </div>`;
+
     case 'cardbits':
       return `<div class="card"><h2>Что слать карточками</h2>${chips(w.bits, 'bit-card')}</div>`;
 

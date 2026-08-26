@@ -78,19 +78,26 @@ _MEDIA_LABELS = {
 }
 
 BODY_LIMIT = 1000     # карточка целиком не должна упереться в лимит Telegram
+# с какой длины улику прячем под кат: две строки сворачивать незачем,
+# а на простыне спама Telegram покажет начало и кнопку «развернуть»
+QUOTE_EXPAND = 200
 
 
 def body_block(text: str | None, media: str | None = None) -> str:
     """Хвост карточки с текстом сообщения нарушителя.
 
     Показываем обычным текстом, без его форматирования: в логе нужна улика,
-    а не кликабельная спам-ссылка.
+    а не кликабельная спам-ссылка. Улику заворачиваем в цитату — так видно,
+    где кончаются поля карточки и начинается чужой текст, — а длинную ещё и
+    сворачиваем: рекламная простыня иначе занимает пол-экрана в лог-чате.
     """
     text = (text or "").strip()
     if not text:
         return f"\n\n💬 <b>Сообщение:</b> [{media} без текста]" if media else ""
     head = f"💬 <b>Сообщение ({media}):</b>" if media else "💬 <b>Сообщение:</b>"
-    return f"\n\n{head}\n{utils.esc(utils.chunk(text, BODY_LIMIT))}"
+    body = utils.esc(utils.chunk(text, BODY_LIMIT))
+    tag = "<blockquote expandable>" if len(body) > QUOTE_EXPAND else "<blockquote>"
+    return f"\n\n{head}\n{tag}{body}</blockquote>"
 
 
 def _buttons(message) -> list[str]:
@@ -167,7 +174,9 @@ def card_text(kind: str, chat_title: str | None, user_id: int, who: str,
         f"👤 {who} (<code>{user_id}</code>)",
         f"📎 Причина: {utils.esc(reason)}",
     ]
-    if kind == "mute":
+    # срок показываем и у временного бана: мут не-участнику
+    # превращается в бан на тот же срок, и это должно быть видно
+    if kind == "mute" or until:
         lines.append(f"⏰ До: {utils.fmt_ts(until)}")
     lines.append(f"👮 Кем: {by}")
     return "\n".join(lines) + body
@@ -208,14 +217,19 @@ async def punish_ex(bot: Bot, chat_id: int, user: User, kind: str, mute_min: int
     # спрашиваем до наказания: после бана статус всё равно станет «kicked»,
     # и уже не понять, был человек в чате или писал из комментариев
     member = await adm_cache.is_member(bot, chat_id, user.id)
-    if kind == "mute" and not member:
+    swapped = kind == "mute" and not member
+    if swapped:
         # Telegram ограничивает только участников: под постами привязанного
         # канала пишут те, кто в группу не вступал, и restrict на них падает
         # с PARTICIPANT_ID_INVALID — наказание просто не применялось. Отпускать
         # такого нельзя, поэтому мут превращается в бан.
         kind = "ban"
-        reason += " · мут не-участнику невозможен, заменён баном"
-    until = utils.until_ts(mute_min) if kind == "mute" else None
+        reason += (" · мут не-участнику невозможен, заменён баном на тот же срок"
+                   if mute_min else " · мут не-участнику невозможен, заменён баном")
+    # Срок сохраняем и у подменённого бана: у banChatMember есть until_date,
+    # и Telegram снимет бан ровно тогда, когда закончился бы мут. Просили
+    # сутки тишины — значит сутки, а не «навсегда» из-за технической детали.
+    until = utils.until_ts(mute_min) if kind == "mute" or swapped else None
     try:
         if kind == "mute":
             s = await db.get_settings(chat_id)
@@ -224,7 +238,8 @@ async def punish_ex(bot: Bot, chat_id: int, user: User, kind: str, mute_min: int
                 until_date=until,
             )
         elif kind == "ban":
-            await bot.ban_chat_member(chat_id, user.id)
+            # until_date=None — бан навсегда, как и раньше у обычных банов
+            await bot.ban_chat_member(chat_id, user.id, until_date=until)
     except Exception as e:
         logger.warning("punish %s failed in %s for %s", kind, chat_id, user.id,
                        exc_info=True)
@@ -441,7 +456,12 @@ def unban_note(link: str | None) -> str:
     if link is None:
         return ""
     if link:
-        return f"\n\nСсылка для входа (по заявке, её бот одобрит сам):\n{link}"
+        # Сам бот написать разбаненному не может: Telegram не даёт ботам писать
+        # первыми тем, кто с ними не переписывался. Значит ссылку передаёт админ,
+        # и в карточке это должно быть сказано прямо.
+        return ("\n\n📨 <b>Передайте ссылку человеку</b> — бот не может написать "
+                "ему сам, пока тот не начал с ботом переписку.\n"
+                f"Вход по заявке, её бот одобрит сам:\n{link}")
     return ("\n\n⚠️ Ссылку создать не вышло — боту нужно право "
             "«Пригласительные ссылки».")
 
@@ -623,6 +643,7 @@ async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
     reason = f"{feature_label}: {detail}" if detail else feature_label
     pid = await apply_punishment(bot, chat.id, user, punish_kind, mute_min, reason, None)
     applied = punish_kind if pid else "delete"
+    until_ts = utils.until_ts(mute_min) if applied == "mute" else None
     if pid:
         # мут не-участнику мог превратиться в бан — на карточке должно быть то,
         # что случилось на самом деле, а не то, что задумывалось
@@ -630,6 +651,7 @@ async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
         if row is not None:
             applied = row["kind"]
             reason = row["reason"]
+            until_ts = row["until_ts"]
 
     if key is not None:
         # ждём остальные части поста, потом рисуем одну карточку на весь альбом
@@ -640,12 +662,22 @@ async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
     who = utils.mention(user.id, user.full_name, user.username)
     card = card_text(
         applied, chat.title, user.id, who, reason, "Gremlin (автомод)",
-        utils.until_ts(mute_min) if applied == "mute" else None, body,
+        until_ts, body,
     )
     await db.add_event(
         chat.id, feature_label,
         f"{applied}: {user.full_name} ({user.id}) — {reason}",
     )
+    # улика для нейрофильтра: сработало правило — значит это пример спама
+    s = await db.get_settings(chat.id)
+    if s.nn_mode:
+        await db.sample_add(
+            chat.id, user.id, "auto", "spam",
+            message.text or message.caption or "",
+            feature=feature_label, pid=pid,
+            extra="\n".join(_buttons(message)) or None,
+        )
+
     sent = await send_card(bot, chat.id, feature_bit, card, pid, applied, user.id)
     if applied != "delete":
         from . import net

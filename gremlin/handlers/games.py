@@ -139,21 +139,20 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
                         message.from_user.username)
     sent = await message.reply("🔫 Крутим барабан…")
     await asyncio.sleep(2)
+    # итог выстрела оставляем в чате: он короткий, и по нему видно, кто
+    # когда крутил. Самоуничтожается только служебная воркотня про кулдаун
     if not hit:
         await sent.edit_text(f"🔫 {who}: {random.choice(_RUS_SAFE)}")
-        _later(bot, message.chat.id, sent.message_id)
         return
     if not await _can_target(bot, message.chat.id, message.from_user.id):
         await sent.edit_text(f"🔫 {who}: {random.choice(_RUS_HIT)}\n"
                              f"<i>…но админов пуля не берёт.</i>")
-        _later(bot, message.chat.id, sent.message_id)
         return
     ok = await _punish(bot, message.chat.id, message.from_user.id, kind, minutes,
                        "проиграл в русскую рулетку")
     tail = (f"{prize_label(kind, minutes).capitalize()}." if ok
             else "…но пистолет заклинило: у бота нет прав.")
     await sent.edit_text(f"🔫 {who}: {random.choice(_RUS_HIT)}\n{tail}")
-    _later(bot, message.chat.id, sent.message_id)
 
 
 # ---------- дуэль ----------

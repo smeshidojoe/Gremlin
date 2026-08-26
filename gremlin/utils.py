@@ -215,18 +215,32 @@ def chunk(text: str, limit: int = 3900) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-_STORIES = dict(can_post_stories=False, can_edit_stories=False, can_delete_stories=False)
+def _rights(**kw) -> ChatAdministratorRights:
+    """Набор админ-прав, переживающий обновления Bot API.
+
+    В каждой версии Telegram добавляет новые права, и в aiogram они приходят
+    обязательными полями: 10.3 принесла can_send_welcome_messages, и бот
+    после pip install падал на старте прямо в импорте. Поэтому не перечисляем
+    поля руками, а спрашиваем у модели: чего не назвали — False, чего в этой
+    версии ещё нет — выбрасываем.
+    """
+    fields = ChatAdministratorRights.model_fields
+    kw = {k: v for k, v in kw.items() if k in fields}
+    for name, f in fields.items():
+        if name not in kw and f.is_required():
+            kw[name] = False
+    return ChatAdministratorRights(**kw)
+
+
 # права, которые нужны боту для модерации/логов (запрашиваются при добавлении)
-_BOT_RIGHTS = ChatAdministratorRights(
-    is_anonymous=False, can_manage_chat=True, can_delete_messages=True,
-    can_manage_video_chats=False, can_restrict_members=True, can_promote_members=False,
-    can_change_info=False, can_invite_users=True, can_pin_messages=True, **_STORIES,
+_BOT_RIGHTS = _rights(
+    can_manage_chat=True, can_delete_messages=True, can_restrict_members=True,
+    can_invite_users=True, can_pin_messages=True,
 )
 # юзер должен иметь как минимум те же права + promote (иначе не сможет добавить бота админом)
-_USER_RIGHTS = ChatAdministratorRights(
-    is_anonymous=False, can_manage_chat=True, can_delete_messages=True,
-    can_manage_video_chats=False, can_restrict_members=True, can_promote_members=True,
-    can_change_info=False, can_invite_users=True, can_pin_messages=True, **_STORIES,
+_USER_RIGHTS = _rights(
+    can_manage_chat=True, can_delete_messages=True, can_restrict_members=True,
+    can_promote_members=True, can_invite_users=True, can_pin_messages=True,
 )
 
 

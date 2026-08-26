@@ -11,7 +11,7 @@ from aiogram.types import (ErrorEvent, MenuButtonCommands, MenuButtonWebApp,
 from . import config, db, runtime, userbot
 from .handlers import admin_menu, cards, events, fun, games, group, user_menu
 from .middlewares import TrackingMiddleware
-from .services import backup, digest, errorlog, moderation
+from .services import backup, digest, errorlog, moderation, nn
 
 logger = logging.getLogger("gremlin")
 
@@ -112,6 +112,7 @@ async def main() -> None:
     titles_task = asyncio.create_task(games.titles_scheduler(bot))
     backup_task = asyncio.create_task(backup.scheduler())
     sweeper_task = asyncio.create_task(moderation.card_sweeper(bot))
+    nn_task = asyncio.create_task(nn.keeper())
     try:
         ub = await userbot.start(bot)
     except Exception:
@@ -131,6 +132,7 @@ async def main() -> None:
         titles_task.cancel()
         backup_task.cancel()
         sweeper_task.cancel()
+        nn_task.cancel()
         if tunnel_task is not None:
             tunnel_task.cancel()
         if web_runner is not None:

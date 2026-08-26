@@ -16,6 +16,9 @@ services:
       TRIG_DIR: /app/data/triggers
       BACKUP_DIR: /app/data/backups
       TG_SESSION: /app/data/audit_session
+      # модель нейрофильтра монтируется, а не копируется в образ:
+      # 240 МБ весов в каждой пересборке никому не нужны
+      NN_MODEL_DIR: /app/models/rubert-tiny2
 
     # чтобы контейнер видел локальную Ollama на хосте
     # (AI_BASE_URL=http://host.docker.internal:11434/v1). На Docker Desktop
@@ -31,6 +34,7 @@ services:
     volumes:
       - ./.env:/app/.env:ro     # только чтение: контейнер его не меняет
       - ./data:/app/data        # база, сессия, медиа триггеров, логи
+      - ./tools/models:/app/models:ro   # rubert-tiny2 для нейрофильтра
 
     # потолок памяти. memswap = mem_limit означает «свопа нет»:
     # иначе контейнер при утечке будет тихо свопиться вместо падения

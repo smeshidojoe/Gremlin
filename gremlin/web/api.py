@@ -20,7 +20,7 @@ from aiohttp import web
 from .. import config, db, schema, utils
 from ..handlers import fun as fun_h, user_menu as um
 from ..services import (adm_cache, digest as digest_svc, filters as flt,
-                        moderation, net as net_svc, resolve, transfer)
+                        moderation, net as net_svc, nn, resolve, transfer)
 from . import auth
 
 logger = logging.getLogger("gremlin.web.api")
@@ -271,6 +271,12 @@ async def _widget(cid: int, widget: str, s) -> dict:
 
     if widget == "logsel":
         return {"chat_id": s.log_chat_id, "title": await _log_label(s.log_chat_id)}
+
+    if widget == "nn_stats":
+        st = await db.samples_stats(cid)
+        st["min"] = config.NN_MIN_SAMPLES
+        st["model"] = nn.status()
+        return st
 
     if widget == "cardbits":
         return {"bits": [{"bit": bit, "label": lbl, "on": bool(s.card_mask & bit)}

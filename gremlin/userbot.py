@@ -20,8 +20,6 @@ from .services import moderation, stats_collect, watch
 
 logger = logging.getLogger("gremlin.userbot")
 
-# «сколько последних сообщений просматриваем, чтобы найти, кто позвал бота»
-_LOOKBACK = 30
 # кто кого звал: (chat_id, bot_username) -> (user_id, имя, username, monotonic)
 _recent_calls: dict[tuple[int, str], tuple] = {}
 _CALL_TTL = 300

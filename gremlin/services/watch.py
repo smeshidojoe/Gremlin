@@ -346,6 +346,17 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None) -> None:
 
     total = p_score + pot + cosmetic
     reasons = p_reasons + m_reasons
+    # Имя и ник — тоже текст. «Анна | 18+ ЛС» и «Кристина ❤️ пиши в лс» для
+    # эвристик разные, для модели — одно и то же, поэтому сравниваем профиль
+    # с теми, за кого в этом чате уже банили.
+    if settings.watch_nn and total:
+        from . import nn
+        face = (f"{user.full_name} @{user.username}" if user.username
+                else user.full_name)
+        sim = await nn.face_score(chat.id, face)
+        if sim is not None and sim >= config.PROFILE_SIM:
+            total += config.PROFILE_POINTS
+            reasons.append(f"имя как у забаненных профилей ({sim}%)")
     if saved:
         reasons.append(f"копилка за сутки: {saved}")
     # Не участник чата (комментатор под постом канала) — тот же текст от него
@@ -392,6 +403,11 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None) -> None:
             f"🤖 Кем: Gremlin (автомод)" + body_gone
         )
         await db.add_event(chat.id, "watch", f"ban: {user.full_name} ({user.id}) — {why} ({total})")
+        if settings.watch_nn:
+            from . import nn
+            face = (f"{user.full_name} @{user.username}" if user.username
+                    else user.full_name)
+            await nn.remember_face(chat.id, user.id, face, "spam")
         await moderation.send_card(bot, chat.id, config.BIT_WATCH, card, pid, "ban", user.id)
         return
 

@@ -31,11 +31,13 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
                                 "words_guests")),
     "flood": ("🌊 Антифлуд", ("flood_on", "flood_msgs", "flood_window", "flood_mute_min")),
     "captcha": ("🤖 Капча", ("captcha_on", "captcha_timeout")),
-    "watch": ("👁 Наблюдение", ("watch_on", "watch_bots", "watch_suspect", "watch_ban")),
+    "watch": ("👁 Наблюдение", ("watch_on", "watch_bots", "watch_suspect",
+                             "watch_ban", "watch_nn")),
     "welcome": ("👋 Приветствие", ("welcome_on", "welcome_text")),
     "media": ("🖼 Медиа-фильтры", ("media_on", "media_mask")),
     "triggers": ("🎯 Триггеры", ("trig_on",)),
-    "cmds": ("🔢 Счётчики", ("cmds_on", "cmds_guest_cd", "cmds_anywhere")),
+    "cmds": ("🔢 Счётчики", ("cmds_on", "cmds_guest_cd", "cmds_anywhere",
+                            "cmds_bare")),
     "trust": ("🎖 Доверие", ("trust_on", "trust_soften", "trust_days",
                               "trust_msgs", "trust_mask")),
     "warns": ("⚠️ Варны", ("warns_on", "warns_limit", "warns_punish",
@@ -46,6 +48,13 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
                "duel_punish", "duel_min", "battle_punish", "battle_min",
                "court_punish", "court_min")),
     "service": ("🧹 Системные", ("service_join", "service_leave", "service_other")),
+    "read": ("🔍 Распознавание", ("ocr_on", "ocr_langs", "asr_on", "asr_max_sec")),
+    "sem": ("🧠 Смысловые стоп-слова", ("sem_on", "sem_threshold", "sem_punish",
+                                        "sem_mute_min", "sem_guests")),
+    "burst": ("📡 Рассылки", ("burst_on", "burst_users", "burst_punish",
+                              "burst_mute_min")),
+    # копилка улик не переносится: она про конкретный чат и его норму
+    "nn": ("🧪 Нейрофильтр", ("nn_mode", "nn_threshold", "nn_net")),
     "wl": ("🕊 Вайтлист", ()),
     "cards": ("🪪 Карточки и лог", ("cards_on", "card_mask", "log_chat_id")),
 }
@@ -85,6 +94,13 @@ async def copy_chat(src: int, dst: int, groups: set[str] | None = None) -> dict[
             if r["word"] not in have:
                 await db.words_add(dst, r["word"], r["mode"])
                 stats["стоп-слов"] += 1
+
+    if "sem" in picked:
+        have = {r["text"].lower() for r in await db.phrases_list(dst)}
+        for r in await db.phrases_list(src):
+            if r["text"].lower() not in have:
+                await db.phrase_add(dst, r["text"])
+                stats["фраз"] = stats.get("фраз", 0) + 1
 
     if "wl" in picked:
         for e in await db.wl_entries(src):

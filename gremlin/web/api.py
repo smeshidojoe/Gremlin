@@ -20,7 +20,7 @@ from aiohttp import web
 from .. import config, db, schema, utils
 from ..handlers import fun as fun_h, user_menu as um
 from ..services import (adm_cache, digest as digest_svc, filters as flt,
-                        moderation, net as net_svc, nn, resolve, transfer)
+                        media, moderation, net as net_svc, nn, resolve, transfer)
 from . import auth
 
 logger = logging.getLogger("gremlin.web.api")
@@ -272,10 +272,29 @@ async def _widget(cid: int, widget: str, s) -> dict:
     if widget == "logsel":
         return {"chat_id": s.log_chat_id, "title": await _log_label(s.log_chat_id)}
 
+    if widget == "phrases":
+        return {"items": [{"id": r["id"], "text": r["text"], "hits": r["hits"]}
+                          for r in await db.phrases_list(cid)],
+                "limit": config.SEM_LIMIT, "model": nn.status()}
+
+    if widget == "read_stats":
+        return {"ocr": media.status(), "asr": media.asr_status(),
+                "asr_url": bool(config.ASR_URL)}
+
+    if widget == "nn_clusters":
+        # сами кучки считаются по кнопке: на тысяче улик это секунда-другая,
+        # и держать раздел закрытым всё это время незачем
+        st = await db.samples_stats(cid)
+        return {"unknown": st["unknown"], "profile": st["profile"],
+                "model": nn.status()}
+
     if widget == "nn_stats":
         st = await db.samples_stats(cid)
+        st["suggest"] = await nn.suggest_threshold(cid)
+        st["threshold"] = s.nn_threshold
         st["min"] = config.NN_MIN_SAMPLES
         st["model"] = nn.status()
+        st["logreg_min"] = config.NN_LOGREG_MIN
         return st
 
     if widget == "cardbits":
@@ -341,6 +360,80 @@ async def _after_set(cid: int, key: str, value) -> None:
     """Побочные эффекты, которые есть и в меню бота."""
     if key in ("words_on", "words_guests"):
         flt.invalidate_words(cid)
+
+
+@routes.post("/api/chat/{cid}/phrases")
+async def api_phrase_add(request: web.Request) -> web.Response:
+    """Добавить фразу-образец. Каждая строка — отдельная фраза."""
+    cid = await cid_of(request)
+    data = await body(request)
+    have = len(await db.phrases_list(cid))
+    added = dupes = 0
+    for raw in str(data.get("text") or "").split("\n"):
+        line = raw.strip()
+        if len(line) < 10 or have + added >= config.SEM_LIMIT:
+            continue
+        if await db.phrase_add(cid, line):
+            added += 1
+        else:
+            dupes += 1
+    nn.invalidate_phrases(cid)
+    return js({"added": added, "dupes": dupes})
+
+
+@routes.delete("/api/chat/{cid}/phrases/{rid}")
+async def api_phrase_del(request: web.Request) -> web.Response:
+    cid = await cid_of(request)
+    await db.phrase_del(cid, int(request.match_info["rid"]))
+    nn.invalidate_phrases(cid)
+    return js({"ok": True})
+
+
+@routes.get("/api/chat/{cid}/nn/doubt")
+async def api_nn_doubt(request: web.Request) -> web.Response:
+    """Улики, на которых фильтр колеблется, — их и стоит разметить руками."""
+    cid = await cid_of(request)
+    return js({"items": await nn.doubtful(cid), "model": nn.status()})
+
+
+@routes.post("/api/chat/{cid}/nn/doubt")
+async def api_nn_doubt_mark(request: web.Request) -> web.Response:
+    cid = await cid_of(request)
+    data = await body(request)
+    label = data.get("label")
+    if label not in ("spam", "ok"):
+        raise web.HTTPBadRequest(text="bad label")
+    await db.sample_relabel(int(data.get("id") or 0), label, origin="card")
+    nn.invalidate(cid)
+    await db.add_event(cid, "nn", f"улика {data.get('id')} размечена как {label} "
+                                  f"(панель)")
+    return js({"ok": True})
+
+
+@routes.get("/api/chat/{cid}/nn/clusters")
+async def api_nn_clusters(request: web.Request) -> web.Response:
+    """Разбивка копилки на кучки похожих улик — для раздела «виды спама»."""
+    cid = await cid_of(request)
+    scope = request.query.get("scope", "unknown")
+    if scope not in ("unknown", "profile"):
+        raise web.HTTPBadRequest(text="bad scope")
+    return js({"scope": scope, "items": await nn.clusters(cid, scope),
+               "model": nn.status(), "min": config.NN_MIN_SAMPLES})
+
+
+@routes.post("/api/chat/{cid}/nn/clusters")
+async def api_nn_cluster_label(request: web.Request) -> web.Response:
+    """Разметить кучку целиком: сотня улик одним нажатием вместо ста карточек."""
+    cid = await cid_of(request)
+    data = await body(request)
+    label = data.get("label")
+    if label not in ("spam", "ok"):
+        raise web.HTTPBadRequest(text="bad label")
+    moved = await nn.label_cluster(cid, int(data.get("index") or 0), label)
+    if moved:
+        await db.add_event(cid, "nn", f"кучка размечена как {label}: {moved} улик "
+                                      f"(панель)")
+    return js({"moved": moved})
 
 
 @routes.post("/api/chat/{cid}/bit")
@@ -823,29 +916,6 @@ async def _save_upload(part, cid: int, kind: str) -> str:
     return path
 
 
-async def _read_upload(request) -> bytes:
-    """Единственный файл из multipart целиком, с потолком по размеру."""
-    reader = await request.multipart()
-    raw = b""
-    while True:
-        part = await reader.next()
-        if part is None:
-            break
-        if part.name != "file":
-            continue
-        while True:
-            chunk = await part.read_chunk()
-            if not chunk:
-                break
-            raw += chunk
-            if len(raw) > config.WEB_UPLOAD_MAX:
-                raise web.HTTPRequestEntityTooLarge(
-                    max_size=config.WEB_UPLOAD_MAX, actual_size=len(raw))
-    if not raw:
-        raise web.HTTPBadRequest(text="Файл не пришёл.")
-    return raw
-
-
 @routes.delete("/api/chat/{cid}/answers/{rid}")
 async def api_answer_del(request: web.Request) -> web.Response:
     cid = await cid_of(request)
@@ -1018,12 +1088,10 @@ async def api_setup_skip(request: web.Request) -> web.Response:
 @routes.post("/api/chat/{cid}/leave")
 async def api_leave(request: web.Request) -> web.Response:
     cid = await cid_of(request)
-    try:
-        await bot_of(request).leave_chat(cid)
-    except Exception as e:
-        raise web.HTTPBadRequest(text=f"Не вышло: {e}")
-    await db.set_chat_active(cid, False)
-    return js({"ok": True})
+    ok, note = await moderation.leave_chat(bot_of(request), cid)
+    if not ok:
+        raise web.HTTPBadRequest(text=f"Не вышло: {note}")
+    return js({"ok": True, "note": note.strip()})
 
 
 # ---------- недельная сводка ----------

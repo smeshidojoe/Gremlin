@@ -69,10 +69,3 @@ async def scheduler() -> None:
         await asyncio.sleep(24 * 3600)
 
 
-async def last_info() -> tuple[str, str] | None:
-    """(имя файла, размер) последней копии — для меню."""
-    files = sorted(glob.glob(os.path.join(config.BACKUP_DIR, "gremlin-*.sqlite3")))
-    if not files:
-        return None
-    last = files[-1]
-    return os.path.basename(last), f"{os.path.getsize(last) // 1024} КБ"

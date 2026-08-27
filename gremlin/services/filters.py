@@ -13,10 +13,19 @@ _TG_LINK_RE = re.compile(
 )
 
 
-def find_tg_links(message) -> list[str]:
-    """Все тг-ссылки в тексте/подписи/entity url. Свой чат и бот исключаются в вызывающем коде."""
+# ссылка в распознанном тексте: entity там нет, Telegram его не размечал
+_BARE_URL_RE = re.compile(
+    r"(?:https?://|www\.)[\w\-.]+\.[a-z]{2,}(?:/[^\s]*)?", re.IGNORECASE)
+
+
+def find_tg_links(message, extra: str = "") -> list[str]:
+    """Все тг-ссылки в тексте/подписи/entity url. Свой чат и бот исключаются в вызывающем коде.
+
+    extra — текст, распознанный в картинке или голосовом: для правил он такой
+    же полноправный, как подпись, просто Telegram его не размечал.
+    """
     found: list[str] = []
-    texts = [message.text or message.caption or ""]
+    texts = [message.text or message.caption or "", extra]
     for ent, ent_text in _entities(message):
         if ent.type == "text_link" and ent.url:
             texts.append(ent.url)
@@ -34,10 +43,17 @@ def _entities(message):
         yield ent, ent.extract_from(text)
 
 
-def find_ext_links(message) -> list[str]:
+def find_ext_links(message, extra: str = "") -> list[str]:
     """Внешние (не телеграмные) ссылки. Берём из entity — Telegram размечает их сам,
-    поэтому нет ложных срабатываний на «3.5» или «файл.txt»."""
+    поэтому нет ложных срабатываний на «3.5» или «файл.txt».
+
+    В распознанном тексте entity взять неоткуда, поэтому там ищем регуляркой
+    и только явные адреса: со схемой или с www.
+    """
     found: list[str] = []
+    for m in _BARE_URL_RE.finditer(extra or ""):
+        if not _TG_LINK_RE.search(m.group(0)):
+            found.append(m.group(0))
     for ent, ent_text in _entities(message):
         if ent.type == "url":
             url = ent_text

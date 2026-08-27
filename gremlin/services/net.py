@@ -118,7 +118,7 @@ async def lift(bot: Bot, src_chat: int, user_id: int) -> tuple[int, int]:
                 await bot.unban_chat_member(cid, user_id, only_if_banned=True)
             else:
                 await bot.restrict_chat_member(cid, user_id,
-                                               permissions=moderation.UNMUTE_PERMS)
+                                               permissions=await moderation.unmute_perms(bot, cid))
             await db.deactivate_user_punishments(cid, user_id)
             adm_cache.invalidate_member(cid, user_id)
             done += 1

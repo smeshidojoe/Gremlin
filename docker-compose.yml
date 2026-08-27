@@ -20,9 +20,9 @@ services:
       # 240 МБ весов в каждой пересборке никому не нужны
       NN_MODEL_DIR: /app/models/rubert-tiny2
 
-    # чтобы контейнер видел локальную Ollama на хосте
-    # (AI_BASE_URL=http://host.docker.internal:11434/v1). На Docker Desktop
-    # это имя есть и так, строка нужна для докера на Linux.
+    # чтобы контейнер видел службы, поднятые на самом хосте (распознавалки,
+    # локальные модели по HTTP). На Docker Desktop это имя есть и так,
+    # строка нужна для докера на Linux.
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
@@ -38,6 +38,34 @@ services:
 
     # потолок памяти. memswap = mem_limit означает «свопа нет»:
     # иначе контейнер при утечке будет тихо свопиться вместо падения
+    mem_limit: 4g
+    memswap_limit: 4g
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Расшифровка голосовых. Отдельный контейнер, потому что модель ест
+  # процессор секундами: пока она считает, бот должен продолжать модерировать.
+  # Внутри Vosk, но боту это безразлично — он знает только ручку
+  # POST /transcribe, так что модель меняется без единой правки в боте.
+  # Служба не поднята — бот работает как раньше, просто без расшифровок.
+  #
+  # Включается в .env:  ASR_URL=http://asr:8080/transcribe
+  asr:
+    build: ./asr
+    container_name: gremlin-asr
+    restart: unless-stopped
+
+    environment:
+      VOSK_MODEL: /models/vosk-model-small-ru-0.22
+
+    volumes:
+      - ./tools/models:/models:ro   # модель монтируется, в образ не копируется
+
+    # маленькой русской модели хватает полугигабайта, большой нужно 3-4
     mem_limit: 4g
     memswap_limit: 4g
 

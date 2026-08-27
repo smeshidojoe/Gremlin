@@ -359,6 +359,31 @@ function widgetHtml(name, w, cid, d) {
           <button class="btn small" data-act="set-log">Изменить</button></div>
       </div>`;
 
+    case 'phrases':
+      return `<div class="card">
+        <h2>🧠 Фразы-образцы</h2>
+        <div class="muted">Бот ловит сообщения, похожие по смыслу на эти фразы,
+          даже если ни одно слово не совпало.</div>
+        ${w.items.map((r) => `
+          <div class="row">
+            <div class="label">${esc(r.text)}<small>поймала ${r.hits}</small></div>
+            <button class="x" data-act="phrase-del" data-id="${r.id}">✕</button>
+          </div>`).join('') || '<div class="empty">Пусто.</div>'}
+        <button class="btn wide" style="margin-top:10px" data-act="phrase-add">
+          ➕ Добавить фразу</button>
+      </div>`;
+
+    case 'read_stats':
+      return `<div class="card">
+        <h2>🔍 Что бот умеет читать</h2>
+        <div class="row"><div class="label">🖼 Картинки<small>tesseract в контейнере</small></div>
+          <div class="value">${esc(w.ocr === 'ok' ? 'готов' : w.ocr)}</div></div>
+        <div class="row"><div class="label">🔊 Голосовые<small>сторонняя служба, ASR_URL</small></div>
+          <div class="value">${esc(w.asr === 'ok' ? 'подключена' : w.asr)}</div></div>
+        ${w.asr_url ? '' : `<div class="muted" style="margin-top:10px">
+          Служба расшифровки не задана — переключатель голосовых ничего не делает.</div>`}
+      </div>`;
+
     case 'nn_stats':
       return `<div class="card">
         <h2>📊 Копилка улик</h2>
@@ -372,8 +397,30 @@ function widgetHtml(name, w, cid, d) {
           <div class="value">${w.unknown}</div></div>
         <div class="row"><div class="label">🧠 Модель</div>
           <div class="value">${esc(w.model === 'ok' ? 'загружена' : w.model)}</div></div>
+        <div class="row"><div class="label">📐 Как считает<small>регрессия включается
+          с ${w.logreg_min} улик</small></div>
+          <div class="value">${w.profile >= w.logreg_min ? 'регрессия' : 'соседи'}</div></div>
+        ${w.suggest ? `<div class="row"><div class="label">🎚 Рекомендованный порог
+          <small>при нём норма из копилки не срабатывает</small></div>
+          <div class="value">${w.suggest}%${w.suggest === w.threshold ? ' ✅' : ''}</div></div>`
+          : ''}
         ${w.profile < w.min ? `<div class="muted" style="margin-top:10px">
           Для сравнения нужно хотя бы ${w.min} улик — пока копим.</div>` : ''}
+      </div>`;
+
+    case 'nn_clusters':
+      return `<div class="card">
+        <h2>🗂 Виды спама</h2>
+        <div class="muted">Копилка раскладывается на кучки похожих улик. Разметив кучку
+          целиком, вы размечаете все её улики разом — вместо сотни карточек одно нажатие.</div>
+        <div class="row" style="margin-top:10px">
+          <button class="btn" data-act="nn-clusters" data-scope="unknown">
+            ✋ Без оценки (${w.unknown})</button>
+          <button class="btn ghost" data-act="nn-clusters" data-scope="profile">
+            📊 Размеченные (${w.profile})</button>
+          <button class="btn ghost" data-act="nn-doubt">🤔 Спорное</button>
+        </div>
+        <div id="clusters"></div>
       </div>`;
 
     case 'cardbits':
@@ -1022,6 +1069,82 @@ const ACT = {
     const r = await api(`/chat/${curChat()}/words/clear`, { json: {} });
     toast(`Удалено: ${r.removed}`);
     render();
+  },
+
+  async 'phrase-add'() {
+    const v = await ask({ title: 'Фраза-образец',
+      hint: 'Так, как пишут спамеры. Несколько — каждая с новой строки.' });
+    if (!v) return;
+    const r = await api(`/chat/${curChat()}/phrases`, { json: { text: v } });
+    toast(`Добавлено: ${r.added}${r.dupes ? ', уже были: ' + r.dupes : ''}`);
+    render();
+  },
+
+  async 'phrase-del'(el) {
+    await api(`/chat/${curChat()}/phrases/${el.dataset.id}`, { method: 'DELETE' });
+    render();
+  },
+
+  async 'nn-doubt'() {
+    const box = document.getElementById('clusters');
+    box.innerHTML = '<div class="muted" style="margin-top:12px">Считаю…</div>';
+    const r = await api(`/chat/${curChat()}/nn/doubt`);
+    if (!r.items.length) {
+      box.innerHTML = `<div class="muted" style="margin-top:12px">${
+        r.model === 'ok' ? 'Спорного нет — либо копилка пуста, либо всё однозначно.'
+                         : 'Модель не загружена: ' + esc(r.model)}</div>`;
+      return;
+    }
+    box.innerHTML = r.items.map((it) => `
+      <div class="card" style="margin-top:10px">
+        <div class="label"><b>оценка ${it.score}%</b></div>
+        <div class="muted" style="margin:6px 0">${esc(it.text.slice(0, 200))}</div>
+        <div class="row">
+          <button class="btn" data-act="doubt-mark" data-id="${it.id}"
+            data-label="spam">⛔ Спам</button>
+          <button class="btn ghost" data-act="doubt-mark" data-id="${it.id}"
+            data-label="ok">🕊 Норма</button>
+        </div>
+      </div>`).join('');
+  },
+
+  async 'doubt-mark'(el) {
+    await api(`/chat/${curChat()}/nn/doubt`,
+              { json: { id: Number(el.dataset.id), label: el.dataset.label } });
+    toast('Размечено');
+    await ACT['nn-doubt']();
+  },
+
+  async 'nn-clusters'(el) {
+    const box = document.getElementById('clusters');
+    const scope = el.dataset.scope;
+    box.innerHTML = '<div class="muted" style="margin-top:12px">Считаю…</div>';
+    const r = await api(`/chat/${curChat()}/nn/clusters?scope=${scope}`);
+    if (!r.items.length) {
+      box.innerHTML = `<div class="muted" style="margin-top:12px">${
+        r.model === 'ok' ? `Улик пока мало — нужно хотя бы ${r.min}.`
+                         : 'Модель не загружена: ' + esc(r.model)}</div>`;
+      return;
+    }
+    box.innerHTML = r.items.map((g, i) => `
+      <div class="card" style="margin-top:10px">
+        <div class="label"><b>${i + 1}. ${g.size} шт</b>
+          <small>${esc(g.words.join(', ') || '—')}</small></div>
+        <div class="muted" style="margin:6px 0">${esc(g.sample.slice(0, 160))}</div>
+        <div class="row">
+          <button class="btn" data-act="nn-label" data-i="${i}" data-label="spam"
+            data-scope="${scope}">⛔ Спам</button>
+          <button class="btn ghost" data-act="nn-label" data-i="${i}" data-label="ok"
+            data-scope="${scope}">🕊 Норма</button>
+        </div>
+      </div>`).join('');
+  },
+
+  async 'nn-label'(el) {
+    const r = await api(`/chat/${curChat()}/nn/clusters`,
+                        { json: { index: Number(el.dataset.i), label: el.dataset.label } });
+    toast(r.moved ? `Размечено: ${r.moved}` : 'Разбивка устарела, пересчитайте');
+    await ACT['nn-clusters']({ dataset: { scope: el.dataset.scope } });
   },
 
   async 'wl-add'() {

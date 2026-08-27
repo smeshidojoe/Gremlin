@@ -80,6 +80,20 @@ async def main() -> None:
     from .services import watch as watch_svc
     watch_svc.set_self((await bot.me()).username)
 
+    # база была битой и её откатили на копию — про такое надо сказать вслух,
+    # иначе пропажа настроек за последние часы обнаружится случайно и нескоро
+    if db.restored_from:
+        for admin_id in config.ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    "⚠️ <b>База была повреждена</b>\n"
+                    f"Бот поднялся на суточной копии <code>{db.restored_from}</code>. "
+                    "Всё, что произошло после неё, потеряно.\n"
+                    "Битый файл лежит рядом с базой с пометкой <code>.malformed-…</code>.")
+            except Exception:
+                logger.warning("не сказать владельцу о восстановлении", exc_info=True)
+
     # порядок важен: специфичные роутеры до группового catch-all
     dp.include_routers(
         admin_menu.router,
@@ -108,6 +122,18 @@ async def main() -> None:
 
                 tunnel_task = asyncio.create_task(tunnel.supervisor(_got_url))
 
+    # Сверяем список чатов с реальностью: за время простоя бота могли выгнать,
+    # а обновление до него не дошло. Фоном — старт из-за этого ждать незачем.
+    async def _reconcile() -> None:
+        from .services import adm_cache
+        gone = await adm_cache.reconcile_chats(bot)
+        for cid, title in gone:
+            await db.add_event(cid, "bot", "чат выключен: бота там больше нет")
+        if gone:
+            names = ", ".join(f"{t} ({c})" for c, t in gone)
+            logger.info("выключены чаты, где бота нет: %s", names)
+
+    reconcile_task = asyncio.create_task(_reconcile())
     digest_task = asyncio.create_task(digest.scheduler(bot))
     titles_task = asyncio.create_task(games.titles_scheduler(bot))
     backup_task = asyncio.create_task(backup.scheduler())
@@ -128,6 +154,7 @@ async def main() -> None:
             drop_pending_updates=False,
         )
     finally:
+        reconcile_task.cancel()
         digest_task.cancel()
         titles_task.cancel()
         backup_task.cancel()

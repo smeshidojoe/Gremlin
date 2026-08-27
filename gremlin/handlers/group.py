@@ -11,7 +11,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .. import config, db, utils
 from ..services import (
-    adm_cache, filters, moderation, net, nn, resolve, triggers, trust, watch,
+    adm_cache, filters, media, moderation, net, nn, resolve, triggers, trust, watch,
 )
 
 logger = logging.getLogger("gremlin.group")
@@ -110,7 +110,11 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
     if stale(message):
         return  # команда из бэклога — админ уже всё разрулил сам
     if not await _is_chat_admin(bot, message.chat.id, message.from_user.id):
-        return  # молча игнорим не-админов
+        # не админ: команду убираем, а самого — под настройку «мут за чужие
+        # команды». Раньше тут стоял молчаливый выход, и настройка не работала
+        # ровно для тех команд, ради которых её и заводили
+        await _misuse(message, bot, await db.get_settings(message.chat.id))
+        return
 
     parts = (message.text or "").split()[1:]
     reply = message.reply_to_message
@@ -445,8 +449,9 @@ async def cmd_lift(message: Message, bot: Bot) -> None:
             if done:
                 await bot.unban_chat_member(message.chat.id, uid, only_if_banned=True)
         else:
-            await bot.restrict_chat_member(message.chat.id, uid,
-                                           permissions=moderation.UNMUTE_PERMS)
+            await bot.restrict_chat_member(
+                message.chat.id, uid,
+                permissions=await moderation.unmute_perms(bot, message.chat.id))
             done = True
     except Exception as e:
         await message.reply(f"Не вышло: {utils.esc(str(e)[:100])}")
@@ -482,11 +487,14 @@ async def cmd_delete(message: Message, bot: Bot) -> None:
     """!dm ответом на сообщение — удалить его вместе с самой командой."""
     if stale(message):
         return
+    # право проверяем до всего остального: иначе на «!dm» без ответа бот
+    # огрызался подсказкой даже тому, кому команда вообще не положена
+    if not await _is_chat_admin(bot, message.chat.id, message.from_user.id):
+        await _misuse(message, bot, await db.get_settings(message.chat.id))
+        return
     if not message.reply_to_message or not message.reply_to_message.from_user:
         await message.reply("Команда работает ответом на сообщение.")
         return
-    if not await _is_chat_admin(bot, message.chat.id, message.from_user.id):
-        return  # молча игнорим не-админов
     target_msg = message.reply_to_message
     target = target_msg.from_user
     body = moderation.message_body(target_msg)     # текст сохраняем до удаления
@@ -514,19 +522,24 @@ async def cmd_delete(message: Message, bot: Bot) -> None:
     )
 
 
-@router.message(F.text.contains("!") | F.caption.contains("!"))
-async def chat_command(message: Message, bot: Bot) -> None:
+async def fire_counter(bot: Bot, message: Message, s) -> None:
     """Счётчики: команда в чате -> ответ по заготовке + счётчик вызовов.
 
+    Зовётся из общего пайплайна, а не отдельным хендлером. Раньше хендлер
+    ловил всё, где есть «!», и на этом разбор сообщения заканчивался: aiogram
+    отдаёт сообщение первому подошедшему обработчику, поэтому «Казино! заходи»
+    вообще не доходило до модерации. Теперь счётчики срабатывают последними,
+    как триггеры, — после всех проверок и только на то, что их пережило.
+
     Ловим и подпись к медиа: команду часто пишут прямо под картинкой.
-    Стоит выше системных !mute/!ban — но те перехватываются раньше по своим
-    регуляркам, а сюда попадает всё остальное с «!».
     """
-    s = await db.get_settings(message.chat.id)
-    if not s.cmds_on:
+    # правка сообщения счётчик не крутит: раньше хендлер ловил только новые,
+    # а теперь мы висим в общем пайплайне, куда приходят и редактирования
+    if not s.cmds_on or message.edit_date is not None:
         return
     text = (message.text or message.caption or "")
-    row = await _find_cmd(message.chat.id, text, bool(s.cmds_anywhere))
+    row = await _find_cmd(message.chat.id, text, bool(s.cmds_anywhere),
+                          bool(s.cmds_bare))
     if row is None:
         return
     # вызов из бэклога: счётчик растёт, но в чат ничего не шлём — иначе после
@@ -600,23 +613,35 @@ async def _link_punish(bot: Bot, chat_id: int, user_id: int, s,
     return mine if await adm_cache.is_member(bot, chat_id, user_id) else guest
 
 
-async def _find_cmd(chat_id: int, text: str, anywhere: bool):
+def _clean_word(word: str) -> str:
+    """Слово без хвостовой пунктуации: «!черви?» и «!черви!!!» — та же команда."""
+    return word.rstrip("?!.,;:…\"'»)(").lower()
+
+
+async def _cmd_by_word(chat_id: int, word: str, bare: bool):
+    """Счётчик по одному слову. Команды хранятся с «!», голое слово — без него."""
+    if word.startswith("!"):
+        return await db.cmd_find(chat_id, word) if len(word) > 1 else None
+    if not bare or len(word) < 2:
+        return None
+    return await db.cmd_find(chat_id, "!" + word)
+
+
+async def _find_cmd(chat_id: int, text: str, anywhere: bool, bare: bool = False):
     """Найти счётчик в сообщении.
 
     По умолчанию — только если сообщение с него начинается, как обычная команда.
-    С тумблером «в любом месте» — первое слово с «!», которое совпало.
+    С тумблером «в любом месте» — первое совпавшее слово где угодно.
+    bare — счётчик отзывается и на голое слово, как триггер.
     """
-    # хвостовую пунктуацию срезаем: «!черви?» и «!черви!!!» — та же команда
-    words = [w.rstrip("?!.,;:…\"'»)(") for w in text.split()]
-    words = [w for w in words if len(w) > 1 and w.startswith("!")]
+    words = [_clean_word(w) for w in text.split()]
     if not words:
         return None
     if not anywhere:
         # команда должна открывать сообщение, иначе это просто разговор о ней
-        first = text.split()[0].rstrip("?!.,;:…\"'»)(").lower()
-        return await db.cmd_find(chat_id, first) if first.startswith("!") else None
+        return await _cmd_by_word(chat_id, words[0], bare)
     for w in words:
-        row = await db.cmd_find(chat_id, w.lower())
+        row = await _cmd_by_word(chat_id, w, bare)
         if row is not None:
             return row
     return None
@@ -660,7 +685,14 @@ async def _captcha_timeout(bot: Bot, chat_id: int, user_id: int, timeout: int, m
         pass
     try:  # кик с возможностью вернуться (ban+unban)
         await bot.ban_chat_member(chat_id, user_id)
+        # пауза перед снятием: отправленный вплотную разбан иногда приходит
+        # раньше, чем записан бан, и с only_if_banned не делает ничего —
+        # тогда не прошедший капчу оставался бы забаненным навсегда
+        await asyncio.sleep(0.5)
         await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+        member = await bot.get_chat_member(chat_id, user_id)
+        if member.status == "kicked":          # бан всё-таки остался — снимаем
+            await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
     except Exception:
         logger.warning("captcha kick failed in %s", chat_id, exc_info=True)
     await db.add_event(chat_id, "captcha", f"не прошёл капчу, кик: {user_id}")
@@ -675,7 +707,8 @@ async def captcha_pass(cb: CallbackQuery, bot: Bot) -> None:
         return
     _captcha_pending.pop((chat_id, user_id), None)
     try:
-        await bot.restrict_chat_member(chat_id, user_id, permissions=moderation.UNMUTE_PERMS)
+        await bot.restrict_chat_member(
+            chat_id, user_id, permissions=await moderation.unmute_perms(bot, chat_id))
     except Exception:
         logger.warning("captcha unmute failed in %s", chat_id, exc_info=True)
     try:
@@ -763,7 +796,8 @@ async def on_join(message: Message, bot: Bot) -> None:
                 # запасом — обычно мут снимает кнопка или кик по таймауту.
                 await bot.restrict_chat_member(
                     message.chat.id, user.id,
-                    permissions=moderation.mute_perms(s.mute_reactions),
+                    permissions=await moderation.mute_perms(
+                        bot, message.chat.id, s.mute_reactions),
                     until_date=int(time.time()) + s.captcha_timeout + 60,
                 )
             except Exception:
@@ -908,13 +942,16 @@ async def moderate(message: Message, bot: Bot) -> None:
     # для всех, поэтому перед выходом всё равно даём им сработать.
     if user.id in config.ADMIN_IDS:
         await fire_trigger(bot, message, s)
+        await fire_counter(bot, message, s)
         return
     if user.id in await adm_cache.chat_admin_ids(bot, chat.id):
         await fire_trigger(bot, message, s)
+        await fire_counter(bot, message, s)
         return
     scopes = await db.wl_scopes_for(chat.id, user.id, user.username)
     if "all" in scopes:
         await fire_trigger(bot, message, s)
+        await fire_counter(bot, message, s)
         return
 
     # --- медиа-фильтры (удаление без наказания) ---
@@ -926,6 +963,13 @@ async def moderate(message: Message, bot: Bot) -> None:
                 except Exception:
                     pass
                 return
+
+    # Текст, спрятанный в картинке или голосовом. Достаём до правил: дальше он
+    # идёт наравне с подписью, иначе рекламная простыня скриншотом для бота
+    # выглядит пустым фото.
+    seen = ""
+    if s.ocr_on or s.asr_on:
+        seen = await media.extract(bot, message, s)
 
     # --- инлайн-боты (via_bot) ---
     if (s.inline_on and message.via_bot is not None and "inline" not in scopes
@@ -940,7 +984,8 @@ async def moderate(message: Message, bot: Bot) -> None:
         # вещи, а правило одно. Поэтому за спам-содержимое наказание ужесточаем.
         if s.inline_spam:
             score, why = watch.score_content(
-                message.text or message.caption or "", moderation.button_urls(message),
+                " ".join(filter(None, [message.text or message.caption or "", seen])),
+                moderation.button_urls(message),
                 self_bot=message.via_bot.username,
             )
             if score >= s.inline_spam:
@@ -1001,7 +1046,7 @@ async def moderate(message: Message, bot: Bot) -> None:
     # --- ссылки на чужие тг-чаты/каналы ---
     if s.links_on and "links" not in scopes:
         links = [
-            l for l in filters.find_tg_links(message)
+            l for l in filters.find_tg_links(message, seen)
             if not filters.link_allowed(l, own_names, own_ids)
         ]
         if links:
@@ -1027,7 +1072,7 @@ async def moderate(message: Message, bot: Bot) -> None:
     # --- внешние ссылки (любые сайты) ---
     if s.extlinks_on and "links" not in scopes:
         ext = [
-            l for l in filters.find_ext_links(message)
+            l for l in filters.find_ext_links(message, seen)
             if not filters.link_allowed(l, own_names, own_ids)
         ]
         if ext:
@@ -1038,7 +1083,7 @@ async def moderate(message: Message, bot: Bot) -> None:
             return
 
     # --- стоп-слова ---
-    text = message.text or message.caption or ""
+    text = " ".join(filter(None, [message.text or message.caption or "", seen]))
     if s.words_on and text and "words" not in scopes:
         word = await filters.match_stopword(chat.id, text)
         # words_guests: фильтр только для тех, кто в чате не состоит (комментаторы
@@ -1054,6 +1099,38 @@ async def moderate(message: Message, bot: Bot) -> None:
             await moderation.violation(
                 bot, message, config.BIT_WORDS, "стоп-слово",
                 kind, s.words_mute_min, word,
+            )
+            return
+
+    # --- смысловые стоп-слова: тот же смысл другими словами ---
+    if s.sem_on and text and "words" not in scopes:
+        hit = await nn.match_phrase(chat.id, text, s.sem_threshold)
+        if hit and s.sem_guests and await adm_cache.is_member(bot, chat.id, user.id):
+            hit = None
+        if hit:
+            phrase, score = hit
+            kind = s.sem_punish
+            if s.trust_on:
+                kind = trust.soften(kind, await trust.level(bot, chat.id, user.id, s),
+                                    s, config.TRUST_S_WORDS)
+            await db.phrase_hit(phrase["id"])
+            await moderation.violation(
+                bot, message, config.BIT_WORDS, "смысловое совпадение",
+                kind, s.sem_mute_min,
+                f"похоже на «{utils.chunk(phrase['text'], 60)}» ({score}%)",
+            )
+            return
+
+    # --- всплеск: одно и то же от разных людей за пару минут ---
+    if s.burst_on and text and message.edit_date is None and "flood" not in scopes:
+        wave = await nn.burst(chat.id, user.id, text, s.burst_users)
+        if wave:
+            nn.forget_burst(chat.id)      # волну уже засчитали, следы не нужны
+            await moderation.violation(
+                bot, message, config.BIT_FLOOD, "рассылка",
+                s.burst_punish, s.burst_mute_min,
+                f"{wave['msgs']} похожих сообщений от {wave['users']} человек "
+                f"за {config.BURST_WINDOW // 60} мин",
             )
             return
 
@@ -1080,12 +1157,14 @@ async def moderate(message: Message, bot: Bot) -> None:
     # Без отрицательных примеров сравнивать не с чем: всё будет «похоже на спам».
     if s.nn_mode and random.randrange(config.SAMPLE_RANDOM_EVERY) == 0:
         await db.sample_add(chat.id, user.id, "random", "ok",
-                            message.text or message.caption or "")
+                            " ".join(filter(None, [message.text or message.caption or "",
+                                                   seen])))
 
     # Теневой прогон нейрофильтра: вердикт уходит в журнал и никого не трогает.
     # Стоит после всей модерации — интересно именно то, что правила пропустили.
     if s.nn_mode > 1:
-        await nn.shadow(chat.id, message, s)
+        await nn.shadow(chat.id, message, s, seen)
 
     # --- триггеры (последними: на удалённое модерацией не отвечаем) ---
     await fire_trigger(bot, message, s)
+    await fire_counter(bot, message, s)

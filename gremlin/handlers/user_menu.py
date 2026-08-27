@@ -14,7 +14,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .. import config, db, runtime, schema, utils
-from ..services import adm_cache, filters as flt, nn, resolve, triggers
+from ..services import adm_cache, filters as flt, media, nn, resolve, triggers
 
 logger = logging.getLogger("gremlin.user_menu")
 
@@ -41,6 +41,7 @@ class Input(StatesGroup):
     mass_unban = State()        # ждём список id для массового разбана
     mass_kick = State()         # ждём список id для массового кика
     mass_ban = State()          # ждём список id для массового бана
+    phrase = State()            # ждём фразу-образец для смысловых стоп-слов
 
 
 _HOME_TEXT = "<b>🧌 Gremlin</b>\n\nМодерация и мониторинг чатов."
@@ -259,11 +260,15 @@ async def view_chat(cid: int, viewer_id: int) -> tuple[str, InlineKeyboardMarkup
     b.button(text="🔗 Ссылки", callback_data=f"u:s:{cid}:links")
     b.button(text="📛 Анонимы", callback_data=f"u:s:{cid}:anon")
     b.button(text="🧨 Стоп-слова", callback_data=f"u:s:{cid}:words")
+    b.button(text="🧠 Смысловые", callback_data=f"u:s:{cid}:sem")
+    b.button(text="📡 Рассылки", callback_data=f"u:s:{cid}:burst")
     b.button(text="🌊 Антифлуд", callback_data=f"u:s:{cid}:flood")
     b.button(text="🤖 Капча", callback_data=f"u:s:{cid}:captcha")
     b.button(text="👁 Наблюдение", callback_data=f"u:s:{cid}:watch")
     b.button(text="👋 Приветствие", callback_data=f"u:s:{cid}:welcome")
     b.button(text="🖼 Медиа-фильтры", callback_data=f"u:s:{cid}:media")
+    b.button(text="🔍 Распознавание", callback_data=f"u:s:{cid}:read")
+    b.button(text="🧪 Нейрофильтр", callback_data=f"u:s:{cid}:nn")
     b.button(text="🎯 Триггеры", callback_data=f"u:s:{cid}:triggers")
     b.button(text="🔢 Счётчики", callback_data=f"u:s:{cid}:cmds")
     from ..services import digest as _dg
@@ -289,7 +294,7 @@ async def view_chat(cid: int, viewer_id: int) -> tuple[str, InlineKeyboardMarkup
     b.button(text="📥 Перенести настройки", callback_data=f"u:cp:{cid}")
     b.button(text="🚪 Убрать бота из чата", callback_data=f"a:leave:{cid}")
     b.button(text="⬅️ Назад", callback_data="u:chats")
-    b.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1)
+    b.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1)
     return text, b.as_markup()
 
 
@@ -454,6 +459,19 @@ async def _render_widget(b: InlineKeyboardBuilder, cid: int, widget: str, s) -> 
         log_str = str(s.log_chat_id) if s.log_chat_id else "не задан"
         b.row(_btn(f"📍 Лог-чат: {log_str}", f"u:logsel:{cid}"))
 
+    elif widget == "phrases":
+        rows = await db.phrases_list(cid)
+        b.row(_btn(f"📝 Фразы-образцы: {len(rows)}", f"u:ph:{cid}"))
+        b.row(_btn("➕ Добавить фразу", f"u:pha:{cid}"))
+
+    elif widget == "read_stats":
+        ocr = media.status()
+        b.row(_btn(f"🖼 Картинки: {'tesseract готов' if ocr == 'ok' else ocr}",
+                   f"u:s:{cid}:read"))
+        asr = media.asr_status()
+        b.row(_btn(f"🔊 Голосовые: {'служба подключена' if asr == 'ok' else asr}",
+                   f"u:s:{cid}:read"))
+
     elif widget == "nn_stats":
         st = await db.samples_stats(cid)
         b.row(_btn(f"📊 Улик: {st['total']} · для сравнения: {st['profile']}",
@@ -463,9 +481,19 @@ async def _render_widget(b: InlineKeyboardBuilder, cid: int, widget: str, s) -> 
         state = nn.status()
         b.row(_btn(f"🧠 Модель: {'загружена' if state == 'ok' else state}",
                    f"u:s:{cid}:nn"))
+        way = ("регрессия по всей копилке" if st["profile"] >= config.NN_LOGREG_MIN
+               else f"голоса соседей (регрессия с {config.NN_LOGREG_MIN})")
+        b.row(_btn(f"📐 Как считает: {way}", f"u:s:{cid}:nn"))
         if st["profile"] < config.NN_MIN_SAMPLES:
             b.row(_btn(f"⏳ Для сравнения нужно хотя бы {config.NN_MIN_SAMPLES}",
                        f"u:s:{cid}:nn"))
+        b.row(_btn("🗂 Виды спама и разметка кучками", f"u:nnc:{cid}:unknown"))
+        b.row(_btn("🤔 Разметить спорное", f"u:nnd:{cid}"))
+        hint = await nn.suggest_threshold(cid)
+        if hint:
+            mark = "✅" if hint <= s.nn_threshold else "⚠️"
+            b.row(_btn(f"{mark} Рекомендованный порог: {hint}%",
+                       f"u:nnt:{cid}:{hint}"))
 
     elif widget == "cardbits":
         row = []
@@ -591,6 +619,74 @@ async def view_wl(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     b.row(_btn("➕ Добавить", f"u:wla:{cid}"))
     b.row(_btn("⬅️ Назад", f"u:s:{cid}:wl"))
     return "\n".join(lines), b.as_markup()
+
+
+_CLUSTER_SCOPES = {
+    "unknown": ("✋ ручные наказания без оценки",
+                "Это наказания, выданные руками. Бот не знает, был там спам "
+                "или личные счёты, поэтому в сравнении они не участвуют. "
+                "Разметьте кучку — и все её улики разом станут обучающими."),
+    "profile": ("📊 уже размеченные улики",
+                "Так видно, какие виды спама ходят в чат. Если бот сложил "
+                "в кучку что-то безобидное, поправьте это одним нажатием."),
+}
+
+
+async def view_clusters(cid: int, scope: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Копилка, разложенная по кучкам похожего. Разметка идёт кучкой целиком."""
+    ch = await db.get_chat(cid)
+    title = utils.esc(ch["title"] if ch else str(cid))
+    label, hint = _CLUSTER_SCOPES.get(scope, _CLUSTER_SCOPES["unknown"])
+    lines = [f"<b>🗂 Виды спама</b> · {title}\n", hint, f"\nПоказаны: {label}", ""]
+
+    b = InlineKeyboardBuilder()
+    groups = await nn.clusters(cid, scope)
+    if not groups:
+        state = nn.status()
+        if state != "ok":
+            lines.append(f"Модель не загружена: {utils.esc(state)}")
+        else:
+            lines.append(f"Улик пока мало — нужно хотя бы {config.NN_MIN_SAMPLES}.")
+    for i, g in enumerate(groups):
+        words = ", ".join(g["words"]) or "—"
+        sample = utils.esc(utils.chunk(" ".join(g["sample"].split()), 110))
+        lines.append(f"<b>{i + 1}.</b> {g['size']} шт · <i>{utils.esc(words)}</i>")
+        lines.append(f"<blockquote>{sample}</blockquote>")
+        b.row(_btn(f"{i + 1}. ⛔ спам ({g['size']})", f"u:nnl:{cid}:{i}:spam:{scope}"),
+              _btn(f"🕊 норма ({g['size']})", f"u:nnl:{cid}:{i}:ok:{scope}"))
+
+    other = "profile" if scope == "unknown" else "unknown"
+    b.row(_btn(f"🔀 Показать {_CLUSTER_SCOPES[other][0]}", f"u:nnc:{cid}:{other}"))
+    b.row(_btn("⬅️ Назад", f"u:s:{cid}:nn"))
+    return "\n".join(lines), b.as_markup()
+
+
+@router.callback_query(F.data.startswith("u:nnc:"))
+async def cb_clusters(cb: CallbackQuery) -> None:
+    _, _, cid, scope = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    # разбивка считается не мгновенно: на тысяче улик это секунда-другая
+    await cb.answer("Считаю…")
+    text, kb = await view_clusters(cid, scope)
+    await cb.message.edit_text(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("u:nnl:"))
+async def cb_cluster_label(cb: CallbackQuery) -> None:
+    _, _, cid, index, label, scope = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    moved = await nn.label_cluster(cid, int(index), label)
+    if moved:
+        await db.add_event(cid, "nn", f"кучка размечена как {label}: {moved} улик "
+                                      f"by {cb.from_user.id}")
+    await cb.answer(f"Размечено: {moved}" if moved
+                    else "Разбивка устарела, пересчитал", show_alert=False)
+    text, kb = await view_clusters(cid, scope)
+    await cb.message.edit_text(text, reply_markup=kb)
 
 
 async def _show_wl(cb: CallbackQuery, cid: int, page: int) -> None:
@@ -860,6 +956,57 @@ async def view_words(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup
     if rows:
         b.row(_btn("🗑 Очистить список", f"u:wdc:{cid}"))
     b.row(_btn("⬅️ Назад", f"u:s:{cid}:words"))
+    return "\n".join(lines), b.as_markup()
+
+
+async def view_phrases(cid: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Фразы-образцы: список с числом срабатываний и кнопками удаления."""
+    rows = await db.phrases_list(cid)
+    s = await db.get_settings(cid)
+    lines = [
+        "<b>🧠 Смысловые стоп-слова</b>\n",
+        "Бот ловит сообщения, похожие по смыслу на эти фразы, даже если ни одно "
+        "слово не совпало.",
+        f"\nПохожесть: <b>{s.sem_threshold}%</b> · фраз: <b>{len(rows)}</b> "
+        f"из {config.SEM_LIMIT}",
+        "",
+    ]
+    b = InlineKeyboardBuilder()
+    if not rows:
+        lines.append("Пусто. Добавьте пару фраз из того, что уже ловили руками.")
+    for i, r in enumerate(rows, 1):
+        lines.append(f"{i}. {utils.esc(utils.chunk(r['text'], 90))} "
+                     f"— <i>поймала {r['hits']}</i>")
+        b.row(_btn(f"❌ {i}. {utils.chunk(r['text'], 28)}", f"u:phd:{cid}:{r['id']}"))
+    b.row(_btn("➕ Добавить фразу", f"u:pha:{cid}"))
+    b.row(_btn("⬅️ Назад", f"u:s:{cid}:sem"))
+    return "\n".join(lines), b.as_markup()
+
+
+async def view_doubt(cid: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Улики, на которых фильтр колеблется. Ответы здесь дороже всего."""
+    ch = await db.get_chat(cid)
+    title = utils.esc(ch["title"] if ch else str(cid))
+    lines = [
+        f"<b>🤔 Спорное</b> · {title}\n",
+        "Это ручные наказания, о которых бот не знает, спам там был или нет, "
+        "и его оценка близка к «не пойму». Разметьте — десяток таких ответов "
+        "двигает качество сильнее сотни очевидных.",
+        "",
+    ]
+    b = InlineKeyboardBuilder()
+    items = await nn.doubtful(cid)
+    if not items:
+        state = nn.status()
+        lines.append(f"Модель не загружена: {utils.esc(state)}" if state != "ok"
+                     else "Спорного нет — либо копилка пуста, либо всё однозначно.")
+    for i, it in enumerate(items, 1):
+        lines.append(f"<b>{i}.</b> оценка {it['score']}%")
+        lines.append(f"<blockquote>{utils.esc(utils.chunk(it['text'], 160))}</blockquote>")
+        b.row(_btn(f"{i}. ⛔ спам", f"u:nnm:{cid}:{it['id']}:spam"),
+              _btn("🕊 норма", f"u:nnm:{cid}:{it['id']}:ok"))
+    b.row(_btn("🔄 Ещё", f"u:nnd:{cid}"))
+    b.row(_btn("⬅️ Назад", f"u:s:{cid}:nn"))
     return "\n".join(lines), b.as_markup()
 
 
@@ -2334,9 +2481,26 @@ async def _kick_one(bot: Bot, cid: int, token: str, by_id: int | None = None) ->
         return "skip", f"{tag} — в чате не состоит"
     try:
         await bot.ban_chat_member(cid, uid)
+        # Полсекунды паузы: разбан, отправленный вплотную к бану, иногда
+        # приходит раньше, чем бан записан, и с only_if_banned просто ничего
+        # не делает — человек остаётся забаненным вместо того, чтобы быть кикнутым
+        await asyncio.sleep(0.5)
         await bot.unban_chat_member(cid, uid, only_if_banned=True)   # бан снят = кик
     except Exception as e:
         return "fail", f"{tag} — {_human_error(e)}"
+
+    # проверяем, что получилось: «сделал вид» вместо результата хуже отказа
+    try:
+        after = await bot.get_chat_member(cid, uid)
+    except Exception:
+        return "done", tag
+    if after.status == "kicked":
+        try:                       # разбан не прошёл — человек в бане, доснимаем
+            await bot.unban_chat_member(cid, uid, only_if_banned=True)
+        except Exception:
+            return "fail", f"{tag} — остался в бане, снимите вручную"
+    elif after.status not in ("left", "kicked"):
+        return "fail", f"{tag} — Telegram не выпустил из чата"
     return "done", tag        # в журнал не пишем: отчёт показывается в этом же окне
 
 
@@ -2879,8 +3043,14 @@ async def cb_leave(cb: CallbackQuery) -> None:
     b.button(text="✅ Да, выйти", callback_data=f"a:leave_yes:{cid}")
     b.button(text="⬅️ Отмена", callback_data=f"u:c:{cid}")
     b.adjust(2)
+    s = await db.get_settings(cid)
+    tail = ""
+    if s.log_chat_id:
+        reason = await db.log_chat_still_needed(s.log_chat_id, cid)
+        tail = (f"\nЛог-чат <code>{s.log_chat_id}</code> оставлю: {reason}." if reason
+                else f"\nИз лог-чата <code>{s.log_chat_id}</code> бот выйдет тоже.")
     await cb.message.edit_text(
-        f"Точно покинуть чат <code>{cid}</code>?", reply_markup=b.as_markup()
+        f"Точно покинуть чат <code>{cid}</code>?" + tail, reply_markup=b.as_markup()
     )
     await cb.answer()
 
@@ -2890,13 +3060,12 @@ async def cb_leave_yes(cb: CallbackQuery, bot: Bot) -> None:
     cid = int(cb.data.split(":")[2])
     if not await _guard(cb, cid):
         return
-    try:
-        await bot.leave_chat(cid)
-    except Exception as e:
-        await cb.answer(f"Не вышло: {e}", show_alert=True)
+    from ..services import moderation
+    ok, note = await moderation.leave_chat(bot, cid)
+    if not ok:
+        await cb.answer(f"Не вышло: {note}", show_alert=True)
         return
-    await db.set_chat_active(cid, False)
-    await cb.message.edit_text("✅ Бот покинул чат.", reply_markup=_home_kb())
+    await cb.message.edit_text("✅ Бот покинул чат." + note, reply_markup=_home_kb())
     await cb.answer()
 
 
@@ -3369,6 +3538,113 @@ async def cb_inline_wl_del(cb: CallbackQuery) -> None:
 
 
 # ---------- добавление: стоп-слова (FSM) ----------
+
+@router.callback_query(F.data.startswith("u:ph:"))
+async def cb_phrases(cb: CallbackQuery, state: FSMContext) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    await state.clear()
+    text, kb = await view_phrases(cid)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:phd:"))
+async def cb_phrase_del(cb: CallbackQuery) -> None:
+    _, _, cid, rid = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    await db.phrase_del(cid, int(rid))
+    nn.invalidate_phrases(cid)
+    text, kb = await view_phrases(cid)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer("Удалено")
+
+
+@router.callback_query(F.data.startswith("u:pha:"))
+async def cb_phrase_add(cb: CallbackQuery, state: FSMContext) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    await _ask(
+        cb, state, Input.phrase,
+        "<b>🧠 Смысловые стоп-слова</b>\n\nПришлите фразу-образец — так, как "
+        "пишут спамеры. Можно несколько, каждую с новой строки.\n\n"
+        "Например: <code>заработок от 5000 в день, пиши в личку</code>",
+        f"u:ph:{cid}", cid=cid,
+    )
+
+
+@router.message(StateFilter(Input.phrase))
+async def phrase_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    cid = data["cid"]
+    if text == "/cancel":
+        await _done(message, bot, state, await view_phrases(cid))
+        return
+    have = len(await db.phrases_list(cid))
+    added = dupes = 0
+    for raw in text.split("\n"):
+        line = raw.strip()
+        if len(line) < 10:              # из трёх слов смысла не выжать
+            continue
+        if have + added >= config.SEM_LIMIT:
+            break
+        if await db.phrase_add(cid, line):
+            added += 1
+        else:
+            dupes += 1
+    if not added and not dupes:
+        await _retry(message, bot, state,
+                     "<b>🧠 Смысловые стоп-слова</b>\n\n⚠️ Нужна фраза, а не пара слов "
+                     "— от десяти символов.")
+        return
+    nn.invalidate_phrases(cid)
+    note = f"✅ Добавлено фраз: {added}."
+    if dupes:
+        note += f" Уже были: {dupes}."
+    await _done(message, bot, state, await view_phrases(cid), note + "\n\n")
+
+
+@router.callback_query(F.data.startswith("u:nnd:"))
+async def cb_doubt(cb: CallbackQuery) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    await cb.answer("Считаю…")
+    text, kb = await view_doubt(cid)
+    await cb.message.edit_text(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("u:nnm:"))
+async def cb_doubt_mark(cb: CallbackQuery) -> None:
+    _, _, cid, sid, label = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    await db.sample_relabel(int(sid), label, origin="card")
+    nn.invalidate(cid)
+    await db.add_event(cid, "nn", f"улика {sid} размечена как {label} "
+                                  f"by {cb.from_user.id}")
+    text, kb = await view_doubt(cid)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer("Размечено")
+
+
+@router.callback_query(F.data.startswith("u:nnt:"))
+async def cb_threshold_apply(cb: CallbackQuery) -> None:
+    """Принять рекомендованный порог одним нажатием."""
+    _, _, cid, value = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    await db.set_setting(cid, "nn_threshold", int(value))
+    await _rerender(cb, cid, "nn")
+    await cb.answer(f"Порог: {value}%")
+
 
 @router.callback_query(F.data.startswith("u:wda:"))
 async def cb_words_add(cb: CallbackQuery, state: FSMContext) -> None:

@@ -5,9 +5,16 @@ import re
 import time
 from dataclasses import dataclass, fields
 
+import glob
+import logging
+import shutil
+import sqlite3
+
 import aiosqlite
 
 from . import config, utils
+
+logger = logging.getLogger("gremlin.db")
 
 _db: aiosqlite.Connection | None = None
 
@@ -84,6 +91,7 @@ CREATE TABLE IF NOT EXISTS settings(
     cmds_on         INTEGER NOT NULL DEFAULT 0,
     cmds_guest_cd   INTEGER NOT NULL DEFAULT 3600,
     cmds_anywhere   INTEGER NOT NULL DEFAULT 0,
+    cmds_bare       INTEGER NOT NULL DEFAULT 0,
     digest_to       INTEGER NOT NULL DEFAULT 0,
     service_join    INTEGER NOT NULL DEFAULT 0,
     service_leave   INTEGER NOT NULL DEFAULT 0,
@@ -112,6 +120,21 @@ CREATE TABLE IF NOT EXISTS settings(
     court_min       INTEGER NOT NULL DEFAULT 15,
     nn_mode         INTEGER NOT NULL DEFAULT 1,
     nn_threshold    INTEGER NOT NULL DEFAULT 85,
+    sem_on          INTEGER NOT NULL DEFAULT 0,
+    sem_threshold   INTEGER NOT NULL DEFAULT 75,
+    sem_punish      TEXT    NOT NULL DEFAULT 'delete',
+    sem_mute_min    INTEGER NOT NULL DEFAULT 60,
+    sem_guests      INTEGER NOT NULL DEFAULT 0,
+    burst_on        INTEGER NOT NULL DEFAULT 0,
+    burst_users     INTEGER NOT NULL DEFAULT 3,
+    burst_punish    TEXT    NOT NULL DEFAULT 'delete',
+    burst_mute_min  INTEGER NOT NULL DEFAULT 60,
+    nn_net          INTEGER NOT NULL DEFAULT 1,
+    watch_nn        INTEGER NOT NULL DEFAULT 0,
+    ocr_on          INTEGER NOT NULL DEFAULT 0,
+    ocr_langs       TEXT    NOT NULL DEFAULT 'rus+eng',
+    asr_on          INTEGER NOT NULL DEFAULT 0,
+    asr_max_sec     INTEGER NOT NULL DEFAULT 120,
     cards_on        INTEGER NOT NULL DEFAULT 1,
     card_mask       INTEGER NOT NULL DEFAULT 4095,
     log_chat_id     INTEGER
@@ -194,6 +217,15 @@ CREATE TABLE IF NOT EXISTS words(
     word    TEXT NOT NULL,
     mode    TEXT NOT NULL DEFAULT 'strict'
 );
+CREATE TABLE IF NOT EXISTS phrases(
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    text    TEXT NOT NULL,
+    hits    INTEGER NOT NULL DEFAULT 0,   -- сколько раз поймала
+    created INTEGER NOT NULL DEFAULT 0,
+    vec     BLOB
+);
+CREATE INDEX IF NOT EXISTS idx_phrases_chat ON phrases(chat_id);
 CREATE TABLE IF NOT EXISTS punishments(
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id  INTEGER NOT NULL,
@@ -316,6 +348,7 @@ class Settings:
     cmds_on: int = 0
     cmds_guest_cd: int = 3600
     cmds_anywhere: int = 0
+    cmds_bare: int = 0
     digest_to: int = 0
     service_join: int = 0
     service_leave: int = 0
@@ -344,6 +377,21 @@ class Settings:
     court_min: int = 15
     nn_mode: int = 1
     nn_threshold: int = 85
+    sem_on: int = 0
+    sem_threshold: int = 75
+    sem_punish: str = "delete"
+    sem_mute_min: int = 60
+    sem_guests: int = 0
+    burst_on: int = 0
+    burst_users: int = 3
+    burst_punish: str = "delete"
+    burst_mute_min: int = 60
+    nn_net: int = 1
+    watch_nn: int = 0
+    ocr_on: int = 0
+    ocr_langs: str = "rus+eng"
+    asr_on: int = 0
+    asr_max_sec: int = 120
     cards_on: int = 1
     card_mask: int = 4095
     log_chat_id: int | None = None
@@ -386,6 +434,21 @@ _SETTINGS_MIGRATIONS = {
     "trust_mask": "INTEGER NOT NULL DEFAULT 31",
     "nn_mode": "INTEGER NOT NULL DEFAULT 1",
     "nn_threshold": "INTEGER NOT NULL DEFAULT 85",
+    "sem_on": "INTEGER NOT NULL DEFAULT 0",
+    "sem_threshold": "INTEGER NOT NULL DEFAULT 75",
+    "sem_punish": "TEXT NOT NULL DEFAULT 'delete'",
+    "sem_mute_min": "INTEGER NOT NULL DEFAULT 60",
+    "sem_guests": "INTEGER NOT NULL DEFAULT 0",
+    "burst_on": "INTEGER NOT NULL DEFAULT 0",
+    "burst_users": "INTEGER NOT NULL DEFAULT 3",
+    "burst_punish": "TEXT NOT NULL DEFAULT 'delete'",
+    "burst_mute_min": "INTEGER NOT NULL DEFAULT 60",
+    "nn_net": "INTEGER NOT NULL DEFAULT 1",
+    "watch_nn": "INTEGER NOT NULL DEFAULT 0",
+    "ocr_on": "INTEGER NOT NULL DEFAULT 0",
+    "ocr_langs": "TEXT NOT NULL DEFAULT 'rus+eng'",
+    "asr_on": "INTEGER NOT NULL DEFAULT 0",
+    "asr_max_sec": "INTEGER NOT NULL DEFAULT 120",
     "games_on": "INTEGER NOT NULL DEFAULT 0",
     "games_adm": "INTEGER NOT NULL DEFAULT 0",
     "rus_punish": "TEXT NOT NULL DEFAULT 'mute'",
@@ -416,6 +479,7 @@ _SETTINGS_MIGRATIONS = {
     "gm_fwd": "INTEGER NOT NULL DEFAULT 60",
     "words_guests": "INTEGER NOT NULL DEFAULT 1",
     "extlinks_on": "INTEGER NOT NULL DEFAULT 1",
+    "cmds_bare": "INTEGER NOT NULL DEFAULT 0",
     "service_join": "INTEGER NOT NULL DEFAULT 0",
     "service_leave": "INTEGER NOT NULL DEFAULT 0",
     "service_other": "INTEGER NOT NULL DEFAULT 0",
@@ -546,8 +610,64 @@ async def _migrate() -> None:
     await _db.commit()
 
 
+def _healthy(path: str) -> bool:
+    """Файл базы читается и не побит."""
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return False
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            return con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        finally:
+            con.close()
+    except Exception:
+        return False
+
+
+def _restore_from_backup() -> str | None:
+    """Подменить битую базу свежей целой копией. Возвращает имя копии.
+
+    База лежит на примонтированном томе, а SQLite в режиме WAL плохо переносит
+    вмешательство снаружи: одна запись чужим процессом — и файл больше не
+    читается. Раньше бот в такой ситуации просто падал при старте и молчал,
+    хотя рядом лежали суточные копии.
+
+    Битый файл не удаляем: кладём рядом с пометкой, вдруг из него ещё что-то
+    выцарапают.
+    """
+    backups = sorted(glob.glob(os.path.join(config.BACKUP_DIR, "gremlin-*.sqlite3")),
+                     reverse=True)
+    for path in backups:
+        if not _healthy(path):
+            logger.warning("копия %s тоже битая", os.path.basename(path))
+            continue
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        if os.path.exists(config.DB_PATH):
+            os.replace(config.DB_PATH, f"{config.DB_PATH}.malformed-{stamp}")
+        for tail in ("-wal", "-shm"):          # хвосты от битой базы не нужны
+            leftover = config.DB_PATH + tail
+            if os.path.exists(leftover):
+                os.remove(leftover)
+        shutil.copy2(path, config.DB_PATH)
+        logger.error("база была повреждена — восстановлена из копии %s",
+                     os.path.basename(path))
+        return os.path.basename(path)
+    return None
+
+
+# что случилось с базой при старте: показываем владельцу, чтобы потеря данных
+# не прошла незамеченной
+restored_from: str | None = None
+
+
 async def init() -> None:
-    global _db
+    global _db, restored_from
+    if os.path.exists(config.DB_PATH) and not _healthy(config.DB_PATH):
+        restored_from = _restore_from_backup()
+        if restored_from is None:
+            logger.error("база повреждена, целых копий нет — начинаем с пустой")
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            os.replace(config.DB_PATH, f"{config.DB_PATH}.malformed-{stamp}")
     _db = await aiosqlite.connect(config.DB_PATH)
     _db.row_factory = aiosqlite.Row
     await _db.execute("PRAGMA journal_mode=WAL")
@@ -596,9 +716,61 @@ async def update_chat_title(chat_id: int, title: str | None, username: str | Non
     await _db.commit()
 
 
+async def clear_log_refs(chat_id: int) -> None:
+    """Убрать ссылки на чат как на лог-чат — он больше не рабочий."""
+    await _db.execute("UPDATE settings SET log_chat_id = NULL WHERE log_chat_id = ?",
+                      (chat_id,))
+    await _db.commit()
+
+
 async def set_chat_active(chat_id: int, active: bool) -> None:
     await _db.execute("UPDATE chats SET active = ? WHERE chat_id = ?", (int(active), chat_id))
     await _db.commit()
+
+
+# всё, что привязано к чату: при повышении группы до супергруппы Telegram
+# меняет ей id, и без переноса чат для бота превращается в чужой
+_CHAT_TABLES = ("settings", "triggers", "chat_cmds", "watch_profiles", "whitelist",
+                "link_wl", "inline_wl", "words", "punishments", "warns",
+                "samples", "events", "msg_stats", "phrases")
+
+
+async def migrate_chat(old_id: int, new_id: int) -> bool:
+    """Перенести чат на новый id после повышения до супергруппы.
+
+    Telegram выдаёт супергруппе другой id (−123 становится −100…123) и присылает
+    об этом служебное сообщение. Если его не обработать, бот перестаёт узнавать
+    чат: настройки, вайтлисты, стоп-слова и копилка улик остаются висеть на
+    старом id, а в новом чате бот молчит, считая его чужим.
+
+    False — переносить нечего (чат не был зарегистрирован).
+    """
+    cur = await _db.execute("SELECT 1 FROM chats WHERE chat_id = ?", (old_id,))
+    if await cur.fetchone() is None:
+        return False
+    # новая запись могла успеть появиться (бота добавили в уже супергруппу):
+    # тогда старую просто убираем, данные в ней всё равно пустые
+    cur = await _db.execute("SELECT 1 FROM chats WHERE chat_id = ?", (new_id,))
+    if await cur.fetchone() is not None:
+        await _db.execute("DELETE FROM chats WHERE chat_id = ?", (old_id,))
+        for table in _CHAT_TABLES:
+            await _db.execute(f"DELETE FROM {table} WHERE chat_id = ?", (old_id,))
+        await _db.commit()
+        return True
+
+    await _db.execute("UPDATE chats SET chat_id = ? WHERE chat_id = ?", (new_id, old_id))
+    for table in _CHAT_TABLES:
+        # OR REPLACE: у settings и msg_stats chat_id входит в первичный ключ,
+        # и строка под новым id теоретически может уже существовать
+        await _db.execute(f"UPDATE OR REPLACE {table} SET chat_id = ? WHERE chat_id = ?",
+                          (new_id, old_id))
+    # чат мог быть чьим-то лог-чатом или адресатом сводки — эти ссылки тоже правим
+    await _db.execute("UPDATE settings SET log_chat_id = ? WHERE log_chat_id = ?",
+                      (new_id, old_id))
+    await _db.execute("UPDATE settings SET digest_to = ? WHERE digest_to = ?",
+                      (new_id, old_id))
+    await _db.commit()
+    return True
 
 
 async def set_owner(chat_id: int, owner_id: int) -> None:
@@ -642,6 +814,42 @@ async def owns_chat(user_id: int, chat_id: int) -> bool:
         return True
     ch = await get_chat(chat_id)
     return ch is not None and ch["owner_id"] == user_id
+
+
+async def log_chat_still_needed(log_id: int, leaving: int) -> str | None:
+    """Кому ещё нужен этот лог-чат, кроме уходящего. None — никому.
+
+    Возвращает причину строкой: её показываем человеку, чтобы он понимал,
+    почему бот остался в логе, а не молча проигнорировал просьбу.
+    """
+    if not log_id or log_id == leaving:
+        return "это сам чат"
+    if await global_log() == log_id:
+        return "это общий лог бота"
+    cur = await _db.execute(
+        """SELECT COUNT(*) AS n FROM settings s JOIN chats c USING (chat_id)
+           WHERE s.log_chat_id = ? AND s.chat_id != ? AND c.active = 1""",
+        (log_id, leaving))
+    row = await cur.fetchone()
+    if row and row["n"]:
+        return f"туда шлют карточки ещё {row['n']} чат(ов)"
+    # Чистый лог-чат — это чат, где бот только пишет карточки. Если у него
+    # есть собственная жизнь (свои наказания, свои стоп-слова, свой лог),
+    # значит его модерируют, и уходить оттуда нельзя.
+    for table, what in (("punishments", "там есть свои наказания"),
+                        ("words", "там свои стоп-слова"),
+                        ("triggers", "там свои триггеры"),
+                        ("chat_cmds", "там свои счётчики")):
+        cur = await _db.execute(
+            f"SELECT 1 FROM {table} WHERE chat_id = ? LIMIT 1", (log_id,))
+        if await cur.fetchone():
+            return f"это рабочий чат: {what}"
+    cur = await _db.execute(
+        "SELECT log_chat_id FROM settings WHERE chat_id = ?", (log_id,))
+    row = await cur.fetchone()
+    if row and row["log_chat_id"]:
+        return "у него самого настроен лог-чат, значит его модерируют"
+    return None
 
 
 async def moderated_chats() -> list[aiosqlite.Row]:
@@ -1096,18 +1304,122 @@ async def sample_set_vec(sample_id: int, vec: bytes) -> None:
     await _db.commit()
 
 
+async def phrases_list(chat_id: int) -> list[aiosqlite.Row]:
+    cur = await _db.execute(
+        "SELECT * FROM phrases WHERE chat_id = ? ORDER BY id", (chat_id,))
+    return await cur.fetchall()
+
+
+async def phrase_add(chat_id: int, text: str) -> int | None:
+    """Добавить фразу-образец. None — такая уже есть."""
+    text = " ".join((text or "").split())[:config.SAMPLE_TEXT_LIMIT]
+    if not text:
+        return None
+    cur = await _db.execute(
+        "SELECT id FROM phrases WHERE chat_id = ? AND lower(text) = lower(?)",
+        (chat_id, text))
+    if await cur.fetchone():
+        return None
+    cur = await _db.execute(
+        "INSERT INTO phrases (chat_id, text, created) VALUES (?,?,?)",
+        (chat_id, text, _now()))
+    await _db.commit()
+    return cur.lastrowid
+
+
+async def phrase_del(chat_id: int, phrase_id: int) -> None:
+    await _db.execute("DELETE FROM phrases WHERE chat_id = ? AND id = ?",
+                      (chat_id, phrase_id))
+    await _db.commit()
+
+
+async def phrase_hit(phrase_id: int) -> None:
+    """Счётчик срабатываний: по нему видно, какие фразы работают, а какие зря."""
+    await _db.execute("UPDATE phrases SET hits = hits + 1 WHERE id = ?", (phrase_id,))
+    await _db.commit()
+
+
+async def phrase_set_vec(phrase_id: int, vec: bytes) -> None:
+    await _db.execute("UPDATE phrases SET vec = ? WHERE id = ?", (vec, phrase_id))
+    await _db.commit()
+
+
+async def samples_profile_net(chat_id: int, limit: int = 4000) -> list[aiosqlite.Row]:
+    """Улики чата плюс улики его сетки.
+
+    Чаты одной сетки принадлежат одному человеку и похожи между собой, поэтому
+    объединять их копилки честно: молодой чат в сетке начинает работать сразу,
+    а не через месяц. С чужими чатами такого не делаем — там своя норма.
+    """
+    peers = [c["chat_id"] for c in await net_peers(chat_id)]
+    if not peers:
+        return await samples_profile(chat_id, limit)
+    ids = [chat_id, *peers]
+    marks = ",".join("?" * len(PROFILE_ORIGINS))
+    chats = ",".join("?" * len(ids))
+    cur = await _db.execute(
+        f"""SELECT * FROM samples
+            WHERE origin IN ({marks}) AND label != 'unknown' AND chat_id IN ({chats})
+            ORDER BY id DESC LIMIT ?""",
+        (*PROFILE_ORIGINS, *ids, limit))
+    return await cur.fetchall()
+
+
+async def samples_of_origin(chat_id: int, origin: str,
+                            limit: int = 2000) -> list[aiosqlite.Row]:
+    """Улики одного вида — например, спам-профили (origin='profile')."""
+    cur = await _db.execute(
+        """SELECT * FROM samples WHERE chat_id = ? AND origin = ?
+           ORDER BY id DESC LIMIT ?""", (chat_id, origin, limit))
+    return await cur.fetchall()
+
+
+async def samples_unknown(chat_id: int, limit: int = 2000) -> list[aiosqlite.Row]:
+    """Улики без оценки — ручные наказания. Лежат мёртвым грузом, пока их
+    не разметят: причина у человека своя, и что там было, знает только он."""
+    cur = await _db.execute(
+        """SELECT * FROM samples WHERE chat_id = ? AND label = 'unknown'
+           ORDER BY id DESC LIMIT ?""", (chat_id, limit))
+    return await cur.fetchall()
+
+
+async def samples_relabel_many(ids: list[int], label: str) -> int:
+    """Разметить пачку улик разом — по итогам разбивки на кучки.
+
+    origin становится 'card': оценку поставил человек, а такие мы не удаляем
+    при подрезке копилки.
+    """
+    if not ids:
+        return 0
+    marks = ",".join("?" * len(ids))
+    cur = await _db.execute(
+        f"UPDATE samples SET label = ?, origin = 'card' WHERE id IN ({marks})",
+        (label, *ids))
+    await _db.commit()
+    return cur.rowcount or 0
+
+
 async def sample_by_id(sample_id: int):
     cur = await _db.execute("SELECT * FROM samples WHERE id = ?", (sample_id,))
     return await cur.fetchone()
 
 
 async def samples_trim(keep: int) -> int:
-    """Не даём копилке расти бесконечно: держим последние keep улик на чат."""
+    """Не даём копилке расти бесконечно: держим последние keep улик на чат.
+
+    База целиком копируется в бэкап каждые сутки и хранится в 14 копиях,
+    поэтому лишний гигабайт улик превращается в четырнадцать. Режем самое
+    дешёвое — поток автомата и случайные образцы нормы, которых набегает
+    сколько угодно. Улики, размеченные человеком кнопкой на карточке
+    (origin='card'), не трогаем никогда: их мало и они самые ценные.
+    """
     cur = await _db.execute(
-        """DELETE FROM samples WHERE id NOT IN (
-               SELECT id FROM samples s2
-               WHERE s2.chat_id = samples.chat_id
-               ORDER BY s2.id DESC LIMIT ?)""", (keep,))
+        """DELETE FROM samples
+            WHERE origin != 'card'
+              AND id NOT IN (
+                  SELECT id FROM samples s2
+                  WHERE s2.chat_id = samples.chat_id AND s2.origin != 'card'
+                  ORDER BY s2.id DESC LIMIT ?)""", (keep,))
     await _db.commit()
     return cur.rowcount or 0
 

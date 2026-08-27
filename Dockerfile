@@ -2,8 +2,13 @@ FROM python:3.13-slim
 
 # tini — чтобы docker stop / Ctrl+C доходили до python как обычный SIGTERM
 # и бот завершался штатно (закрыл базу, отключил юзербота), а не убивался
+#
+# tesseract — чтение текста с картинок: реклама часто приходит скриншотом,
+# и без него такое сообщение для правил выглядит пустым фото. Русский язык
+# ставится отдельным пакетом, иначе распознаётся только латиница.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends tini \
+ && apt-get install -y --no-install-recommends \
+      tini tesseract-ocr tesseract-ocr-rus \
  && rm -rf /var/lib/apt/lists/*
 
 # cloudflared: бот сам поднимает им быстрый туннель для веб-панели.

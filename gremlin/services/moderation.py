@@ -11,45 +11,84 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .. import config, db, utils
-from . import adm_cache
+from . import adm_cache, media
 
 logger = logging.getLogger("gremlin.moderation")
 
-UNMUTE_PERMS = ChatPermissions(
-    can_send_messages=True,
-    can_send_audios=True,
-    can_send_documents=True,
-    can_send_photos=True,
-    can_send_videos=True,
-    can_send_video_notes=True,
-    can_send_voice_notes=True,
-    can_send_polls=True,
-    can_send_other_messages=True,
-    can_add_web_page_previews=True,
-    can_invite_users=True,
-)
 
-MUTE_PERMS = ChatPermissions(
-    can_react_to_messages=False,
-    can_send_messages=False,
-    can_send_audios=False,
-    can_send_documents=False,
-    can_send_photos=False,
-    can_send_videos=False,
-    can_send_video_notes=False,
-    can_send_voice_notes=False,
-    can_send_polls=False,
-    can_send_other_messages=False,
-    can_add_web_page_previews=False,
-)
-
-def mute_perms(reactions: bool) -> ChatPermissions:
-    """Права замученного. Реакции оставляем, если чат так настроен."""
-    return MUTE_PERMS.model_copy(update={"can_react_to_messages": bool(reactions)})
+def _all_allowed() -> ChatPermissions:
+    """Полный набор разрешений — все поля, какие есть в этой версии API."""
+    return ChatPermissions(**{k: True for k in ChatPermissions.model_fields})
 
 
-KIND_EMOJI = {"ban": "⛔", "mute": "🔇", "delete": "🗑", "banchan": "📛"}
-KIND_LABEL = {"ban": "Бан", "mute": "Мут", "delete": "Удаление", "banchan": "Бан отправителя-канала"}
+async def unmute_perms(bot: Bot, chat_id: int) -> ChatPermissions:
+    """Права, с которыми человек возвращается в чат после мута.
+
+    Разрешаем всё — и это не щедрость, а единственный способ снять мут
+    по-настоящему. Личные ограничения Telegram хранит отдельной записью, и
+    удаляет её, только когда в ней не осталось ни одного запрета. Пока запись
+    жива, человек числится restricted, даже если писать ему уже можно:
+    клиенты показывают такое как «вы ограничены», а у кого-то чат и вовсе
+    пропадает из списка. Проверено на живом чате: набор из всех полей = True
+    возвращает статус member, любой набор с одним False оставляет restricted.
+
+    Отдельных прав это не даёт: без личной записи человек живёт по общим
+    настройкам чата, как все остальные.
+
+    Исключение — чат, где писать запрещено всем (объявления, режим «только
+    админы»). Там всеобщий запрет важнее аккуратного статуса: копируем
+    настройки чата, иначе размученный окажется единственным, кому можно
+    писать.
+    """
+    try:
+        chat = await bot.get_chat(chat_id)
+        perms = getattr(chat, "permissions", None)
+    except Exception:
+        logger.warning("не получить права чата %s", chat_id, exc_info=True)
+        return _all_allowed()
+    if perms is None or perms.can_send_messages is not False:
+        return _all_allowed()
+    # чат закрыт для всех — возвращаем человека ровно к общим правилам
+    data = {k: (False if v is None else v) for k, v in perms.model_dump().items()}
+    return ChatPermissions(**data)
+
+
+# что именно отбирает мут: право писать и всё, что этим правом является
+_MUTE_OFF = ("can_send_messages", "can_send_audios", "can_send_documents",
+             "can_send_photos", "can_send_videos", "can_send_video_notes",
+             "can_send_voice_notes", "can_send_polls", "can_send_other_messages",
+             "can_add_web_page_previews")
+
+
+async def mute_perms(bot: Bot, chat_id: int, reactions: bool) -> ChatPermissions:
+    """Права замученного: настройки чата минус право писать.
+
+    Раньше тут был фиксированный набор, где всё незаполненное превращалось
+    в запрет: замученный заодно лишался права приглашать, закреплять и менять
+    описание — того, о чём мут не просили. Личная запись об ограничении
+    получалась шире, чем нужно.
+
+    Теперь берём общие настройки чата и гасим ровно то, что относится
+    к отправке сообщений. Остальное остаётся как у всех, и запись описывает
+    ровно один запрет: молчать.
+    """
+    try:
+        chat = await bot.get_chat(chat_id)
+        base = getattr(chat, "permissions", None)
+    except Exception:
+        logger.warning("не получить права чата %s", chat_id, exc_info=True)
+        base = None
+    data = ({k: bool(v) for k, v in base.model_dump().items()} if base is not None
+            else {k: True for k in ChatPermissions.model_fields})
+    for key in _MUTE_OFF:
+        data[key] = False
+    data["can_react_to_messages"] = bool(reactions) and data.get("can_react_to_messages", True)
+    return ChatPermissions(**data)
+
+
+KIND_EMOJI = {"ban": "⛔", "mute": "🔇", "delete": "🗑", "banchan": "📛", "kick": "👢"}
+KIND_LABEL = {"ban": "Бан", "mute": "Мут", "delete": "Удаление",
+              "banchan": "Бан отправителя-канала", "kick": "Кик"}
 
 
 def card_kb(pid: int | None, kind: str,
@@ -146,15 +185,26 @@ def message_body(message, with_link: bool = False) -> str:
     """
     if message is None:
         return ""
-    media = next((label for attr, label in _MEDIA_LABELS.items()
-                  if getattr(message, attr, None) is not None), None)
+    # не media: так зовётся сервис распознавания, он нужен несколькими строками ниже
+    attach = next((label for attr, label in _MEDIA_LABELS.items()
+                   if getattr(message, attr, None) is not None), None)
     lines = []
     link = message_link(message) if with_link else None
     if link:
         lines.append(f"🔗 <b>Ссылка:</b> {link}")   # сначала «где», потом «что»
-    inner = body_block(message.text or message.caption, media).lstrip("\n")
+    inner = body_block(message.text or message.caption, attach).lstrip("\n")
     if inner:
         lines.append(inner)
+    # распознанное в картинке или голосовом: без этой строки в карточке
+    # висело бы «фото без текста», хотя наказали именно за текст на картинке
+    seen = media.cached(message)
+    if seen:
+        head = "🔊 <b>Расшифровка:</b>" if getattr(message, "voice", None) \
+            else "🔍 <b>Распознано:</b>"
+        body = utils.esc(utils.chunk(seen, BODY_LIMIT))
+        tag = "<blockquote expandable>" if len(body) > QUOTE_EXPAND else "<blockquote>"
+        lines.append(f"{head}\n{tag}{body}</blockquote>")
+
     block = ("\n\n" + "\n".join(lines)) if lines else ""
     buttons = _buttons(message)
     if buttons:
@@ -234,7 +284,8 @@ async def punish_ex(bot: Bot, chat_id: int, user: User, kind: str, mute_min: int
         if kind == "mute":
             s = await db.get_settings(chat_id)
             await bot.restrict_chat_member(
-                chat_id, user.id, permissions=mute_perms(s.mute_reactions),
+                chat_id, user.id,
+                permissions=await mute_perms(bot, chat_id, s.mute_reactions),
                 until_date=until,
             )
         elif kind == "ban":
@@ -278,7 +329,8 @@ async def lift_punishment(bot: Bot, pid: int,
     chat_id, uid, kind = p["chat_id"], p["user_id"], p["kind"]
     try:
         if kind == "mute":
-            await bot.restrict_chat_member(chat_id, uid, permissions=UNMUTE_PERMS)
+            await bot.restrict_chat_member(
+                chat_id, uid, permissions=await unmute_perms(bot, chat_id))
         elif kind == "ban":
             await bot.unban_chat_member(chat_id, uid, only_if_banned=True)
         elif kind == "banchan":
@@ -480,6 +532,46 @@ async def unban_pass_valid(chat_id: int, uid: int) -> bool:
     return ok
 
 
+async def leave_chat(bot: Bot, chat_id: int) -> tuple[bool, str]:
+    """Выйти из чата и, если он больше никому не нужен, из его лог-чата.
+
+    Лог-чат заводят под конкретную группу, и оставаться в нём после ухода
+    из самой группы бессмысленно: карточек оттуда больше не будет, а бот
+    висит в чужом чате.
+
+    Но лог-чат бывает общим на несколько групп и бывает рабочим чатом сам по
+    себе — тогда уходить нельзя. Причину, по которой остались, возвращаем
+    строкой, чтобы человек не гадал.
+    """
+    s = await db.get_settings(chat_id)
+    log_id = s.log_chat_id
+    try:
+        await bot.leave_chat(chat_id)
+    except Exception as e:
+        return False, human_error(e)
+    await db.set_chat_active(chat_id, False)
+    await db.add_event(chat_id, "bot", "бот покинул чат по команде владельца")
+
+    note = ""
+    if log_id:
+        reason = await db.log_chat_still_needed(log_id, chat_id)
+        if reason:
+            note = f"\nЛог-чат оставил: {reason}."
+        else:
+            try:
+                await bot.leave_chat(log_id)
+            except Exception as e:
+                logger.warning("не выйти из лог-чата %s", log_id, exc_info=True)
+                note = f"\nИз лог-чата выйти не вышло: {human_error(e)}"
+            else:
+                await db.set_chat_active(log_id, False)
+                await db.add_event(log_id, "bot", f"лог-чат покинут вместе с {chat_id}")
+                note = "\nИз лог-чата тоже вышел."
+        # ссылка на лог всё равно больше не рабочая
+        await db.set_setting(chat_id, "log_chat_id", None)
+    return True, note
+
+
 async def send_card(bot: Bot, chat_id: int, bit: int, text: str,
                     pid: int | None = None, kind: str = "delete",
                     user_id: int | None = None,
@@ -673,7 +765,8 @@ async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
     if s.nn_mode:
         await db.sample_add(
             chat.id, user.id, "auto", "spam",
-            message.text or message.caption or "",
+            " ".join(filter(None, [message.text or message.caption or "",
+                                   media.cached(message)])),
             feature=feature_label, pid=pid,
             extra="\n".join(_buttons(message)) or None,
         )

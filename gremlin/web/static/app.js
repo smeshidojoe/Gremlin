@@ -167,15 +167,38 @@ const chips = (list, act) => `<div class="wrap">${list.map((b) => `
   <button class="chip ${b.on ? 'on' : 'off'}" data-act="${act}" data-bit="${b.bit}">
     ${b.on ? '✓' : '○'} ${esc(b.label)}</button>`).join('')}</div>`;
 
+/* Разложить по владельцам: [{owner, items}], владельцы по алфавиту,
+   свои чаты — первыми, чтобы не искать их среди чужих. */
+function groupByOwner(items, mineId) {
+  const mine = mineId || (INIT.user && INIT.user.id);
+  const byOwner = new Map();
+  for (const it of items) {
+    const key = it.owner_id || 0;
+    if (!byOwner.has(key)) byOwner.set(key, { owner: it.owner || 'без владельца', items: [] });
+    byOwner.get(key).items.push(it);
+  }
+  return [...byOwner.entries()]
+    .sort((a, b) => (a[0] === mine ? -1 : b[0] === mine ? 1
+      : a[1].owner.localeCompare(b[1].owner, 'ru')))
+    .map(([, g]) => g);
+}
+
 /* ---------- страницы ---------- */
 
 async function homeView() {
   const d = INIT;
-  const chats = d.chats.map((c) => `
+  const tileFor = (c) => `
     <button class="tile" data-go="#/chat/${c.chat_id}" style="grid-column:1/-1">
       <span>${esc(c.title)}${c.linked ? `<small>📣 ${esc(c.linked)}</small>` : ''}</span>
       <span class="right muted">›</span>
-    </button>`).join('');
+    </button>`;
+  // у владельца бота в списке чаты разных людей — группируем по хозяину,
+  // иначе список превращается в кашу
+  const chats = d.owner ? groupByOwner(d.chats).map((g) => `
+      <div class="label" style="margin:10px 0 4px">👤 ${esc(g.owner)}
+        <small>${g.items.length} ${num(g.items.length, 'чат', 'чата', 'чатов')}</small></div>
+      <div class="tiles">${g.items.map(tileFor).join('')}</div>`).join('')
+    : `<div class="tiles">${d.chats.map(tileFor).join('')}</div>`;
 
   const ownerTiles = d.owner ? `
     <h2>Владельцу бота</h2>
@@ -195,7 +218,7 @@ async function homeView() {
     html: `
       <div class="card">
         <h2>💬 Чаты <span class="muted">(${d.chats.length})</span></h2>
-        ${chats ? `<div class="tiles">${chats}</div>`
+        ${d.chats.length ? chats
                 : '<div class="empty">Пока пусто. Добавьте бота администратором в свой чат.</div>'}
         <div style="margin-top:10px"><a class="btn wide" href="${esc(d.add_url)}" target="_blank" rel="noopener">➕ Добавить в чат</a></div>
       </div>
@@ -789,6 +812,18 @@ async function eventsView(cid) {
 
 /* --- сетки --- */
 
+/* Строки сеток; у владельца бота — с разбивкой по владельцам. */
+function netRows(items) {
+  const row = (n) => `<button class="item" style="width:100%;background:none;border:0;color:inherit;font:inherit;text-align:left"
+      data-go="#/net/${n.id}">
+      <div class="body">🕸 ${esc(n.title)}<small>${n.chats} ${num(n.chats, 'чат', 'чата', 'чатов')}</small></div>
+      <div class="value">›</div></button>`;
+  if (!INIT.owner) return items.map(row).join('');
+  return groupByOwner(items).map((g) => `
+    <div class="label" style="margin:10px 0 4px">👤 ${esc(g.owner)}</div>
+    ${g.items.map(row).join('')}`).join('');
+}
+
 async function netsView() {
   const d = await api('/nets');
   return {
@@ -798,10 +833,7 @@ async function netsView() {
       <div class="intro">Сетка — группа ваших чатов, между которыми разъезжаются наказания:
         бан в одном применяется во всех остальных. Чат состоит ровно в одной сетке или ни в одной.</div>
       <div style="margin-top:10px">
-        ${d.items.map((n) => `<button class="item" style="width:100%;background:none;border:0;color:inherit;font:inherit;text-align:left"
-            data-go="#/net/${n.id}">
-            <div class="body">🕸 ${esc(n.title)}<small>${n.chats} ${num(n.chats, 'чат', 'чата', 'чатов')}${n.owner ? ' · ' + esc(n.owner) : ''}</small></div>
-            <div class="value">›</div></button>`).join('') || '<div class="empty">Пока ни одной сетки.</div>'}
+        ${netRows(d.items) || '<div class="empty">Пока ни одной сетки.</div>'}
       </div>
       ${d.can_create
         ? '<button class="btn wide" style="margin-top:10px" data-act="net-new">🆕 Создать сетку</button>'

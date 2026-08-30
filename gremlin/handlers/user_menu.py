@@ -143,7 +143,10 @@ async def view_access() -> tuple[str, InlineKeyboardMarkup]:
     )
     b.button(text="➕ Добавить", callback_data="u:acca")
     for r in rows:
-        who = await db.user_label(r["user_id"], r["username"])
+        # имя, записанное при добавлении, — запасной вариант: человек мог
+        # так и не написать боту, и в users его нет
+        stored = r["name"] if "name" in r.keys() else None
+        who = await db.user_label(r["user_id"], r["username"], fallback=stored)
         b.button(text=f"❌ {who}", callback_data=f"u:accd:{r['id']}")
     b.button(text="⬅️ Назад", callback_data="u:home")
     b.adjust(1)
@@ -1742,17 +1745,22 @@ async def access_input(message: Message, state: FSMContext, bot: Bot) -> None:
     if text == "/cancel":
         await _done(message, bot, state, await view_access())
         return
-    user_id, username = None, None
+    user_id, username, name = None, None, None
     if text.lstrip("-").isdigit():
         user_id = int(text)
     elif text.startswith("@") and len(text) > 3:
         username = text
-        user_id, _ = await resolve.by_username(bot, text)   # закрепляем id, если нашли
+        # закрепляем и id, и имя: про человека, который боту ещё не писал,
+        # мы больше ничего не знаем, и в списке висел голый ник
+        user_id, name = await resolve.by_username(bot, text)
     else:
         await _retry(message, bot, state,
                      "<b>👥 Доступ к боту</b>\n\n⚠️ Нужен числовой id или @username.")
         return
-    await db.access_add(user_id, username)
+    if user_id and not name:
+        row = await db.get_user(user_id)
+        name = row["first_name"] if row else None
+    await db.access_add(user_id, username, name)
     note = "✅ Добавлено.\n\n" if user_id else "✅ Добавлено (id узнать не вышло — сверяю по нику).\n\n"
     await _done(message, bot, state, await view_access(), note)
 

@@ -95,11 +95,18 @@ async def card_ban(cb: CallbackQuery, bot: Bot) -> None:
     )
     await db.add_event(chat_id, "card", f"бан из карточки: {user_id} by {cb.from_user.id}")
     # человек посмотрел на конкретное сообщение и подтвердил, что это спам
+    from ..services import nn
     last = await db.sample_last_for(chat_id, user_id)
     if last is not None:
         await db.sample_relabel(last["id"], "spam", origin="card")
-        from ..services import nn
         nn.invalidate(chat_id)
+    # и сам профиль: имя с ником — тоже улика, по ней узнаются следующие такие же
+    row = await db.get_user(user_id)
+    face = " ".join(x for x in (
+        (row["first_name"] if row else None),
+        (f"@{row['username']}" if row and row["username"] else None)) if x)
+    if face:
+        await nn.remember_face(chat_id, user_id, face, "spam")
     await _mark(cb, "\n\n⛔ <b>Забанен</b>")
     from ..services import net
     asyncio.create_task(net.spread_id_and_note(

@@ -101,6 +101,9 @@ async def _chat_brief(bot, row) -> dict:
         "title": row["title"] or str(cid),
         "username": row["username"],
         "owner_id": row["owner_id"],
+        # имя владельца: у владельца бота в списке чаты нескольких человек,
+        # и без подписи непонятно, чей какой
+        "owner": await db.user_label(row["owner_id"]) if row["owner_id"] else None,
         "linked": linked,
     }
 
@@ -1189,8 +1192,9 @@ async def api_nets(request: web.Request) -> web.Response:
         chats = await db.net_chats(n["id"])
         out.append({"id": n["id"], "title": n["title"], "chats": len(chats),
                     "owner_id": n["owner_id"],
-                    "owner": (await db.user_handle(n["owner_id"])
-                              if is_owner(request) and n["owner_id"] != uid else None)})
+                    # имя владельца нужно и для своих сеток: по нему панель
+                    # группирует список у владельца бота
+                    "owner": await db.user_label(n["owner_id"])})
     mine = sum(1 for n in nets if n["owner_id"] == uid)
     return js({"items": out, "limit": config.NET_LIMIT, "can_create": mine < config.NET_LIMIT})
 
@@ -1314,8 +1318,10 @@ async def api_access(request: web.Request) -> web.Response:
     owner_only(request)
     items = []
     for r in await db.access_list():
+        stored = r["name"] if "name" in r.keys() else None
         items.append({"id": r["id"], "user_id": r["user_id"], "username": r["username"],
-                      "who": await db.user_label(r["user_id"], r["username"])})
+                      "who": await db.user_label(r["user_id"], r["username"],
+                                                 fallback=stored)})
     return js({"items": items})
 
 
@@ -1324,10 +1330,12 @@ async def api_access_add(request: web.Request) -> web.Response:
     owner_only(request)
     token = ((await body(request)).get("target") or "").strip()
     if token.lstrip("-").isdigit():
-        await db.access_add(int(token), None)
+        uid = int(token)
+        row = await db.get_user(uid)
+        await db.access_add(uid, None, row["first_name"] if row else None)
     elif token.startswith("@") and len(token) > 3:
-        uid, _ = await resolve.by_username(bot_of(request), token)
-        await db.access_add(uid, token)
+        uid, name = await resolve.by_username(bot_of(request), token)
+        await db.access_add(uid, token, name)
     else:
         raise web.HTTPBadRequest(text="Нужен id или @username.")
     return js({"ok": True})

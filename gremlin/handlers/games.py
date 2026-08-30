@@ -10,6 +10,7 @@
 import asyncio
 import logging
 import random
+import re
 import time
 
 from aiogram import Bot, F, Router
@@ -117,7 +118,6 @@ _RUS_HIT = (
 )
 
 
-@router.message(F.text.regexp(r"^!(рулетка|roulette)(\s|$)"))
 async def cmd_roulette(message: Message, bot: Bot) -> None:
     if not await _allowed(bot, message, config.GAME_RUS):
         return
@@ -157,7 +157,6 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
 
 # ---------- дуэль ----------
 
-@router.message(F.text.regexp(r"^!(дуэль|duel)(\s|$)"))
 async def cmd_duel(message: Message, bot: Bot) -> None:
     if not await _allowed(bot, message, config.GAME_DUEL):
         return
@@ -272,7 +271,6 @@ def _death(used: set[str]) -> str:
     return pick
 
 
-@router.message(F.text.regexp(r"^!(битва|battle)(\s|$)"))
 async def cmd_battle(message: Message, bot: Bot) -> None:
     if not await _allowed(bot, message, config.GAME_BATTLE):
         return
@@ -384,7 +382,6 @@ async def _battle_run(bot: Bot, key: tuple[int, int]) -> None:
 
 # ---------- народный суд ----------
 
-@router.message(F.text.regexp(r"^!(суд|court)(\s|$)"))
 async def cmd_court(message: Message, bot: Bot) -> None:
     if not await _allowed(bot, message, config.GAME_COURT):
         return
@@ -593,3 +590,28 @@ async def send_titles(bot: Bot) -> int:
             logger.warning("титулы: не отправить в %s", ch["chat_id"], exc_info=True)
         await asyncio.sleep(1)
     return done
+
+
+# ---------- запуск из общего пайплайна ----------
+#
+# Раньше каждая игра висела своим хендлером и перехватывала сообщение целиком:
+# aiogram отдаёт его первому подошедшему обработчику и на этом останавливается,
+# поэтому «!суд заходи на t.me/spam» до модерации не доходило вовсе. Теперь
+# игры зовутся последними, после всех проверок — на то, что их пережило.
+# Комментарий к команде (обвинение в суде) при этом сохраняется: он проходит
+# те же фильтры, что любой другой текст.
+COMMANDS = (
+    (re.compile(r"^!(рулетка|roulette)(\s|$)", re.IGNORECASE), cmd_roulette),
+    (re.compile(r"^!(дуэль|duel)(\s|$)", re.IGNORECASE), cmd_duel),
+    (re.compile(r"^!(битва|battle)(\s|$)", re.IGNORECASE), cmd_battle),
+    (re.compile(r"^!(суд|court)(\s|$)", re.IGNORECASE), cmd_court),
+)
+
+
+async def fire_game(bot: Bot, message: Message) -> bool:
+    """Запустить игру, если сообщение начинается с её команды."""
+    for pattern, handler in COMMANDS:
+        if pattern.match(message.text or ""):
+            await handler(message, bot)
+            return True
+    return False

@@ -647,6 +647,13 @@ async def _find_cmd(chat_id: int, text: str, anywhere: bool, bare: bool = False)
     return None
 
 
+async def fire_games(bot: Bot, message: Message) -> bool:
+    """Игры чата. Зовём отсюда, а не отдельным хендлером: иначе сообщение
+    с командой игры не доходило бы до модерации."""
+    from . import games
+    return await games.fire_game(bot, message)
+
+
 async def fire_trigger(bot: Bot, message: Message, s) -> None:
     """Ответить триггером, если фраза совпала. Работает для всех, включая админов."""
     if not s.trig_on or message.edit_date is not None or stale(message):
@@ -941,15 +948,21 @@ async def moderate(message: Message, bot: Bot) -> None:
     # и вайтлист. Но триггеры — развлекательная часть, они должны работать
     # для всех, поэтому перед выходом всё равно даём им сработать.
     if user.id in config.ADMIN_IDS:
+        if await fire_games(bot, message):
+            return
         await fire_trigger(bot, message, s)
         await fire_counter(bot, message, s)
         return
     if user.id in await adm_cache.chat_admin_ids(bot, chat.id):
+        if await fire_games(bot, message):
+            return
         await fire_trigger(bot, message, s)
         await fire_counter(bot, message, s)
         return
     scopes = await db.wl_scopes_for(chat.id, user.id, user.username)
     if "all" in scopes:
+        if await fire_games(bot, message):
+            return
         await fire_trigger(bot, message, s)
         await fire_counter(bot, message, s)
         return
@@ -1136,7 +1149,18 @@ async def moderate(message: Message, bot: Bot) -> None:
 
     # --- антифлуд (только новые сообщения, не редактирования) ---
     if s.flood_on and message.edit_date is None and "flood" not in scopes:
-        if filters.flood_hit(chat.id, user.id, s.flood_msgs, s.flood_window):
+        burst_ids = filters.flood_hit(chat.id, user.id, s.flood_msgs, s.flood_window,
+                                      message.message_id)
+        if burst_ids:
+            # чистим весь залп: последнее сообщение удалит moderation.violation,
+            # остальные — здесь, иначе спам остаётся висеть в чате
+            for mid in burst_ids:
+                if mid == message.message_id:
+                    continue
+                try:
+                    await bot.delete_message(chat.id, mid)
+                except Exception:
+                    pass          # старше 48 часов или уже удалено
             kind = "mute"
             if s.trust_on:
                 kind = trust.soften(kind, await trust.level(bot, chat.id, user.id, s),
@@ -1166,5 +1190,9 @@ async def moderate(message: Message, bot: Bot) -> None:
         await nn.shadow(chat.id, message, s, seen)
 
     # --- триггеры (последними: на удалённое модерацией не отвечаем) ---
+    # игры зовём здесь, а не отдельным хендлером: иначе сообщение с командой
+    # игры («!суд заходи на t.me/spam») до проверок бы не дошло
+    if await fire_games(bot, message):
+        return
     await fire_trigger(bot, message, s)
     await fire_counter(bot, message, s)

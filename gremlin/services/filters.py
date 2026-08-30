@@ -135,8 +135,14 @@ async def match_stopword(chat_id: int, text: str) -> str | None:
 _flood: dict[tuple[int, int], deque] = {}
 
 
-def flood_hit(chat_id: int, user_id: int, max_msgs: int, window: int) -> bool:
-    """True если юзер превысил лимит сообщений в окне."""
+def flood_hit(chat_id: int, user_id: int, max_msgs: int, window: int,
+              msg_id: int | None = None) -> list[int]:
+    """Сообщения залпа, если юзер превысил лимит. Пустой список — не превысил.
+
+    Возвращаем именно список id: наказать за флуд и оставить сам флуд в чате
+    странно, а удалять есть что только пока мы помним, какие это были
+    сообщения. Последнее из них удалит общий механизм нарушения.
+    """
     key = (chat_id, user_id)
     now = time.monotonic()
     dq = _flood.get(key)
@@ -144,9 +150,9 @@ def flood_hit(chat_id: int, user_id: int, max_msgs: int, window: int) -> bool:
         if len(_flood) > 50000:
             _flood.clear()
         dq = _flood[key] = deque(maxlen=64)
-    dq.append(now)
-    recent = [t for t in dq if now - t <= window]
-    if len(recent) >= max_msgs:
-        dq.clear()  # чтобы не наказывать повторно за тот же залп
-        return True
-    return False
+    dq.append((now, msg_id))
+    recent = [(t, mid) for t, mid in dq if now - t <= window]
+    if len(recent) < max_msgs:
+        return []
+    dq.clear()          # чтобы не наказывать повторно за тот же залп
+    return [mid for _t, mid in recent if mid is not None]

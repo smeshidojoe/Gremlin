@@ -178,6 +178,7 @@ CREATE TABLE IF NOT EXISTS access(
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id  INTEGER,
     username TEXT,
+    name     TEXT,          -- имя на момент добавления: боту человек мог не писать
     added    INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS watch_profiles(
@@ -504,6 +505,12 @@ _TABLE_MIGRATIONS = {
 
 
 async def _migrate() -> None:
+    # имя в списке доступа: раньше про добавленного по нику мы не знали ничего,
+    # и в списке висел голый @ник
+    cur = await _db.execute("PRAGMA table_info(access)")
+    if "name" not in {r["name"] for r in await cur.fetchall()}:
+        await _db.execute("ALTER TABLE access ADD COLUMN name TEXT")
+
     # первая версия сеток была одна на владельца: таблица nets с owner_id вместо
     # id и флаг chats.net_on. Перетаскиваем в именованные сетки.
     cur = await _db.execute("PRAGMA table_info(nets)")
@@ -1498,7 +1505,10 @@ async def user_label(user_id: int | None, username: str | None = None,
             if label:
                 return label
     if username:
-        return f"@{username.lstrip('@')}"
+        # имя, если его знали при добавлении: «Тыква @sweet_pumpkins» понятнее
+        # голого ника, а ник понятнее голого id
+        handle = f"@{username.lstrip('@')}"
+        return f"{fallback} {handle}" if fallback else handle
     return fallback or str(user_id or "—")
 
 
@@ -1867,10 +1877,17 @@ async def watch_set(chat_id: int, user_id: int, sig: str, flagged: bool,
 
 # ---------- доступ к боту (кого владелец пустил) ----------
 
-async def access_add(user_id: int | None, username: str | None) -> None:
+async def access_add(user_id: int | None, username: str | None,
+                     name: str | None = None) -> None:
+    """Добавить в список доступа. name — имя, если его удалось узнать сразу.
+
+    Без имени в списке висел голый ник: про человека, который боту ещё
+    не писал, мы больше ничего не знаем.
+    """
     await _db.execute(
-        "INSERT INTO access (user_id, username, added) VALUES (?, ?, ?)",
-        (user_id, (username or None) and username.lower().lstrip("@"), _now()),
+        "INSERT INTO access (user_id, username, name, added) VALUES (?, ?, ?, ?)",
+        (user_id, (username or None) and username.lower().lstrip("@"), name or None,
+         _now()),
     )
     await _db.commit()
 

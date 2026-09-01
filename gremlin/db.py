@@ -1359,11 +1359,15 @@ async def samples_profile(chat_id: int | None = None,
 
 async def samples_stats(chat_id: int | None = None) -> dict:
     """Сколько чего накопилось — показываем в меню, чтобы было видно прогресс."""
+    # без чата считаем свои улики всех чатов; стартовый набор сюда не идёт —
+    # он общий и чужой, в «сколько чат накопил» ему делать нечего
     q = "SELECT origin, label, COUNT(*) AS n FROM samples"
     args: tuple = ()
     if chat_id is not None:
         q += " WHERE chat_id = ?"
         args = (chat_id,)
+    else:
+        q += f" WHERE chat_id != {SEED_CHAT}"
     cur = await _db.execute(q + " GROUP BY origin, label", args)
     out: dict = {"spam": 0, "ok": 0, "unknown": 0, "profile": 0, "total": 0}
     for r in await cur.fetchall():
@@ -1487,11 +1491,23 @@ async def seed_clear() -> int:
 
 
 async def samples_seed(limit: int) -> list[aiosqlite.Row]:
-    """Стартовый набор для подмешивания в профиль молодого чата."""
-    cur = await _db.execute(
-        "SELECT * FROM samples WHERE chat_id = ? ORDER BY id LIMIT ?",
-        (SEED_CHAT, limit))
-    return await cur.fetchall()
+    """Стартовый набор для подмешивания в профиль молодого чата.
+
+    Берём поровну спама и нормы. Чужие датасеты почти всегда лежат
+    отсортированными по метке — обычный «первые N по id» дал бы одну только
+    норму, и молодой чат научился бы, что спама не существует.
+
+    Отбор всегда один и тот же (по возрастанию id), иначе посчитанные векторы
+    пришлось бы считать заново после каждого перезапуска.
+    """
+    half = max(limit // 2, 1)
+    rows: list[aiosqlite.Row] = []
+    for label in ("spam", "ok"):
+        cur = await _db.execute(
+            """SELECT * FROM samples WHERE chat_id = ? AND label = ?
+               ORDER BY id LIMIT ?""", (SEED_CHAT, label, half))
+        rows.extend(await cur.fetchall())
+    return rows
 
 
 async def samples_of_origin(chat_id: int, origin: str,
@@ -1541,10 +1557,14 @@ async def samples_trim(keep: int) -> int:
     дешёвое — поток автомата и случайные образцы нормы, которых набегает
     сколько угодно. Улики, размеченные человеком кнопкой на карточке
     (origin='card'), не трогаем никогда: их мало и они самые ценные.
+
+    Стартовый набор тоже не трогаем: его загрузили руками и осознанно, а
+    «последние keep по id» вырезали бы из отсортированного датасета целый
+    класс — метка-то у него идёт подряд.
     """
     cur = await _db.execute(
-        """DELETE FROM samples
-            WHERE origin != 'card'
+        f"""DELETE FROM samples
+            WHERE origin != 'card' AND chat_id != {SEED_CHAT}
               AND id NOT IN (
                   SELECT id FROM samples s2
                   WHERE s2.chat_id = samples.chat_id AND s2.origin != 'card'

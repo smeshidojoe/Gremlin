@@ -677,7 +677,12 @@ async def keeper() -> None:
             if gone:
                 logger.info("копилка улик подрезана: удалено %d", gone)
             if await ensure():
-                rows = await db.samples_without_vec()
+                # стартовый набор считаем отдельно: он общий, в samples_without_vec
+                # не попадает (там только свои улики чатов), а без готовых векторов
+                # первое сообщение в молодом чате ждало бы прогон всех четырёхсот
+                rows = [r for r in await db.samples_seed(config.NN_SEED_LIMIT)
+                        if not r["vec"]]
+                rows += await db.samples_without_vec()
                 if rows:
                     vecs = await embed([r["text"] for r in rows])
                     for r, v in zip(rows, vecs):

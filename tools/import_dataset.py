@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import json
 import os
+import random
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -76,12 +77,53 @@ def pick(row, names, given):
     return None
 
 
+def prepare(rows, args) -> list[tuple[str, str]]:
+    """Строки датасета -> [(текст, метка)], перемешанные и уравненные.
+
+    Перемешиваем всегда: датасеты почти всегда лежат отсортированными по метке
+    (сначала вся норма, потом весь спам), и любая выборка «первых N» дала бы
+    один класс. Порядок фиксированный — повторный запуск даст ту же выборку.
+
+    С --limit берём поровну спама и нормы: перекос выборки регрессия гасит
+    весом класса, но лишние примеры одного класса всё равно ничего не добавляют.
+    """
+    text_col = label_col = None
+    spam: list[str] = []
+    ok: list[str] = []
+    for row in rows:
+        text_col = text_col or pick(row, TEXT_COLS, args.text_col)
+        label_col = label_col or pick(row, LABEL_COLS, args.label_col)
+        if not text_col:
+            sys.exit(f"не нашёл колонку с текстом, есть: {list(row)}")
+        text = str(row.get(text_col) or "")
+        raw = str(row.get(label_col, "")).strip().lower() if label_col else ""
+        (spam if raw in SPAM_VALUES else ok).append(text)
+
+    rnd = random.Random(20260901)
+    rnd.shuffle(spam)
+    rnd.shuffle(ok)
+    if args.limit:
+        half = max(args.limit // 2, 1)
+        spam, ok = spam[:half], ok[:half]
+    # чередуем классы: тогда и наивная выборка «первых N по id» останется
+    # сбалансированной, чем бы её потом ни делали
+    out: list[tuple[str, str]] = []
+    for i in range(max(len(spam), len(ok))):
+        if i < len(spam):
+            out.append((spam[i], "spam"))
+        if i < len(ok):
+            out.append((ok[i], "ok"))
+    print(f"в файле: спам {len(spam)}, норма {len(ok)}")
+    return out
+
+
 async def main() -> None:
     ap = argparse.ArgumentParser(description="Импорт датасета в стартовый набор")
     ap.add_argument("path", help="файл датасета (.jsonl, .csv, .parquet)")
     ap.add_argument("--text-col", help="колонка с текстом")
     ap.add_argument("--label-col", help="колонка с меткой")
-    ap.add_argument("--limit", type=int, default=0, help="взять не больше N строк")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="взять не больше N строк, поровну спама и нормы")
     ap.add_argument("--clear", action="store_true", help="сначала очистить набор")
     args = ap.parse_args()
 
@@ -93,24 +135,15 @@ async def main() -> None:
     if args.clear:
         print("очищено:", await db.seed_clear())
 
-    text_col = label_col = None
+    pairs = list(prepare(read_rows(args.path), args))
     added = dupes = skipped = 0
-    for row in read_rows(args.path):
-        text_col = pick(row, TEXT_COLS, text_col or args.text_col)
-        label_col = pick(row, LABEL_COLS, label_col or args.label_col)
-        if not text_col:
-            sys.exit(f"не нашёл колонку с текстом, есть: {list(row)}")
-        text = str(row.get(text_col) or "")
-        raw = str(row.get(label_col, "")).strip().lower() if label_col else ""
-        label = "spam" if raw in SPAM_VALUES else "ok"
+    for text, label in pairs:
         if await db.seed_add(text, label):
             added += 1
         elif len(" ".join(text.split())) < 10:
             skipped += 1
         else:
             dupes += 1
-        if args.limit and added >= args.limit:
-            break
     await db.seed_commit()
 
     stats = await db.seed_stats()

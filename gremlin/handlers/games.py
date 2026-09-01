@@ -498,15 +498,32 @@ async def _court_run(bot: Bot, key: tuple[int, int]) -> None:
 
 # ---------- титулы недели ----------
 
-async def titles_text(chat_id: int) -> str | None:
+async def titles_text(chat_id: int, bot: Bot | None = None) -> str | None:
     """Итоги недели по статистике сообщений. None — награждать некого.
 
     Служебные аккаунты пропускаем: «Telegram» приносит в обсуждение посты
     канала и по счётчику легко обгоняет живых людей.
+
+    Считаем только тех, кто в чате состоит: под постами привязанного канала
+    пишут комментаторы, которые в группу не вступали, и «болтуном недели»
+    оказывался случайный прохожий. Статус спрашиваем только у претендентов —
+    это несколько запросов, а не по одному на каждого писавшего.
     """
     day = utils.day_num()
     people = {uid: f for uid, f in (await db.week_activity(chat_id)).items()
               if f["week"] > 0 and uid not in config.SERVICE_IDS}
+    if bot is not None and people:
+        from ..services import adm_cache
+        # проверяем сверху вниз по активности и останавливаемся, когда набрали
+        # десяток своих: дальше в титулы всё равно никто не попадёт
+        checked, members = 0, {}
+        for uid, f in sorted(people.items(), key=lambda kv: -kv[1]["week"]):
+            if checked >= 15 or len(members) >= 10:
+                break
+            checked += 1
+            if await adm_cache.is_member(bot, chat_id, uid):
+                members[uid] = f
+        people = members or people
     if not people:
         return None
 
@@ -580,7 +597,7 @@ async def send_titles(bot: Bot) -> int:
         s = await db.get_settings(ch["chat_id"])
         if not (s.games_on & config.GAME_TITLES):
             continue
-        text = await titles_text(ch["chat_id"])
+        text = await titles_text(ch["chat_id"], bot)
         if not text:
             continue
         try:

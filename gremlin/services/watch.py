@@ -152,16 +152,31 @@ GUEST_BOOST = 15
 SCORE_WINDOW = 86400
 SCORE_MAX = 200          # выше копить бессмысленно: бан наступит раньше
 
+# Причины, которые сами по себе что-то значат: их бот показывает даже тогда,
+# когда косметика не считается.
+_HARD_NAMES = {
+    "невидимые символы в имени", "ссылка/упоминание в имени",
+    "реклама профиля в имени", "telegra.ph-ссылка", "невидимые символы",
+    "упоминание бота", "ссылка через сокращатель",
+    "кривой текст вместе со ссылкой",
+}
+
 # Повторная карточка подозрения — только если счёт заметно вырос.
 RECARD_STEP = 20
 
 
-def score_profile(first_name: str | None, last_name: str | None,
-                  username: str | None) -> tuple[int, list[str]]:
-    """Оценка профиля. Вернуть (очки, причины)."""
+def profile_parts(first_name: str | None, last_name: str | None,
+                  username: str | None) -> tuple[int, int, list[str]]:
+    """Разобрать профиль на (тревожные очки, косметика, причины).
+
+    Тревожное — то, что делают ради рекламы: ссылка в имени, невидимые
+    символы, прямой призыв писать в личку. Косметика — необычный алфавит,
+    эмодзи, цифры: у живых людей такое сплошь и рядом, поэтому сама по себе
+    она ничего не значит и учитывается только рядом с тревожным.
+    """
     name = " ".join(x for x in (first_name, last_name) if x)
     if not name:
-        return 0, []
+        return 0, 0, []
     score, reasons = 0, []
     cosmetic = 0
 
@@ -187,7 +202,14 @@ def score_profile(first_name: str | None, last_name: str | None,
     if re.search(r"[а-яёa-z]\d{2,}|[一-鿿぀-ヿ]\d", name, re.IGNORECASE):
         cosmetic += 10; reasons.append("цифры в имени")
 
-    return score + min(cosmetic, COSMETIC_CAP), reasons
+    return score, min(cosmetic, COSMETIC_CAP), reasons
+
+
+def score_profile(first_name: str | None, last_name: str | None,
+                  username: str | None) -> tuple[int, list[str]]:
+    """Суммарная оценка профиля — для мест, где разбирать по частям незачем."""
+    hard, cosmetic, reasons = profile_parts(first_name, last_name, username)
+    return hard + cosmetic, reasons
 
 
 def message_parts(text: str) -> tuple[int, int, list[str]]:
@@ -320,12 +342,15 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None) -> None:
     from .. import config, db, utils
     from . import moderation
 
-    p_score, p_reasons = score_profile(user.first_name, user.last_name, user.username)
+    p_hard, p_cos, p_reasons = profile_parts(user.first_name, user.last_name,
+                                             user.username)
     hard, cosmetic, m_reasons = (0, 0, [])
+    text = ""
     if message is not None:
-        hard, cosmetic, m_reasons = message_parts(message.text or message.caption or "")
+        text = message.text or message.caption or ""
+        hard, cosmetic, m_reasons = message_parts(text)
     # чисто? тогда и в базу лезть незачем — на каждое сообщение это лишний запрос
-    if not p_score and not hard and not cosmetic:
+    if not (p_hard or p_cos or hard or cosmetic):
         return
 
     sig = profile_sig(user.first_name, user.last_name, user.username)
@@ -344,8 +369,16 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None) -> None:
     # этого «эээ» да «нууу» за день набирали человеку на карточку
     pot = min(saved + hard, SCORE_MAX)
 
-    total = p_score + pot + cosmetic
-    reasons = p_reasons + m_reasons
+    # Косметика — растянутые буквы, эмодзи, необычный алфавит — у живых людей
+    # встречается постоянно, и как самостоятельная улика она давала карточки
+    # на обычных участников. Теперь она только усиливает: считается, если рядом
+    # есть настоящий сигнал — тревожный признак, ссылка или похожий профиль.
+    amplify = bool(p_hard or hard or (text and _REAL_LINK.search(text)))
+    total = p_hard + pot + (p_cos + cosmetic if amplify else 0)
+    # без усиления в причинах остаётся только тревожное: иначе в карточке
+    # висело бы «растянутые буквы» как повод, которым оно не является
+    reasons = (p_reasons + m_reasons if amplify
+               else [r for r in p_reasons + m_reasons if r in _HARD_NAMES])
     # Имя и ник — тоже текст. «Анна | 18+ ЛС» и «Кристина ❤️ пиши в лс» для
     # эвристик разные, для модели — одно и то же, поэтому сравниваем профиль
     # с теми, за кого в этом чате уже банили.

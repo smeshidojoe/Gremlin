@@ -19,7 +19,7 @@ import os
 import time
 from collections import deque
 
-from .. import config, db
+from .. import config, db, utils
 
 logger = logging.getLogger("gremlin.nn")
 
@@ -96,8 +96,14 @@ async def ensure() -> bool:
 
 
 def _embed_sync(texts: list[str]):
-    """Векторы для списка текстов: усреднение по токенам + нормировка."""
-    enc = _tok.encode_batch(texts)
+    """Векторы для списка текстов: усреднение по токенам + нормировка.
+
+    Текст сначала нормализуем: подменённые буквы и невидимые символы модель
+    иначе не понимает, и «кaзuно» для неё не похоже на «казино» — то есть
+    ровно на обфускации, ради которой спам её и использует, сравнение
+    переставало работать.
+    """
+    enc = _tok.encode_batch([utils.normalize_text(t) for t in texts])
     ids = _np.array([e.ids for e in enc], dtype=_np.int64)
     mask = _np.array([e.attention_mask for e in enc], dtype=_np.int64)
     out = _sess.run(["last_hidden_state"], {
@@ -132,6 +138,13 @@ async def _build_profile(chat_id: int):
     s = await db.get_settings(chat_id)
     rows = (await db.samples_profile_net(chat_id) if s.nn_net
             else await db.samples_profile(chat_id))
+    own = len(rows)
+    # Пока своих улик мало, добавляем стартовый набор — чужие примеры спама
+    # и обычных сообщений. Иначе новый чат месяц не понимает вообще ничего.
+    # Как только своих набирается NN_SEED_UNTIL, набор отпадает: своя норма
+    # всегда точнее чужой.
+    if s.nn_seed and own < config.NN_SEED_UNTIL:
+        rows = list(rows) + list(await db.samples_seed(config.NN_SEED_LIMIT))
     if len(rows) < config.NN_MIN_SAMPLES:
         return None
 
@@ -153,8 +166,8 @@ async def _build_profile(chat_id: int):
     weights = None
     if len(ids) >= config.NN_LOGREG_MIN:
         weights = await asyncio.to_thread(_fit, matrix, labels)
-    logger.debug("профиль чата %s: %d улик, регрессия %s",
-                 chat_id, len(ids), "есть" if weights else "рано")
+    logger.debug("профиль чата %s: %d улик (своих %d), регрессия %s",
+                 chat_id, len(ids), own, "есть" if weights else "рано")
     return matrix, labels, ids, weights
 
 

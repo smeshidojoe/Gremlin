@@ -95,8 +95,9 @@ async def reconcile_chats(bot) -> list[tuple[int, str]]:
     """
     from .. import db
     me = (await bot.me()).id
+    rows = await db.all_chats(active_only=True)
     gone = []
-    for row in await db.all_chats(active_only=True):
+    for row in rows:
         cid = row["chat_id"]
         try:
             member = await bot.get_chat_member(cid, me)
@@ -111,10 +112,20 @@ async def reconcile_chats(bot) -> list[tuple[int, str]]:
                 continue
             inside = False
         if not inside:
-            await db.set_chat_active(cid, False)
-            await db.clear_log_refs(cid)
             gone.append((cid, row["title"] or str(cid)))
-            logger.info("чат %s (%s) выключен: бота там нет", cid, row["title"])
+
+    # Предохранитель: если «пропали» почти все чаты разом, дело не в чатах,
+    # а в Telegram или в сети. Вычёркивать список целиком по такому поводу
+    # нельзя — молча потерять все настройки хуже, чем показать лишнее.
+    if rows and len(gone) > max(1, len(rows) // 2):
+        logger.warning("сверка чатов отменена: не нашлись %d из %d — похоже "
+                       "на сбой, а не на выход из чатов", len(gone), len(rows))
+        return []
+
+    for cid, title in gone:
+        await db.set_chat_active(cid, False)
+        await db.clear_log_refs(cid)
+        logger.info("чат %s (%s) выключен: бота там нет", cid, title)
     return gone
 
 

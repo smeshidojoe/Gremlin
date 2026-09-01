@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import random
+import re
 import time
 
 from aiogram import Bot, F, Router
@@ -647,6 +648,41 @@ async def _find_cmd(chat_id: int, text: str, anywhere: bool, bare: bool = False)
     return None
 
 
+# кулдаун команды курса: (чат) -> monotonic последнего ответа
+_rates_fired: dict[int, float] = {}
+
+
+async def fire_rates(bot: Bot, message: Message, s) -> bool:
+    """Команда !курс. True — ответили, дальше разбирать нечего."""
+    text = (message.text or "").strip()
+    if not s.rates_on or message.edit_date is None and not text:
+        return False
+    if not re.match(r"^!(курс|rate|rates)(\s|$)", text, re.IGNORECASE):
+        return False
+    if message.edit_date is not None:
+        return True          # правку не пересчитываем, но и дальше не пускаем
+
+    now = time.monotonic()
+    if s.rates_cd and now - _rates_fired.get(message.chat.id, 0) < s.rates_cd:
+        # Просто молчим. Удалять сообщение человека из-за того, что тикает
+        # пауза, нельзя: со стороны это выглядит так, будто бот стёр вопрос
+        # про курс без всякой причины.
+        logger.debug("курс: пауза в %s", message.chat.id)
+        return True
+    _rates_fired[message.chat.id] = now
+
+    from ..services import rates
+    body = text.split(maxsplit=1)[1] if " " in text else ""
+    amount = rates.parse_amount(body) if body else None
+    answer = (await rates.convert(*amount)) if amount else (await rates.board())
+    try:
+        await message.reply(answer)
+    except Exception as e:
+        if not utils.msg_gone(e):
+            logger.warning("курс: не ответить в %s", message.chat.id, exc_info=True)
+    return True
+
+
 async def fire_games(bot: Bot, message: Message) -> bool:
     """Игры чата. Зовём отсюда, а не отдельным хендлером: иначе сообщение
     с командой игры не доходило бы до модерации."""
@@ -948,7 +984,7 @@ async def moderate(message: Message, bot: Bot) -> None:
     # и вайтлист. Но триггеры — развлекательная часть, они должны работать
     # для всех, поэтому перед выходом всё равно даём им сработать.
     if user.id in config.ADMIN_IDS:
-        if await fire_games(bot, message):
+        if await fire_rates(bot, message, s) or await fire_games(bot, message):
             return
         await fire_trigger(bot, message, s)
         await fire_counter(bot, message, s)
@@ -1192,7 +1228,7 @@ async def moderate(message: Message, bot: Bot) -> None:
     # --- триггеры (последними: на удалённое модерацией не отвечаем) ---
     # игры зовём здесь, а не отдельным хендлером: иначе сообщение с командой
     # игры («!суд заходи на t.me/spam») до проверок бы не дошло
-    if await fire_games(bot, message):
+    if await fire_rates(bot, message, s) or await fire_games(bot, message):
         return
     await fire_trigger(bot, message, s)
     await fire_counter(bot, message, s)

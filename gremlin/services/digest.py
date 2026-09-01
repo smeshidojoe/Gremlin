@@ -160,10 +160,16 @@ def build_html(stats_db: str) -> bytes:
     return data
 
 
-async def send_digest(bot: Bot, chat_id: int, to_user: int) -> bool:
-    """Обновить сводку у получателя (или прислать первую). True — получилось.
+async def send_digest(bot: Bot, chat_id: int, to_user: int,
+                      notify: bool = False) -> bool:
+    """Показать сводку получателю. True — получилось.
 
-    Сводка живёт одним сообщением: каждую неделю правим его, а не плодим новые.
+    notify=False — правим прежнее сообщение на месте: так открытая сводка
+    обновляется по кнопке, не засоряя личку.
+
+    notify=True — присылаем новое, а старое убираем. Так работает еженедельная
+    рассылка: правка сообщения проходит без уведомления, и человек про сводку
+    попросту не узнавал — именно так она и «терялась» по воскресеньям.
     """
     from .. import userbot
     await userbot.refresh_members()          # состав перед подсчётом молчунов
@@ -182,7 +188,16 @@ async def send_digest(bot: Bot, chat_id: int, to_user: int) -> bool:
 
     key = f"digest_msg:{chat_id}"
     raw = await db.kv_get(key)
-    if raw:
+    if raw and notify:
+        # старую сводку убираем: она уже неактуальна, а новая придёт отдельным
+        # сообщением — с уведомлением, ради которого всё и затевалось
+        prev_user, _, prev_msg = raw.partition(":")
+        if prev_user == str(to_user) and prev_msg.isdigit():
+            try:
+                await bot.delete_message(to_user, int(prev_msg))
+            except Exception:
+                pass          # уже удалили или старше 48 часов
+    elif raw:
         prev_user, _, prev_msg = raw.partition(":")
         if prev_user == str(to_user) and prev_msg.isdigit():
             try:
@@ -223,7 +238,8 @@ async def scheduler(bot: Bot) -> None:
                     key = f"digest_sent:{ch['chat_id']}"
                     if await db.kv_get(key) == stamp:
                         continue
-                    if await send_digest(bot, ch["chat_id"], s.digest_to):
+                    if await send_digest(bot, ch["chat_id"], s.digest_to,
+                                         notify=True):
                         await db.kv_set(key, stamp)
         except Exception:
             logger.warning("digest scheduler tick failed", exc_info=True)

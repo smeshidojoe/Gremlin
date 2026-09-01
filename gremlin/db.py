@@ -92,6 +92,8 @@ CREATE TABLE IF NOT EXISTS settings(
     cmds_guest_cd   INTEGER NOT NULL DEFAULT 3600,
     cmds_anywhere   INTEGER NOT NULL DEFAULT 0,
     cmds_bare       INTEGER NOT NULL DEFAULT 0,
+    rates_on        INTEGER NOT NULL DEFAULT 0,
+    rates_cd        INTEGER NOT NULL DEFAULT 30,
     digest_to       INTEGER NOT NULL DEFAULT 0,
     service_join    INTEGER NOT NULL DEFAULT 0,
     service_leave   INTEGER NOT NULL DEFAULT 0,
@@ -130,7 +132,9 @@ CREATE TABLE IF NOT EXISTS settings(
     burst_punish    TEXT    NOT NULL DEFAULT 'delete',
     burst_mute_min  INTEGER NOT NULL DEFAULT 60,
     nn_net          INTEGER NOT NULL DEFAULT 1,
+    nn_seed         INTEGER NOT NULL DEFAULT 1,
     watch_nn        INTEGER NOT NULL DEFAULT 0,
+    watch_react     INTEGER NOT NULL DEFAULT 0,
     ocr_on          INTEGER NOT NULL DEFAULT 0,
     ocr_langs       TEXT    NOT NULL DEFAULT 'rus+eng',
     asr_on          INTEGER NOT NULL DEFAULT 0,
@@ -350,6 +354,8 @@ class Settings:
     cmds_guest_cd: int = 3600
     cmds_anywhere: int = 0
     cmds_bare: int = 0
+    rates_on: int = 0
+    rates_cd: int = 30
     digest_to: int = 0
     service_join: int = 0
     service_leave: int = 0
@@ -388,7 +394,9 @@ class Settings:
     burst_punish: str = "delete"
     burst_mute_min: int = 60
     nn_net: int = 1
+    nn_seed: int = 1
     watch_nn: int = 0
+    watch_react: int = 0
     ocr_on: int = 0
     ocr_langs: str = "rus+eng"
     asr_on: int = 0
@@ -445,7 +453,9 @@ _SETTINGS_MIGRATIONS = {
     "burst_punish": "TEXT NOT NULL DEFAULT 'delete'",
     "burst_mute_min": "INTEGER NOT NULL DEFAULT 60",
     "nn_net": "INTEGER NOT NULL DEFAULT 1",
+    "nn_seed": "INTEGER NOT NULL DEFAULT 1",
     "watch_nn": "INTEGER NOT NULL DEFAULT 0",
+    "watch_react": "INTEGER NOT NULL DEFAULT 0",
     "ocr_on": "INTEGER NOT NULL DEFAULT 0",
     "ocr_langs": "TEXT NOT NULL DEFAULT 'rus+eng'",
     "asr_on": "INTEGER NOT NULL DEFAULT 0",
@@ -481,6 +491,8 @@ _SETTINGS_MIGRATIONS = {
     "words_guests": "INTEGER NOT NULL DEFAULT 1",
     "extlinks_on": "INTEGER NOT NULL DEFAULT 1",
     "cmds_bare": "INTEGER NOT NULL DEFAULT 0",
+    "rates_on": "INTEGER NOT NULL DEFAULT 0",
+    "rates_cd": "INTEGER NOT NULL DEFAULT 30",
     "service_join": "INTEGER NOT NULL DEFAULT 0",
     "service_leave": "INTEGER NOT NULL DEFAULT 0",
     "service_other": "INTEGER NOT NULL DEFAULT 0",
@@ -505,6 +517,15 @@ _TABLE_MIGRATIONS = {
 
 
 async def _migrate() -> None:
+    # векторы, посчитанные до нормализации текста, больше не сопоставимы
+    # с новыми — считаем заново, благо это фоновая работа
+    cur = await _db.execute("SELECT v FROM kv WHERE k = 'mig_norm_vec'")
+    if await cur.fetchone() is None:
+        await _db.execute("UPDATE samples SET vec = NULL")
+        await _db.execute("UPDATE phrases SET vec = NULL")
+        await _db.execute("INSERT INTO kv (k, v) VALUES ('mig_norm_vec', '1')")
+        await _db.commit()
+
     # имя в списке доступа: раньше про добавленного по нику мы не знали ничего,
     # и в списке висел голый @ник
     cur = await _db.execute("PRAGMA table_info(access)")
@@ -944,13 +965,34 @@ async def wl_entry(chat_id: int, row_id: int) -> dict | None:
 async def wl_entry_by_key(chat_id: int, user_id: int | None,
                           username: str | None) -> dict | None:
     """Запись по самому объекту. После перезаписи уровней id строк меняются,
-    поэтому искать по ним нельзя."""
+    поэтому искать по ним нельзя.
+
+    Совпадением считаем и id, и ник: человека могли добавить по нику, когда
+    id узнать не вышло, а сегодня он уже известен — это всё равно он, и второй
+    записи быть не должно.
+    """
+    uname = (username or "").lower().lstrip("@") or None
     for e in await wl_entries(chat_id):
         if user_id is not None and e["user_id"] == user_id:
             return e
-        if user_id is None and e["user_id"] is None and e["username"] == username:
+        if uname and e["username"] == uname:
             return e
     return None
+
+
+async def wl_attach_id(chat_id: int, username: str, user_id: int,
+                       title: str | None = None) -> None:
+    """Дописать id к записи, заведённой по нику.
+
+    Ник меняют, id — нет: как только он стал известен, запись надо привязать
+    к нему, иначе после смены ника игнор перестанет работать.
+    """
+    uname = username.lower().lstrip("@")
+    await _db.execute(
+        """UPDATE whitelist SET user_id = ?, title = COALESCE(title, ?)
+           WHERE chat_id = ? AND username = ? AND user_id IS NULL""",
+        (user_id, title, chat_id, uname))
+    await _db.commit()
 
 
 async def wl_set_scopes(chat_id: int, user_id: int | None, username: str | None,
@@ -983,12 +1025,32 @@ async def wl_scopes_for(chat_id: int, user_id: int, username: str | None) -> set
 # ---------- разрешённые для ссылок чаты и каналы ----------
 
 async def link_wl_add(chat_id: int, target_id: int | None, username: str | None,
-                      title: str | None = None) -> None:
+                      title: str | None = None) -> bool:
+    """Разрешить чат или канал в ссылках. False — он уже в списке.
+
+    Совпадением считаем и id, и ник: один и тот же канал не должен лежать
+    в списке дважды, даже если добавляли его по-разному.
+    """
+    uname = (username or None) and username.lower().lstrip("@")
+    for r in await link_wl_list(chat_id):
+        if target_id is not None and r["target_id"] == target_id:
+            if uname and not r["username"]:      # знаем теперь и ник — допишем
+                await _db.execute("UPDATE link_wl SET username = ? WHERE id = ?",
+                                  (uname, r["id"]))
+                await _db.commit()
+            return False
+        if uname and r["username"] == uname:
+            if target_id is not None and r["target_id"] is None:
+                await _db.execute("UPDATE link_wl SET target_id = ? WHERE id = ?",
+                                  (target_id, r["id"]))
+                await _db.commit()
+            return False
     await _db.execute(
         "INSERT INTO link_wl (chat_id, target_id, username, title) VALUES (?, ?, ?, ?)",
-        (chat_id, target_id, (username or None) and username.lower().lstrip("@"), title),
+        (chat_id, target_id, uname, title),
     )
     await _db.commit()
+    return True
 
 
 async def link_wl_remove(row_id: int) -> None:
@@ -1003,12 +1065,23 @@ async def link_wl_list(chat_id: int) -> list[aiosqlite.Row]:
 
 # ---------- разрешённые инлайн-боты ----------
 
-async def inline_wl_add(chat_id: int, username: str, bot_id: int | None = None) -> None:
+async def inline_wl_add(chat_id: int, username: str,
+                        bot_id: int | None = None) -> bool:
+    """Разрешить инлайн-бота. False — он уже в списке."""
+    uname = username.lower().lstrip("@")
+    for r in await inline_wl_list(chat_id):
+        if r["username"] == uname or (bot_id and r["bot_id"] == bot_id):
+            if bot_id and not r["bot_id"]:
+                await _db.execute("UPDATE inline_wl SET bot_id = ? WHERE id = ?",
+                                  (bot_id, r["id"]))
+                await _db.commit()
+            return False
     await _db.execute(
         "INSERT INTO inline_wl (chat_id, bot_id, username) VALUES (?, ?, ?)",
-        (chat_id, bot_id, username.lower().lstrip("@")),
+        (chat_id, bot_id, uname),
     )
     await _db.commit()
+    return True
 
 
 async def inline_wl_remove(row_id: int) -> None:
@@ -1220,6 +1293,9 @@ async def active_punishments_count(chat_id: int) -> int:
 
 PROFILE_ORIGINS = ("auto", "card", "random")
 
+# Стартовый набор лежит в той же копилке под чатом 0: он ничей и общий.
+SEED_CHAT = 0
+
 
 async def sample_add(chat_id: int, user_id: int | None, origin: str, label: str,
                      text: str, feature: str | None = None,
@@ -1271,7 +1347,8 @@ async def samples_profile(chat_id: int | None = None,
                           limit: int = 2000) -> list[aiosqlite.Row]:
     """Улики, годные для сравнения: без ручных наказаний с их вольными причинами."""
     marks = ",".join("?" * len(PROFILE_ORIGINS))
-    q = f"SELECT * FROM samples WHERE origin IN ({marks}) AND label != 'unknown'"
+    q = (f"SELECT * FROM samples WHERE origin IN ({marks}) AND label != 'unknown'"
+         f" AND chat_id != {SEED_CHAT}")
     args = list(PROFILE_ORIGINS)
     if chat_id is not None:
         q += " AND chat_id = ?"
@@ -1369,6 +1446,51 @@ async def samples_profile_net(chat_id: int, limit: int = 4000) -> list[aiosqlite
             WHERE origin IN ({marks}) AND label != 'unknown' AND chat_id IN ({chats})
             ORDER BY id DESC LIMIT ?""",
         (*PROFILE_ORIGINS, *ids, limit))
+    return await cur.fetchall()
+
+
+async def seed_add(text: str, label: str) -> bool:
+    """Добавить пример в стартовый набор. False — такой уже есть."""
+    text = " ".join((text or "").split())[:config.SAMPLE_TEXT_LIMIT]
+    if len(text) < 10:
+        return False
+    cur = await _db.execute(
+        "SELECT 1 FROM samples WHERE chat_id = ? AND text = ?", (SEED_CHAT, text))
+    if await cur.fetchone():
+        return False
+    await _db.execute(
+        """INSERT INTO samples (chat_id, user_id, ts, origin, feature, label, text)
+           VALUES (?, NULL, ?, 'seed', 'набор', ?, ?)""",
+        (SEED_CHAT, _now(), label, text))
+    return True
+
+
+async def seed_commit() -> None:
+    await _db.commit()
+
+
+async def seed_stats() -> dict:
+    cur = await _db.execute(
+        "SELECT label, COUNT(*) AS n FROM samples WHERE chat_id = ? GROUP BY label",
+        (SEED_CHAT,))
+    out = {"spam": 0, "ok": 0}
+    for r in await cur.fetchall():
+        out[r["label"]] = r["n"]
+    out["total"] = out["spam"] + out["ok"]
+    return out
+
+
+async def seed_clear() -> int:
+    cur = await _db.execute("DELETE FROM samples WHERE chat_id = ?", (SEED_CHAT,))
+    await _db.commit()
+    return cur.rowcount or 0
+
+
+async def samples_seed(limit: int) -> list[aiosqlite.Row]:
+    """Стартовый набор для подмешивания в профиль молодого чата."""
+    cur = await _db.execute(
+        "SELECT * FROM samples WHERE chat_id = ? ORDER BY id LIMIT ?",
+        (SEED_CHAT, limit))
     return await cur.fetchall()
 
 
@@ -1636,6 +1758,15 @@ async def ans_clear(owner: str, owner_id: int) -> None:
         await ans_remove(r["id"])
 
 
+async def trig_find(chat_id: int, phrase: str):
+    """Триггер с такой же фразой. Второй такой не нужен: сработает всё равно
+    первый, а в списке будут висеть две одинаковые строки."""
+    cur = await _db.execute(
+        "SELECT * FROM triggers WHERE chat_id = ? AND phrase = ?",
+        (chat_id, phrase.strip().lower()))
+    return await cur.fetchone()
+
+
 async def trig_add(chat_id: int, phrase: str, text: str | None,
                    file_path: str | None = None, media_type: str | None = None) -> int:
     cur = await _db.execute(
@@ -1884,10 +2015,21 @@ async def access_add(user_id: int | None, username: str | None,
     Без имени в списке висел голый ник: про человека, который боту ещё
     не писал, мы больше ничего не знаем.
     """
+    uname = (username or None) and username.lower().lstrip("@")
+    for r in await access_list():
+        if user_id is not None and r["user_id"] == user_id:
+            return
+        if uname and r["username"] == uname:
+            # знаем теперь id — привязываем: ник меняют, id нет
+            if user_id is not None and r["user_id"] is None:
+                await _db.execute(
+                    "UPDATE access SET user_id = ?, name = COALESCE(name, ?) "
+                    "WHERE id = ?", (user_id, name, r["id"]))
+                await _db.commit()
+            return
     await _db.execute(
         "INSERT INTO access (user_id, username, name, added) VALUES (?, ?, ?, ?)",
-        (user_id, (username or None) and username.lower().lstrip("@"), name or None,
-         _now()),
+        (user_id, uname, name or None, _now()),
     )
     await _db.commit()
 

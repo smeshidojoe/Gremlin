@@ -274,6 +274,7 @@ async def view_chat(cid: int, viewer_id: int) -> tuple[str, InlineKeyboardMarkup
     b.button(text="🧪 Нейрофильтр", callback_data=f"u:s:{cid}:nn")
     b.button(text="🎯 Триггеры", callback_data=f"u:s:{cid}:triggers")
     b.button(text="🔢 Счётчики", callback_data=f"u:s:{cid}:cmds")
+    b.button(text="💱 Курс валют", callback_data=f"u:s:{cid}:rates")
     from ..services import digest as _dg
     if _dg.tracked_chat() == cid:          # подробная статистика — только этот чат
         b.button(text="📊 Недельная сводка", callback_data=f"u:s:{cid}:digest")
@@ -3289,6 +3290,11 @@ async def wl_target_input(message: Message, state: FSMContext, bot: Bot) -> None
                         cid, "anon", f"разбан канала по вайтлисту: {title or user_id}"
                     )
     else:
+        # запись могли завести по нику, когда id был неизвестен: привязываем его,
+        # иначе после смены ника игнор перестанет действовать
+        if user_id and exists["user_id"] is None and exists["username"]:
+            await db.wl_attach_id(cid, exists["username"], user_id, title)
+            exists = await db.wl_entry_by_key(cid, user_id, uname)
         note = "ℹ️ Он уже в вайтлисте — вот его настройки.\n\n"
     view = await view_wl_entry(cid, exists["row_id"])
     await _done(message, bot, state, view, note)
@@ -3468,10 +3474,14 @@ async def link_wl_input(message: Message, state: FSMContext, bot: Bot) -> None:
         )
         return
 
-    await db.link_wl_add(cid, target_id, uname, title)
+    added = await db.link_wl_add(cid, target_id, uname, title)
     who = title or (f"@{uname}" if uname else str(target_id))
-    note = (f"✅ {utils.esc(who)} разрешён.\n\n" if target_id
-            else f"✅ {utils.esc(who)} разрешён (id не определился — сверяю по нику).\n\n")
+    if not added:
+        note = f"ℹ️ {utils.esc(who)} уже в списке разрешённых.\n\n"
+    elif target_id:
+        note = f"✅ {utils.esc(who)} разрешён.\n\n"
+    else:
+        note = f"✅ {utils.esc(who)} разрешён (id не определился — сверяю по нику).\n\n"
     await _done(message, bot, state, await view_link_wl(cid), note)
 
 
@@ -3529,9 +3539,10 @@ async def inline_wl_input(message: Message, state: FSMContext, bot: Bot) -> None
         await _retry(message, bot, state,
                      "<b>🤖 Разрешённый инлайн-бот</b>\n\n⚠️ Этот бот уже в списке.")
         return
-    await db.inline_wl_add(cid, uname, bot_id)
-    await _done(message, bot, state, await view_section(cid, "inline"),
-                f"✅ @{utils.esc(uname)} разрешён.\n\n")
+    added = await db.inline_wl_add(cid, uname, bot_id)
+    note = (f"✅ @{utils.esc(uname)} разрешён.\n\n" if added
+            else f"ℹ️ @{utils.esc(uname)} уже в списке.\n\n")
+    await _done(message, bot, state, await view_section(cid, "inline"), note)
 
 
 @router.callback_query(F.data.startswith("u:ild:"))

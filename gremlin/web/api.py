@@ -615,8 +615,10 @@ async def api_linkwl_add(request: web.Request) -> web.Response:
         target_id, title = await resolve.by_username(bot_of(request), token)
     else:
         raise web.HTTPBadRequest(text="Нужен @username или id.")
-    await db.link_wl_add(cid, target_id, uname, title)
+    added = await db.link_wl_add(cid, target_id, uname, title)
     who = title or (f"@{uname}" if uname else str(target_id))
+    if not added:
+        return js({"note": f"{who} уже в списке разрешённых."})
     return js({"note": f"{who} разрешён." if target_id
                else f"{who} разрешён (id не определился — сверяю по нику)."})
 
@@ -640,8 +642,9 @@ async def api_inlinewl_add(request: web.Request) -> web.Response:
     bot_id, _ = await resolve.by_username(bot_of(request), token)
     if await db.inline_wl_allowed(cid, uname, bot_id):
         raise web.HTTPBadRequest(text="Этот бот уже в списке.")
-    await db.inline_wl_add(cid, uname, bot_id)
-    return js({"note": f"@{uname} разрешён."})
+    added = await db.inline_wl_add(cid, uname, bot_id)
+    return js({"note": f"@{uname} разрешён." if added
+               else f"@{uname} уже в списке."})
 
 
 @routes.delete("/api/chat/{cid}/inlinewl/{rid}")

@@ -7,7 +7,7 @@ from aiogram import Bot, F, Router
 from aiogram.filters import (
     ADMINISTRATOR, IS_MEMBER, IS_NOT_MEMBER, MEMBER, ChatMemberUpdatedFilter,
 )
-from aiogram.types import ChatMemberUpdated, Message
+from aiogram.types import ChatMemberUpdated, Message, MessageReactionUpdated
 
 from .. import config, db, utils
 from ..services import adm_cache, moderation
@@ -20,10 +20,33 @@ router = Router()
 
 # ---------- бот добавили / убрали ----------
 
+async def _allowed_admin(bot: Bot, chat_id: int) -> int | None:
+    """Есть ли среди админов чата кто-то из допущенных к боту. Вернуть его id.
+
+    Нужно там, где непонятно, кто позвал бота: добавить могли анонимный
+    админ или человек через интерфейс канала, и тогда в обновлении нет автора.
+    Отказывать в такой ситуации нельзя — чат-то свой.
+    """
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+    except Exception:
+        logger.warning("не спросить админов %s", chat_id, exc_info=True)
+        return None
+    for m in admins:
+        u = getattr(m, "user", None)
+        if u is None or u.is_bot:
+            continue
+        if u.id in config.ADMIN_IDS or await db.access_allowed(u.id, u.username):
+            return u.id
+    return None
+
+
 @router.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=IS_NOT_MEMBER >> IS_MEMBER))
 async def bot_added(update: ChatMemberUpdated, bot: Bot) -> None:
     chat = update.chat
-    if chat.type not in ("group", "supergroup"):
+    # каналы тоже регистрируем: модерировать там нечего, но чат нужен в списке —
+    # его назначают лог-чатом, и без записи он для бота не существует
+    if chat.type not in ("group", "supergroup", "channel"):
         return
     adder = update.from_user
     owner_id = adder.id if adder and not adder.is_bot else None
@@ -33,6 +56,12 @@ async def bot_added(update: ChatMemberUpdated, bot: Bot) -> None:
         owner_id in config.ADMIN_IDS
         or await db.access_allowed(owner_id, adder.username if adder else None)
     )
+    if not allowed:
+        # автора не видно (анонимный админ, добавление через канал) или он
+        # не в списке — смотрим, нет ли среди админов чата допущенного
+        by_admin = await _allowed_admin(bot, chat.id)
+        if by_admin is not None:
+            owner_id, allowed = by_admin, True
     if not allowed:
         who = (
             utils.mention(adder.id, adder.full_name, adder.username) if adder else "неизвестно"
@@ -115,6 +144,49 @@ async def bot_promoted(update: ChatMemberUpdated, bot: Bot) -> None:
     if update.chat.type not in ("group", "supergroup"):
         return
     adm_cache.invalidate_admins(update.chat.id)
+
+
+# Кого из ставивших реакции уже смотрели: (чат, юзер) -> когда.
+# Реакции сыплются пачками, и без этого проверка шла бы на каждую.
+_reacted: dict[tuple[int, int], float] = {}
+
+
+@router.message_reaction()
+async def reaction_put(update: MessageReactionUpdated, bot: Bot) -> None:
+    """Реакцию поставил человек — заодно смотрим, что у него за профиль.
+
+    Рекламные аккаунты часто вообще ничего не пишут: ставят реакцию, чтобы
+    засветиться в чате и собрать переходы в профиль. Для правил такой человек
+    невидим — он не отправил ни одного сообщения.
+    """
+    user = update.user
+    if user is None or user.is_bot or update.chat.type not in ("group", "supergroup"):
+        return
+    if not update.new_reaction:
+        return                       # реакцию сняли — смотреть нечего
+    if not await db.get_chat(update.chat.id):
+        return
+    s = await db.get_settings(update.chat.id)
+    if not (s.watch_on and s.watch_react):
+        return
+    if user.id in config.ADMIN_IDS:
+        return
+    if "all" in await db.wl_scopes_for(update.chat.id, user.id, user.username):
+        return
+
+    key = (update.chat.id, user.id)
+    now = time.monotonic()
+    if now - _reacted.get(key, 0) < config.REACTION_TTL:
+        return
+    if len(_reacted) > config.REACTION_KEEP:
+        _reacted.clear()
+    _reacted[key] = now
+    if user.id in await adm_cache.chat_admin_ids(bot, update.chat.id):
+        return
+
+    from ..services import watch
+    # сообщения нет — проверяем только профиль
+    await watch.check_user(bot, update.chat, user, s, None, None)
 
 
 # ---------- ручные действия админов чата (нативные бан/мут) ----------

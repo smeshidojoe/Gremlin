@@ -127,11 +127,29 @@ async def main() -> None:
     async def _reconcile() -> None:
         from .services import adm_cache
         gone = await adm_cache.reconcile_chats(bot)
+        if not gone:
+            return
+        owners: dict[int, list[str]] = {}
         for cid, title in gone:
             await db.add_event(cid, "bot", "чат выключен: бота там больше нет")
-        if gone:
-            names = ", ".join(f"{t} ({c})" for c, t in gone)
-            logger.info("выключены чаты, где бота нет: %s", names)
+            ch = await db.get_chat(cid)
+            if ch and ch["owner_id"]:
+                owners.setdefault(ch["owner_id"], []).append(f"{title} ({cid})")
+        logger.info("выключены чаты, где бота нет: %s",
+                    ", ".join(f"{t} ({c})" for c, t in gone))
+        # молча убирать чат из списка нельзя: человек решит, что настройки
+        # потерялись, и будет искать их
+        for owner_id, names in owners.items():
+            try:
+                await bot.send_message(
+                    owner_id,
+                    "ℹ️ Убрал из списка чаты, где бота больше нет:\n"
+                    + "\n".join(f"• {n}" for n in names)
+                    + "\n\nНастройки сохранены: добавите бота обратно — "
+                      "чат вернётся в список со всем, что было.")
+            except Exception:
+                logger.warning("не сказать владельцу %s о выключенных чатах",
+                               owner_id, exc_info=True)
 
     reconcile_task = asyncio.create_task(_reconcile())
     digest_task = asyncio.create_task(digest.scheduler(bot))

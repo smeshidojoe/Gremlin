@@ -32,12 +32,13 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
     "flood": ("🌊 Антифлуд", ("flood_on", "flood_msgs", "flood_window", "flood_mute_min")),
     "captcha": ("🤖 Капча", ("captcha_on", "captcha_timeout")),
     "watch": ("👁 Наблюдение", ("watch_on", "watch_bots", "watch_suspect",
-                             "watch_ban", "watch_nn")),
+                             "watch_ban", "watch_nn", "watch_react")),
     "welcome": ("👋 Приветствие", ("welcome_on", "welcome_text")),
     "media": ("🖼 Медиа-фильтры", ("media_on", "media_mask")),
     "triggers": ("🎯 Триггеры", ("trig_on",)),
     "cmds": ("🔢 Счётчики", ("cmds_on", "cmds_guest_cd", "cmds_anywhere",
                             "cmds_bare")),
+    "rates": ("💱 Курс валют", ("rates_on", "rates_cd")),
     "trust": ("🎖 Доверие", ("trust_on", "trust_soften", "trust_days",
                               "trust_msgs", "trust_mask")),
     "warns": ("⚠️ Варны", ("warns_on", "warns_limit", "warns_punish",
@@ -54,7 +55,7 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
     "burst": ("📡 Рассылки", ("burst_on", "burst_users", "burst_punish",
                               "burst_mute_min")),
     # копилка улик не переносится: она про конкретный чат и его норму
-    "nn": ("🧪 Нейрофильтр", ("nn_mode", "nn_threshold", "nn_net")),
+    "nn": ("🧪 Нейрофильтр", ("nn_mode", "nn_threshold", "nn_net", "nn_seed")),
     "wl": ("🕊 Вайтлист", ()),
     # лог-чат не переносим: он свой у каждого чата, и подставлять чужой —
     # верный способ отправить карточки не туда

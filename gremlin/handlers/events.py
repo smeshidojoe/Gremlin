@@ -186,7 +186,7 @@ async def reaction_put(update: MessageReactionUpdated, bot: Bot) -> None:
 
     from ..services import watch
     # сообщения нет — проверяем только профиль
-    await watch.check_user(bot, update.chat, user, s, None, None)
+    await watch.check_user(bot, update.chat, user, s, None, None, event="reaction")
 
 
 # ---------- ручные действия админов чата (нативные бан/мут) ----------

@@ -19,7 +19,7 @@ from aiohttp import web
 
 from .. import config, db, schema, utils
 from ..handlers import fun as fun_h, user_menu as um
-from ..services import (adm_cache, digest as digest_svc, filters as flt,
+from ..services import (adm_cache, cas, digest as digest_svc, filters as flt,
                         media, moderation, net as net_svc, nn, resolve, transfer)
 from . import auth
 
@@ -283,6 +283,18 @@ async def _widget(cid: int, widget: str, s) -> dict:
     if widget == "read_stats":
         return {"ocr": media.status(), "asr": media.asr_status(),
                 "asr_url": bool(config.ASR_URL)}
+
+    if widget == "nn_subs":
+        return {"sem_on": bool(s.sem_on), "burst_on": bool(s.burst_on),
+                "phrases": len(await db.phrases_list(cid))}
+
+    if widget == "watch_subs":
+        return {"cas_on": bool(s.cas_on)}
+
+    if widget == "cas_stats":
+        st = await db.cas_stats()
+        st["service"] = cas.status()
+        return st
 
     if widget == "nn_clusters":
         # сами кучки считаются по кнопке: на тысяче улик это секунда-другая,
@@ -1454,3 +1466,58 @@ async def api_roulette_spin(request: web.Request) -> web.Response:
         logger.warning("рулетка из панели упала", exc_info=True)
         raise web.HTTPBadRequest(text=f"Не вышло: {e}")
     return js({"note": note})
+
+
+# ---------- стартовый набор нейрофильтра ----------
+#
+# Набор общий на весь бот, поэтому только владельцу: удалённый пример пропадает
+# сразу у всех чатов.
+
+SEED_PAGE = 20
+
+
+@routes.get("/api/seed")
+async def api_seed(request: web.Request) -> web.Response:
+    owner_only(request)
+    label = request.query.get("label") or None
+    if label not in ("spam", "ok", None):
+        label = None
+    q = (request.query.get("q") or "").strip() or None
+    page = max(0, int(request.query.get("page") or 0))
+    total = await db.seed_count(label, q)
+    rows = await db.seed_page(label, q, page * SEED_PAGE, SEED_PAGE)
+    return js({
+        "stats": await db.seed_stats(),
+        "vecs": await db.seed_vec_count(),
+        "in_work": config.NN_SEED_LIMIT,
+        "until": config.NN_SEED_UNTIL,
+        "total": total,
+        "page": page,
+        "pages": max(1, -(-total // SEED_PAGE)),
+        "items": [{"id": r["id"], "label": r["label"], "text": r["text"]}
+                  for r in rows],
+    })
+
+
+@routes.post("/api/seed/delete")
+async def api_seed_delete(request: web.Request) -> web.Response:
+    owner_only(request)
+    p = await body(request)
+    if p.get("all"):
+        gone = await db.seed_clear()
+        what = "набор очищен"
+    elif p.get("ids"):
+        gone = await db.seed_delete([int(x) for x in p["ids"]])
+        what = "удалены примеры"
+    else:
+        label = p.get("label") if p.get("label") in ("spam", "ok") else None
+        q = (p.get("q") or "").strip() or None
+        if not label and not q:
+            raise web.HTTPBadRequest(text="Нечего удалять: задайте поиск или метку.")
+        gone = await db.seed_delete_where(label, q)
+        what = f"удалено по фильтру ({q or label})"
+    if gone:
+        nn.invalidate()          # набор подмешан всем молодым чатам
+        await db.add_event(None, "nn", f"стартовый набор: {what}, {gone} шт "
+                                       f"by {uid_of(request)}")
+    return js({"ok": True, "gone": gone})

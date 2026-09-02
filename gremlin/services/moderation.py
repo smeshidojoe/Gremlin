@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import time
+from collections import deque
 
 from aiogram import Bot
 from aiogram.types import (
@@ -255,6 +256,58 @@ def human_error(e: Exception) -> str:
     return text[:120]
 
 
+# ---------- уборка за забаненным ----------
+#
+# Забанить спамера и оставить в чате пять его рекламных сообщений — работа
+# наполовину. Telegram истории ботам не даёт: «последние сообщения юзера»
+# спросить не у кого, помнить их можем только мы сами.
+#
+# Держим в памяти, а не в базе: писать id каждого сообщения чата на диск ради
+# редкого бана дорого, а плата за память — три числа на говорящего человека.
+# После перезапуска буфер пуст, и первые минуты уборка ничего не находит —
+# это осознанный размен.
+
+# (chat_id, user_id) -> deque[message_id]
+_seen_msgs: dict[tuple[int, int], deque] = {}
+
+
+def remember_message(chat_id: int, user_id: int, msg_id: int) -> None:
+    """Запомнить id сообщения — вдруг автора придётся банить."""
+    key = (chat_id, user_id)
+    dq = _seen_msgs.get(key)
+    if dq is None:
+        if len(_seen_msgs) > 50000:      # чат-гигант не должен съесть память
+            _seen_msgs.clear()
+        dq = _seen_msgs[key] = deque(maxlen=config.BAN_WIPE_KEEP)
+    dq.append(msg_id)
+
+
+def forget_messages(chat_id: int, user_id: int) -> None:
+    _seen_msgs.pop((chat_id, user_id), None)
+
+
+async def wipe_recent(bot: Bot, chat_id: int, user_id: int, keep: int) -> int:
+    """Удалить последние keep сообщений человека. Возвращает, сколько удалось."""
+    if keep <= 0:
+        return 0
+    dq = _seen_msgs.get((chat_id, user_id))
+    if not dq:
+        return 0
+    ids = list(dq)[-keep:]
+    forget_messages(chat_id, user_id)
+    gone = 0
+    for mid in ids:
+        try:
+            await bot.delete_message(chat_id, mid)
+            gone += 1
+        except Exception:
+            # уже удалено модерацией, или старше 48 часов — обычное дело
+            pass
+    if gone:
+        logger.info("уборка за баном в %s: удалено %d из %d", chat_id, gone, len(ids))
+    return gone
+
+
 async def punish_ex(bot: Bot, chat_id: int, user: User, kind: str, mute_min: int,
                     reason: str, by_id: int | None) -> tuple[int | None, str | None]:
     """То же, что apply_punishment, но возвращает и текст ошибки Telegram.
@@ -301,6 +354,12 @@ async def punish_ex(bot: Bot, chat_id: int, user: User, kind: str, mute_min: int
         chat_id, user.id, user.username, user.full_name, kind, reason, until, by_id,
         was_member=member,
     )
+    # за баном убираем то, что человек успел написать: и автоматическим,
+    # и выданным рукой — смысл один
+    if kind == "ban":
+        s = await db.get_settings(chat_id)
+        if s.ban_wipe:
+            await wipe_recent(bot, chat_id, user.id, s.ban_wipe)
     return pid, None
 
 

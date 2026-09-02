@@ -9,6 +9,7 @@
 """
 import logging
 import os
+import re
 
 from aiohttp import web
 
@@ -52,13 +53,34 @@ async def _errors_mw(request: web.Request, handler):
                                  status=500)
 
 
-async def _index(request: web.Request) -> web.FileResponse:
-    resp = web.FileResponse(os.path.join(STATIC, "index.html"))
+_ASSET_RE = re.compile(r"(/static/app\.(?:css|js))\?v=[^\"']*")
+
+
+def _asset_version() -> str:
+    """Метка версии для app.js и app.css — время правки самих файлов.
+
+    Раньше в index.html стояло «?v=2» руками, и после правки панели браузер
+    честно отдавал старый файл: метка-то не менялась. Забыть её обновить —
+    вопрос времени, поэтому считаем сами.
+    """
+    stamps = []
+    for name in ("app.js", "app.css"):
+        try:
+            stamps.append(int(os.path.getmtime(os.path.join(STATIC, name))))
+        except OSError:
+            pass
+    return str(max(stamps)) if stamps else "0"
+
+
+async def _index(request: web.Request) -> web.Response:
+    with open(os.path.join(STATIC, "index.html"), encoding="utf-8") as f:
+        html = f.read()
+    html = _ASSET_RE.sub(r"\1?v=" + _asset_version(), html)
     # WebView Telegram охотно кэширует страницу, и после обновления панели
     # у людей оставалась старая. Сама страница крошечная, перепроверять её
     # каждый раз дешевле, чем ловить потом «а у меня всё по-старому»
-    resp.headers["Cache-Control"] = "no-cache"
-    return resp
+    return web.Response(text=html, content_type="text/html",
+                        headers={"Cache-Control": "no-cache"})
 
 
 def build(bot) -> web.Application:

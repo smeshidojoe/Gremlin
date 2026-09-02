@@ -329,17 +329,24 @@ def profile_sig(first_name: str | None, last_name: str | None, username: str | N
     return f"{first_name or ''}|{last_name or ''}|{username or ''}"
 
 
-async def check_user(bot, chat, user, settings, message=None, lvl=None) -> None:
+async def check_user(bot, chat, user, settings, message=None, lvl=None,
+                     event: str = "message", nn_hit: bool = False) -> None:
     """Полный цикл наблюдения: скоринг профиля (+сообщения), бан или карточка.
 
     Профиль скорится один раз на версию профиля (изменился — пересчёт).
     Очки за сообщения складываются в копилку: спам выгодно дробить на порции
     ниже порога, и без накопления такая рассылка проходила бы насквозь.
     Копилка обнуляется, если человек сутки не давал поводов.
+
+    event — откуда пришли: 'message', 'join' или 'reaction'. Нужен CAS: на входе
+    в чат текста ещё нет, и проверка списка спамеров там единственное, что
+    вообще может сработать. nn_hit — нейрофильтр счёл сообщение рекламой;
+    для CAS это тоже повод спросить.
     """
     import time
 
     from .. import config, db, utils
+    from . import cas as cas_svc
     from . import moderation
 
     p_hard, p_cos, p_reasons = profile_parts(user.first_name, user.last_name,
@@ -349,8 +356,15 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None) -> None:
     if message is not None:
         text = message.text or message.caption or ""
         hard, cosmetic, m_reasons = message_parts(text)
+
+    # CAS на входе в чат: профиль у спамера обычно самый обычный, и всё
+    # остальное здесь молчит — спрашиваем список до того, как он что-то написал
+    cas_pts, cas_reasons = 0, []
+    if settings.cas_on and settings.cas_join and event == "join":
+        cas_pts, cas_reasons = await cas_svc.points(user.id, settings)
+
     # чисто? тогда и в базу лезть незачем — на каждое сообщение это лишний запрос
-    if not (p_hard or p_cos or hard or cosmetic):
+    if not (p_hard or p_cos or hard or cosmetic or cas_pts or nn_hit):
         return
 
     sig = profile_sig(user.first_name, user.last_name, user.username)
@@ -390,6 +404,17 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None) -> None:
         if sim is not None and sim >= config.PROFILE_SIM:
             total += config.PROFILE_POINTS
             reasons.append(f"имя как у забаненных профилей ({sim}%)")
+    # CAS при подозрении: спрашиваем, только когда что-то уже набежало или
+    # нейрофильтр показал на сообщение. Спрашивать про каждого — и лишний
+    # запрос наружу, и чужому сервису знать всех подряд незачем.
+    if (settings.cas_on and settings.cas_suspect and not cas_pts
+            and (total > 0 or nn_hit)):
+        cas_pts, cas_reasons = await cas_svc.points(user.id, settings)
+    if cas_pts:
+        total += cas_pts
+        reasons += cas_reasons
+    if nn_hit:
+        reasons.append("нейрофильтр: похоже на рекламу")
     if saved:
         reasons.append(f"копилка за сутки: {saved}")
     # Не участник чата (комментатор под постом канала) — тот же текст от него

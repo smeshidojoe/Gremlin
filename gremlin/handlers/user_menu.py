@@ -42,6 +42,7 @@ class Input(StatesGroup):
     mass_kick = State()         # ждём список id для массового кика
     mass_ban = State()          # ждём список id для массового бана
     phrase = State()            # ждём фразу-образец для смысловых стоп-слов
+    seed_q = State()            # ждём слово для поиска по стартовому набору
 
 
 _HOME_TEXT = "<b>🧌 Gremlin</b>\n\nМодерация и мониторинг чатов."
@@ -73,9 +74,10 @@ async def view_home(user_id: int, bot: Bot) -> tuple[str, InlineKeyboardMarkup]:
         b.button(text="🐞 Ошибки", callback_data="a:errors")
         b.button(text="⚙️ Состояние", callback_data="a:health")
         b.button(text="👥 Доступ к боту", callback_data="u:acc")
+        b.button(text="🌱 Стартовый набор", callback_data="u:seed")
         b.button(text="🎪 Приколы", callback_data="f:home")
     b.button(text="✖️ Закрыть", callback_data="u:close")
-    b.adjust(1, 1, 2, 1, 1, 1, 1)
+    b.adjust(1, 1, 2, 1, 1, 1, 1, 1)
     text = _HOME_TEXT + (_PANEL_HINT if runtime.webapp_url() else "")
     return text, b.as_markup()
 
@@ -263,8 +265,6 @@ async def view_chat(cid: int, viewer_id: int) -> tuple[str, InlineKeyboardMarkup
     b.button(text="🔗 Ссылки", callback_data=f"u:s:{cid}:links")
     b.button(text="📛 Анонимы", callback_data=f"u:s:{cid}:anon")
     b.button(text="🧨 Стоп-слова", callback_data=f"u:s:{cid}:words")
-    b.button(text="🧠 Смысловые", callback_data=f"u:s:{cid}:sem")
-    b.button(text="📡 Рассылки", callback_data=f"u:s:{cid}:burst")
     b.button(text="🌊 Антифлуд", callback_data=f"u:s:{cid}:flood")
     b.button(text="🤖 Капча", callback_data=f"u:s:{cid}:captcha")
     b.button(text="👁 Наблюдение", callback_data=f"u:s:{cid}:watch")
@@ -298,7 +298,7 @@ async def view_chat(cid: int, viewer_id: int) -> tuple[str, InlineKeyboardMarkup
     b.button(text="📥 Перенести настройки", callback_data=f"u:cp:{cid}")
     b.button(text="🚪 Убрать бота из чата", callback_data=f"a:leave:{cid}")
     b.button(text="⬅️ Назад", callback_data="u:chats")
-    b.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1)
+    b.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1)
     return text, b.as_markup()
 
 
@@ -516,6 +516,26 @@ async def _render_widget(b: InlineKeyboardBuilder, cid: int, widget: str, s) -> 
         if s.welcome_text and not rows:
             b.row(_btn("⤴️ Перенести старый текст в заготовки", f"u:wmig:{cid}"))
 
+    elif widget == "nn_subs":
+        # смысловые фразы и рассылки — тот же нейрофильтр, только с другой
+        # копилкой: держим их внутри него, а не отдельными пунктами меню
+        n = len(await db.phrases_list(cid))
+        b.row(_btn(f"{'✅' if s.sem_on else '🚫'} 🧠 Смысловые стоп-слова: {n}",
+                   f"u:s:{cid}:sem"))
+        b.row(_btn(f"{'✅' if s.burst_on else '🚫'} 📡 Рассылки",
+                   f"u:s:{cid}:burst"))
+
+    elif widget == "watch_subs":
+        b.row(_btn(f"{'✅' if s.cas_on else '🚫'} 🌐 Общий список спамеров",
+                   f"u:s:{cid}:cas"))
+
+    elif widget == "cas_stats":
+        from ..services import cas as cas_svc
+        st = await db.cas_stats()
+        b.row(_btn(f"🌐 Сервис: {cas_svc.status()}", f"u:s:{cid}:cas"))
+        b.row(_btn(f"📇 Запомнено ответов: {st['listed']} в списке, "
+                   f"{st['clean']} чистых", f"u:s:{cid}:cas"))
+
     elif widget == "trustsoft":
         n = sum(1 for bit, _ in config.TRUST_BITS if s.trust_mask & bit)
         b.row(_btn(f"🎚 Что смягчать: {n} из {len(config.TRUST_BITS)}",
@@ -636,6 +656,27 @@ _CLUSTER_SCOPES = {
 }
 
 
+def _cluster_state(g: dict) -> str:
+    """Как размечены улики внутри кучки.
+
+    Кучка — это просто похожие друг на друга улики, собранные вместе;
+    своей метки у неё нет, метки есть у каждой улики. Голые числа
+    «спам 2 · норма 7» рядом с «9 шт» читались как непонятно что,
+    поэтому пишем предложением.
+    """
+    spam, ok, unknown = g.get("spam", 0), g.get("ok", 0), g.get("unknown", 0)
+    if not spam and not ok:
+        return "ни одна улика ещё не размечена"
+    parts = []
+    if spam:
+        parts.append(f"⛔ спамом — {spam}")
+    if ok:
+        parts.append(f"🕊 нормой — {ok}")
+    if unknown:
+        parts.append(f"✋ без оценки — {unknown}")
+    return "из них помечено: " + ", ".join(parts)
+
+
 async def view_clusters(cid: int, scope: str) -> tuple[str, InlineKeyboardMarkup]:
     """Копилка, разложенная по кучкам похожего. Разметка идёт кучкой целиком."""
     ch = await db.get_chat(cid)
@@ -656,6 +697,7 @@ async def view_clusters(cid: int, scope: str) -> tuple[str, InlineKeyboardMarkup
         sample = utils.esc(utils.chunk(" ".join(g["sample"].split()), 110))
         lines.append(f"<b>{i + 1}.</b> {g['size']} шт · <i>{utils.esc(words)}</i>")
         lines.append(f"<blockquote>{sample}</blockquote>")
+        lines.append(f"<i>{_cluster_state(g)}</i>")
         b.row(_btn(f"{i + 1}. ⛔ спам ({g['size']})", f"u:nnl:{cid}:{i}:spam:{scope}"),
               _btn(f"🕊 норма ({g['size']})", f"u:nnl:{cid}:{i}:ok:{scope}"))
 
@@ -3706,3 +3748,268 @@ async def words_input(message: Message, state: FSMContext, bot: Bot) -> None:
     if dupes:
         note += f" Уже были в списке: {dupes}."
     await _done(message, bot, state, await view_words(cid, 0), note + "\n\n")
+
+
+# ---------- стартовый набор (только владелец бота) ----------
+#
+# Набор общий на весь бот: один и тот же список примеров подмешивается всем
+# молодым чатам. Поэтому и правит его владелец, а не хозяин отдельного чата —
+# удалил пример здесь, он пропал сразу везде.
+
+SEED_PER_PAGE = 5
+
+# что человек сейчас смотрит: user_id -> (метка, поисковое слово, страница).
+# В callback_data это не влезает — там 64 байта, а слово бывает любым.
+_seed_view: dict[int, tuple[str | None, str | None, int]] = {}
+
+_SEED_LABELS = {None: "все", "spam": "⛔ только спам", "ok": "🕊 только норма"}
+
+
+def _seed_state(uid: int) -> tuple[str | None, str | None, int]:
+    return _seed_view.get(uid, (None, None, 0))
+
+
+async def _seed_admin(cb: CallbackQuery) -> bool:
+    """Набор общий, поэтому правит его только владелец бота."""
+    if cb.from_user.id in config.ADMIN_IDS:
+        return True
+    await cb.answer("Стартовый набор общий для всех чатов — его правит "
+                    "владелец бота.", show_alert=True)
+    return False
+
+
+async def view_seed(uid: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Главный экран набора: сколько чего и что с этим можно сделать."""
+    st = await db.seed_stats()
+    vecs = await db.seed_vec_count()
+    label, q, _ = _seed_state(uid)
+
+    lines = [
+        "<b>🌱 Стартовый набор</b>\n",
+        "Чужие примеры спама и обычных сообщений. Ими пользуется чат, пока не "
+        f"накопит своих {config.NN_SEED_UNTIL}; дальше набор отключается сам — "
+        "своя норма всегда точнее чужой.",
+        "",
+        "Набор общий: удалили пример здесь — он пропал у всех чатов сразу. "
+        "Смело выкидывайте то, что к вашим чатам отношения не имеет: чужая "
+        "«норма» из чата про Linux в чате про рыбалку только мешает.",
+        "",
+        f"⛔ Спам: <b>{st['spam']}</b>",
+        f"🕊 Норма: <b>{st['ok']}</b>",
+        f"📦 Всего: <b>{st['total']}</b>",
+        f"🧮 Посчитано векторов: <b>{vecs}</b> "
+        f"(в работе {min(config.NN_SEED_LIMIT, st['total'])} — поровну того и другого)",
+    ]
+    if q:
+        found = await db.seed_count(label, q)
+        lines += ["", f"🔎 Найдено по «<code>{utils.esc(q)}</code>»: <b>{found}</b>"]
+
+    b = InlineKeyboardBuilder()
+    b.row(_btn(f"📋 Смотреть: {_SEED_LABELS[label]}", "u:seedl:0"))
+    b.row(_btn("🔎 Найти по слову", "u:seedq"))
+    if q:
+        b.row(_btn(f"❌ Удалить всё найденное по «{q[:20]}»", "u:seedw"))
+        b.row(_btn("✖️ Сбросить поиск", "u:seedr"))
+    b.row(_btn("🧹 Очистить набор целиком", "u:seedx"))
+    b.row(_btn("⬅️ Назад", "u:home"))
+    return "\n".join(lines), b.as_markup()
+
+
+async def view_seed_list(uid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """Постранично сам список: текст примера плюс кнопка «удалить»."""
+    label, q, _ = _seed_state(uid)
+    total = await db.seed_count(label, q)
+    pages = max(1, -(-total // SEED_PER_PAGE))
+    page = max(0, min(page, pages - 1))
+    _seed_view[uid] = (label, q, page)
+    rows = await db.seed_page(label, q, page * SEED_PER_PAGE, SEED_PER_PAGE)
+
+    head = f"<b>🌱 Набор</b> · {_SEED_LABELS[label]}"
+    if q:
+        head += f" · поиск «{utils.esc(q)}»"
+    lines = [head + "\n",
+             f"Всего: <b>{total}</b>"
+             + (f" · страница {page + 1} из {pages}" if pages > 1 else ""),
+             ""]
+    b = InlineKeyboardBuilder()
+    if not rows:
+        lines.append("Ничего не нашлось.")
+    for i, r in enumerate(rows, page * SEED_PER_PAGE + 1):
+        mark = "⛔" if r["label"] == "spam" else "🕊"
+        body = utils.esc(utils.chunk(" ".join(r["text"].split()), 160))
+        lines.append(f"<b>{i}.</b> {mark}")
+        lines.append(f"<blockquote>{body}</blockquote>")
+        b.row(_btn(f"❌ Удалить {i}", f"u:seedd:{r['id']}"))
+
+    if pages > 1:
+        b.row(
+            _btn("⬅️", f"u:seedl:{page - 1 if page else pages - 1}"),
+            _btn(f"{page + 1}/{pages}", f"u:seedl:{page}"),
+            _btn("➡️", f"u:seedl:{page + 1 if page + 1 < pages else 0}"),
+        )
+    # фильтр по метке: чаще всего выкидывают именно чужую «норму»
+    b.row(*[_btn(("• " if label == key else "") + name, f"u:seedf:{key or 'all'}")
+            for key, name in _SEED_LABELS.items()])
+    b.row(_btn("⬅️ Назад", "u:seed"))
+    return "\n".join(lines), b.as_markup()
+
+
+def _seed_changed() -> None:
+    """Набор правили — профили всех чатов, где он подмешан, устарели."""
+    from ..services import nn
+    nn.invalidate()
+
+
+@router.callback_query(F.data == "u:seed")
+async def cb_seed(cb: CallbackQuery) -> None:
+    if not await _seed_admin(cb):
+        return
+    text, kb = await view_seed(cb.from_user.id)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:seedl:"))
+async def cb_seed_list(cb: CallbackQuery) -> None:
+    if not await _seed_admin(cb):
+        return
+    page = int(cb.data.split(":")[2])
+    text, kb = await view_seed_list(cb.from_user.id, page)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:seedf:"))
+async def cb_seed_filter(cb: CallbackQuery) -> None:
+    if not await _seed_admin(cb):
+        return
+    key = cb.data.split(":")[2]
+    label = None if key == "all" else key
+    _, q, _ = _seed_state(cb.from_user.id)
+    _seed_view[cb.from_user.id] = (label, q, 0)
+    text, kb = await view_seed_list(cb.from_user.id, 0)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:seedd:"))
+async def cb_seed_delete(cb: CallbackQuery) -> None:
+    if not await _seed_admin(cb):
+        return
+    sid = int(cb.data.split(":")[2])
+    gone = await db.seed_delete([sid])
+    if gone:
+        _seed_changed()
+        await db.add_event(None, "nn", f"из набора удалён пример #{sid} "
+                                       f"by {cb.from_user.id}")
+    _, _, page = _seed_state(cb.from_user.id)
+    text, kb = await view_seed_list(cb.from_user.id, page)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer("Удалено" if gone else "Уже удалено")
+
+
+@router.callback_query(F.data == "u:seedr")
+async def cb_seed_reset(cb: CallbackQuery) -> None:
+    if not await _seed_admin(cb):
+        return
+    label, _, _ = _seed_state(cb.from_user.id)
+    _seed_view[cb.from_user.id] = (label, None, 0)
+    text, kb = await view_seed(cb.from_user.id)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer("Поиск сброшен")
+
+
+@router.callback_query(F.data == "u:seedq")
+async def cb_seed_search_ask(cb: CallbackQuery, state: FSMContext) -> None:
+    if not await _seed_admin(cb):
+        return
+    await _ask(
+        cb, state, Input.seed_q,
+        "<b>🔎 Поиск в наборе</b>\n\nПришлите слово или кусок фразы — покажу "
+        "все примеры, где оно встречается, и предложу удалить их разом.\n"
+        "Например: <code>docker</code>, <code>ядро</code>, <code>systemd</code>.",
+        "u:seed",
+    )
+
+
+@router.message(StateFilter(Input.seed_q))
+async def seed_search_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    q = " ".join((message.text or "").split())[:100]
+    uid = message.from_user.id
+    if q == "/cancel" or not q:
+        await _done(message, bot, state, await view_seed(uid))
+        return
+    label, _, _ = _seed_state(uid)
+    _seed_view[uid] = (label, q, 0)
+    await _done(message, bot, state, await view_seed_list(uid, 0))
+
+
+@router.callback_query(F.data == "u:seedw")
+async def cb_seed_wipe_ask(cb: CallbackQuery) -> None:
+    if not await _seed_admin(cb):
+        return
+    label, q, _ = _seed_state(cb.from_user.id)
+    if not q:
+        await cb.answer("Сначала найдите что-нибудь.", show_alert=True)
+        return
+    found = await db.seed_count(label, q)
+    b = InlineKeyboardBuilder()
+    b.row(_btn(f"❌ Да, удалить {found}", "u:seedwy"))
+    b.row(_btn("⬅️ Отмена", "u:seed"))
+    await cb.message.edit_text(
+        f"<b>❌ Удалить найденное</b>\n\nПо «<code>{utils.esc(q)}</code>» "
+        f"({_SEED_LABELS[label]}) нашлось <b>{found}</b> примеров.\n"
+        "Они пропадут из набора у всех чатов. Отменить будет нельзя — "
+        "набор придётся загружать заново.",
+        reply_markup=b.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "u:seedwy")
+async def cb_seed_wipe(cb: CallbackQuery) -> None:
+    if not await _seed_admin(cb):
+        return
+    label, q, _ = _seed_state(cb.from_user.id)
+    gone = await db.seed_delete_where(label, q)
+    if gone:
+        _seed_changed()
+        await db.add_event(None, "nn", f"из набора удалено по «{q}»: {gone} "
+                                       f"by {cb.from_user.id}")
+    _seed_view[cb.from_user.id] = (label, None, 0)
+    text, kb = await view_seed(cb.from_user.id)
+    await cb.message.edit_text(f"✅ Удалено примеров: {gone}.\n\n" + text,
+                               reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "u:seedx")
+async def cb_seed_clear_ask(cb: CallbackQuery) -> None:
+    if not await _seed_admin(cb):
+        return
+    st = await db.seed_stats()
+    b = InlineKeyboardBuilder()
+    b.row(_btn(f"🧹 Да, удалить все {st['total']}", "u:seedxy"))
+    b.row(_btn("⬅️ Отмена", "u:seed"))
+    await cb.message.edit_text(
+        f"<b>🧹 Очистить набор</b>\n\nБудут удалены все <b>{st['total']}</b> "
+        "примеров. Молодые чаты снова останутся без образцов и будут молчать, "
+        "пока не накопят своих.\n"
+        "Загрузить набор заново можно только с машины: "
+        "<code>python tools/import_dataset.py файл</code>.",
+        reply_markup=b.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "u:seedxy")
+async def cb_seed_clear(cb: CallbackQuery) -> None:
+    if not await _seed_admin(cb):
+        return
+    gone = await db.seed_clear()
+    _seed_changed()
+    await db.add_event(None, "nn", f"стартовый набор очищен: {gone} "
+                                   f"by {cb.from_user.id}")
+    _seed_view.pop(cb.from_user.id, None)
+    text, kb = await view_seed(cb.from_user.id)
+    await cb.message.edit_text(f"🧹 Удалено примеров: {gone}.\n\n" + text,
+                               reply_markup=kb)
+    await cb.answer()

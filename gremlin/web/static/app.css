@@ -144,6 +144,13 @@ main { padding: 12px; max-width: 720px; margin: 0 auto; }
 .btn.wide { width: 100%; }
 .btn.ghost { background: color-mix(in srgb, var(--hint) 20%, transparent); color: var(--text); }
 .btn.danger { background: var(--danger); color: #fff; }
+/* Разметка кучек: обе кнопки — действие, а не состояние. Заливка у одной из
+   них читалась как «кучка помечена спамом», поэтому фон нейтральный у обеих,
+   различаются только цветом надписи. */
+.btn.ghost.danger { background: color-mix(in srgb, var(--danger) 18%, transparent);
+                    color: var(--danger); }
+.btn.ghost.good { background: color-mix(in srgb, var(--ok) 18%, transparent);
+                  color: var(--ok); }
 .btn.small { padding: 6px 10px; font-size: 13px; border-radius: 8px; }
 .btn[disabled] { opacity: .5; pointer-events: none; }
 

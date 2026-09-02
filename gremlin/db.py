@@ -135,6 +135,11 @@ CREATE TABLE IF NOT EXISTS settings(
     nn_seed         INTEGER NOT NULL DEFAULT 1,
     watch_nn        INTEGER NOT NULL DEFAULT 0,
     watch_react     INTEGER NOT NULL DEFAULT 0,
+    cas_on          INTEGER NOT NULL DEFAULT 0,
+    cas_join        INTEGER NOT NULL DEFAULT 1,
+    cas_suspect     INTEGER NOT NULL DEFAULT 1,
+    cas_score       INTEGER NOT NULL DEFAULT 60,
+    ban_wipe        INTEGER NOT NULL DEFAULT 3,
     ocr_on          INTEGER NOT NULL DEFAULT 0,
     ocr_langs       TEXT    NOT NULL DEFAULT 'rus+eng',
     asr_on          INTEGER NOT NULL DEFAULT 0,
@@ -292,6 +297,13 @@ CREATE TABLE IF NOT EXISTS kv(
     k TEXT PRIMARY KEY,
     v TEXT
 );
+-- Ответы CAS (чужой список спамеров). Держим отдельно, а не в kv: ответ живёт
+-- неделями, а спрашивать одного и того же человека приходится в каждом чате.
+CREATE TABLE IF NOT EXISTS cas_cache(
+    user_id INTEGER PRIMARY KEY,
+    listed  INTEGER NOT NULL,
+    ts      INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_wl_chat ON whitelist(chat_id);
 CREATE INDEX IF NOT EXISTS idx_words_chat ON words(chat_id);
 CREATE INDEX IF NOT EXISTS idx_pun_chat ON punishments(chat_id, active);
@@ -397,6 +409,11 @@ class Settings:
     nn_seed: int = 1
     watch_nn: int = 0
     watch_react: int = 0
+    cas_on: int = 0
+    cas_join: int = 1
+    cas_suspect: int = 1
+    cas_score: int = 60
+    ban_wipe: int = 3
     ocr_on: int = 0
     ocr_langs: str = "rus+eng"
     asr_on: int = 0
@@ -456,6 +473,11 @@ _SETTINGS_MIGRATIONS = {
     "nn_seed": "INTEGER NOT NULL DEFAULT 1",
     "watch_nn": "INTEGER NOT NULL DEFAULT 0",
     "watch_react": "INTEGER NOT NULL DEFAULT 0",
+    "cas_on": "INTEGER NOT NULL DEFAULT 0",
+    "cas_join": "INTEGER NOT NULL DEFAULT 1",
+    "cas_suspect": "INTEGER NOT NULL DEFAULT 1",
+    "cas_score": "INTEGER NOT NULL DEFAULT 60",
+    "ban_wipe": "INTEGER NOT NULL DEFAULT 3",
     "ocr_on": "INTEGER NOT NULL DEFAULT 0",
     "ocr_langs": "TEXT NOT NULL DEFAULT 'rus+eng'",
     "asr_on": "INTEGER NOT NULL DEFAULT 0",
@@ -2218,3 +2240,109 @@ async def kv_set(key: str, value: str | None) -> None:
             (key, value),
         )
     await _db.commit()
+
+
+# ---------- кэш ответов CAS ----------
+
+async def cas_get(user_id: int, ttl_listed: int, ttl_clean: int) -> bool | None:
+    """Что CAS отвечал про этого человека. None — не спрашивали или пора заново.
+
+    Срок у ответов разный: «в списке» держим дольше, потому что оттуда почти
+    не выходят, а «чист» перепроверяем чаще — сегодня чист, завтра попался.
+    """
+    cur = await _db.execute(
+        "SELECT listed, ts FROM cas_cache WHERE user_id = ?", (user_id,))
+    row = await cur.fetchone()
+    if row is None:
+        return None
+    ttl = ttl_listed if row["listed"] else ttl_clean
+    if _now() - row["ts"] > ttl:
+        return None
+    return bool(row["listed"])
+
+
+async def cas_put(user_id: int, listed: bool) -> None:
+    await _db.execute(
+        """INSERT INTO cas_cache (user_id, listed, ts) VALUES (?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET listed = excluded.listed,
+                                              ts = excluded.ts""",
+        (user_id, 1 if listed else 0, _now()))
+    await _db.commit()
+
+
+async def cas_prune(older_than: int) -> int:
+    """Выкинуть протухшие ответы, чтобы таблица не росла бесконечно."""
+    cur = await _db.execute(
+        "DELETE FROM cas_cache WHERE ts < ?", (_now() - older_than,))
+    await _db.commit()
+    return cur.rowcount or 0
+
+
+async def cas_stats() -> dict:
+    cur = await _db.execute(
+        "SELECT listed, COUNT(*) AS n FROM cas_cache GROUP BY listed")
+    out = {"listed": 0, "clean": 0}
+    for r in await cur.fetchall():
+        out["listed" if r["listed"] else "clean"] = r["n"]
+    return out
+
+
+# ---------- стартовый набор: просмотр и чистка ----------
+#
+# Набор общий на весь бот, поэтому и правит его только владелец бота: удалил
+# пример — он пропал у всех чатов сразу.
+
+def _seed_where(label: str | None, q: str | None) -> tuple[str, list]:
+    cond = ["chat_id = ?"]
+    args: list = [SEED_CHAT]
+    if label in ("spam", "ok"):
+        cond.append("label = ?")
+        args.append(label)
+    if q:
+        cond.append("text LIKE ? COLLATE NOCASE")
+        args.append(f"%{q}%")
+    return " AND ".join(cond), args
+
+
+async def seed_count(label: str | None = None, q: str | None = None) -> int:
+    where, args = _seed_where(label, q)
+    cur = await _db.execute(f"SELECT COUNT(*) FROM samples WHERE {where}", args)
+    return (await cur.fetchone())[0] or 0
+
+
+async def seed_page(label: str | None = None, q: str | None = None,
+                    offset: int = 0, limit: int = 5) -> list[aiosqlite.Row]:
+    where, args = _seed_where(label, q)
+    cur = await _db.execute(
+        f"""SELECT id, label, text, vec IS NOT NULL AS has_vec FROM samples
+            WHERE {where} ORDER BY id LIMIT ? OFFSET ?""", (*args, limit, offset))
+    return await cur.fetchall()
+
+
+async def seed_delete(ids: list[int]) -> int:
+    if not ids:
+        return 0
+    marks = ",".join("?" * len(ids))
+    cur = await _db.execute(
+        f"DELETE FROM samples WHERE chat_id = ? AND id IN ({marks})",
+        (SEED_CHAT, *ids))
+    await _db.commit()
+    return cur.rowcount or 0
+
+
+async def seed_delete_where(label: str | None = None, q: str | None = None) -> int:
+    """Удалить всё, что нашлось по фильтру. Пустой фильтр не чистит набор
+    целиком: для этого есть отдельная кнопка со своим подтверждением."""
+    if not label and not q:
+        return 0
+    where, args = _seed_where(label, q)
+    cur = await _db.execute(f"DELETE FROM samples WHERE {where}", args)
+    await _db.commit()
+    return cur.rowcount or 0
+
+
+async def seed_vec_count() -> int:
+    cur = await _db.execute(
+        "SELECT COUNT(*) FROM samples WHERE chat_id = ? AND vec IS NOT NULL",
+        (SEED_CHAT,))
+    return (await cur.fetchone())[0] or 0

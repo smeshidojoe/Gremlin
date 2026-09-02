@@ -135,6 +135,11 @@ async def _build_profile(chat_id: int):
     # разное представление о норме. Исключение — своя сетка: эти чаты
     # принадлежат одному человеку и похожи, там объединять честно (nn_net).
     # Пока улик меньше NN_MIN_SAMPLES — фильтр молчит и копит.
+    # Без модели тут делать нечего: и векторы считать нечем, и распаковать
+    # готовые не через что. Раньше это спасала пустая копилка — со стартовым
+    # набором она перестала быть пустой, и сюда стало можно дойти без модели.
+    if not await ensure():
+        return None
     s = await db.get_settings(chat_id)
     rows = (await db.samples_profile_net(chat_id) if s.nn_net
             else await db.samples_profile(chat_id))
@@ -335,14 +340,18 @@ async def log_verdict(chat_id: int, title: str | None, user_id, text: str,
     await asyncio.to_thread(_append, "\n".join(lines) + "\n\n")
 
 
-async def shadow(chat_id: int, message, s, extra: str = "") -> None:
+async def shadow(chat_id: int, message, s, extra: str = "") -> bool:
     """Теневой прогон: вердикт пишем в файл, на модерацию не влияем.
 
     Живой модерации фильтр не касается сознательно — сперва надо посмотреть,
     что он ловит и на чём ошибается, и только потом давать ему права.
+
+    Возвращаем, добрал ли вердикт до порога. Наказывать по этому нельзя и
+    никто не наказывает: наблюдение берёт это как ещё один повод присмотреться
+    к человеку — например, спросить про него общий список спамеров.
     """
     if s.nn_mode < 2:
-        return
+        return False
     # extra — распознанное в картинке или голосовом: для фильтра это обычный
     # текст, и сравнивать надо именно вместе с ним
     text = " ".join(filter(None, [message.text or message.caption or "", extra]))
@@ -350,14 +359,16 @@ async def shadow(chat_id: int, message, s, extra: str = "") -> None:
         verdict = await check(chat_id, text)
     except Exception:
         logger.warning("нейрофильтр упал на сообщении в %s", chat_id, exc_info=True)
-        return
+        return False
     if verdict is None or verdict["score"] < config.NN_LOG_FLOOR:
-        return
+        return False
     who = getattr(getattr(message, "from_user", None), "id", None)
     title = getattr(getattr(message, "chat", None), "title", None)
     await log_verdict(chat_id, title, who, text, verdict, s.nn_threshold)
-    if verdict["score"] >= s.nn_threshold:
+    hit = verdict["score"] >= s.nn_threshold
+    if hit:
         logger.info("nn shadow %s/%s score=%s", chat_id, who, verdict["score"])
+    return hit
 
 
 def _kmeans(matrix, k: int, steps: int = 25):

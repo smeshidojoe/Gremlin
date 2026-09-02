@@ -138,6 +138,28 @@ const tile = (href, label, opts = {}) => `
     <span>${esc(label)}${opts.sub ? `<small>${esc(opts.sub)}</small>` : ''}</span>
   </button>`;
 
+// Кучка — это похожие друг на друга улики, собранные вместе; своей метки
+// у неё нет, метки есть у каждой улики внутри. Пишем предложением: голые
+// числа рядом с «9 шт» читались как непонятно что.
+const clusterState = (g) => {
+  if (!g.spam && !g.ok) return 'ни одна улика ещё не размечена';
+  const parts = [];
+  if (g.spam) parts.push(`⛔ спамом — ${g.spam}`);
+  if (g.ok) parts.push(`🕊 нормой — ${g.ok}`);
+  if (g.unknown) parts.push(`✋ без оценки — ${g.unknown}`);
+  return 'из них помечено: ' + parts.join(', ');
+};
+
+// Подсветка вкладки живёт в разметке, поэтому переставляем её сами:
+// раньше «Без оценки» горела всегда, что бы ни было открыто.
+const markTab = (tab) => {
+  const box = document.getElementById('cluster-tabs');
+  if (!box) return;
+  box.querySelectorAll('[data-tab]').forEach((b) => {
+    b.classList.toggle('ghost', b.dataset.tab !== tab);
+  });
+};
+
 const switchRow = (key, label, on, extra = '') => `
   <div class="row">
     <div class="label">${esc(label)}${extra ? `<small>${esc(extra)}</small>` : ''}</div>
@@ -204,6 +226,7 @@ async function homeView() {
     <h2>Владельцу бота</h2>
     <div class="tiles">
       ${tile('#/access', '👥 Доступ к боту')}
+      ${tile('#/seed', '🌱 Стартовый набор')}
       ${tile('#/roulette', '🎯 Бан-рулетка')}
       ${tile('#/admin/log', '📜 Лог событий')}
       ${tile('#/admin/errors', '🐞 Ошибки')}
@@ -431,17 +454,42 @@ function widgetHtml(name, w, cid, d) {
           Для сравнения нужно хотя бы ${w.min} улик — пока копим.</div>` : ''}
       </div>`;
 
+    case 'nn_subs':
+      // смысловые фразы и рассылки — тот же нейрофильтр, другая копилка;
+      // отдельными пунктами меню они выглядели как три разных механизма
+      return `<div class="card">
+        ${tile(`#/chat/${cid}/s/sem`, '🧠 Смысловые стоп-слова',
+               { dot: w.sem_on, sub: w.phrases + ' ' + num(w.phrases, 'фраза', 'фразы', 'фраз') })}
+        ${tile(`#/chat/${cid}/s/burst`, '📡 Рассылки', { dot: w.burst_on })}
+      </div>`;
+
+    case 'watch_subs':
+      return `<div class="card">
+        ${tile(`#/chat/${cid}/s/cas`, '🌐 Общий список спамеров', { dot: w.cas_on })}
+      </div>`;
+
+    case 'cas_stats':
+      return `<div class="card">
+        <h2>🌐 Что бот уже спрашивал</h2>
+        <div class="row"><div class="label">Сервис</div>
+          <div class="value">${esc(w.service)}</div></div>
+        <div class="row"><div class="label">⛔ Нашлись в списке</div>
+          <div class="value">${w.listed}</div></div>
+        <div class="row"><div class="label">🕊 Чистые</div>
+          <div class="value">${w.clean}</div></div>
+      </div>`;
+
     case 'nn_clusters':
       return `<div class="card">
         <h2>🗂 Виды спама</h2>
         <div class="muted">Копилка раскладывается на кучки похожих улик. Разметив кучку
           целиком, вы размечаете все её улики разом — вместо сотни карточек одно нажатие.</div>
-        <div class="row" style="margin-top:10px">
-          <button class="btn" data-act="nn-clusters" data-scope="unknown">
-            ✋ Без оценки (${w.unknown})</button>
-          <button class="btn ghost" data-act="nn-clusters" data-scope="profile">
-            📊 Размеченные (${w.profile})</button>
-          <button class="btn ghost" data-act="nn-doubt">🤔 Спорное</button>
+        <div class="row" style="margin-top:10px" id="cluster-tabs">
+          <button class="btn ghost" data-act="nn-clusters" data-scope="unknown"
+            data-tab="unknown">✋ Без оценки (${w.unknown})</button>
+          <button class="btn ghost" data-act="nn-clusters" data-scope="profile"
+            data-tab="profile">📊 Размеченные (${w.profile})</button>
+          <button class="btn ghost" data-act="nn-doubt" data-tab="doubt">🤔 Спорное</button>
         </div>
         <div id="clusters"></div>
       </div>`;
@@ -894,6 +942,75 @@ async function accessView() {
   };
 }
 
+// Стартовый набор общий на весь бот: удалили пример — он пропал у всех
+// чатов сразу. Чужая «норма» из чата про Linux в чате про рыбалку только
+// мешает, поэтому смысл страницы — быстро найти лишнее и выкинуть.
+const SEED = { label: '', q: '', page: 0 };
+
+async function seedView() {
+  const p = new URLSearchParams({ label: SEED.label, q: SEED.q, page: SEED.page });
+  const d = await api(`/seed?${p}`);
+  CACHE.seed = d;
+  const tab = (key, name) => `<button class="btn ${SEED.label === key ? '' : 'ghost'}"
+    data-act="seed-label" data-label="${key}">${name}</button>`;
+  return {
+    title: 'Стартовый набор',
+    back: '#/',
+    html: `<div class="card">
+      <div class="intro">Чужие примеры спама и обычных сообщений. Ими пользуется
+        чат, пока не накопит своих ${d.until}; дальше набор отключается сам —
+        своя норма всегда точнее чужой.<br><br>
+        Набор общий: удалили пример здесь — он пропал у всех чатов сразу.</div>
+      <div class="row"><div class="label">⛔ Спам</div>
+        <div class="value">${d.stats.spam}</div></div>
+      <div class="row"><div class="label">🕊 Норма</div>
+        <div class="value">${d.stats.ok}</div></div>
+      <div class="row"><div class="label">📦 Всего</div>
+        <div class="value">${d.stats.total}</div></div>
+      <div class="row"><div class="label">🧮 Посчитано векторов
+        <small>в работе ${Math.min(d.in_work, d.stats.total)}, поровну того и другого</small></div>
+        <div class="value">${d.vecs}</div></div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="gap:6px">
+        ${tab('', 'Все')}${tab('spam', '⛔ Спам')}${tab('ok', '🕊 Норма')}
+      </div>
+      <button class="btn ghost wide" style="margin-top:10px" data-act="seed-search">
+        🔎 ${SEED.q ? 'Поиск: ' + esc(SEED.q) : 'Найти по слову'}</button>
+      ${SEED.q ? `<button class="btn ghost danger wide" style="margin-top:6px"
+        data-act="seed-wipe">❌ Удалить всё найденное (${d.total})</button>
+        <button class="btn ghost wide" style="margin-top:6px"
+        data-act="seed-clearq">✖️ Сбросить поиск</button>` : ''}
+    </div>
+
+    <div class="card">
+      <div class="label">Найдено: ${d.total}${d.pages > 1
+        ? ` · страница ${d.page + 1} из ${d.pages}` : ''}</div>
+      <div style="margin-top:10px">
+        ${d.items.map((r) => `<div class="item">
+          <div class="body">${r.label === 'spam' ? '⛔' : '🕊'}
+            ${esc(r.text.slice(0, 300))}</div>
+          <button class="x" data-act="seed-del" data-id="${r.id}">✕</button></div>`).join('')
+          || '<div class="empty">Ничего не нашлось.</div>'}
+      </div>
+      ${d.pages > 1 ? `<div class="row" style="margin-top:10px;gap:6px">
+        <button class="btn ghost" data-act="seed-page" data-page="${d.page - 1}"
+          ${d.page ? '' : 'disabled'}>⬅️</button>
+        <button class="btn ghost" data-act="seed-page" data-page="${d.page + 1}"
+          ${d.page + 1 < d.pages ? '' : 'disabled'}>➡️</button>
+      </div>` : ''}
+    </div>
+
+    <div class="card">
+      <button class="btn ghost danger wide" data-act="seed-clear">
+        🧹 Очистить набор целиком</button>
+      <div class="intro" style="margin-top:8px">Загрузить заново можно только
+        с машины: <span class="mono">python tools/import_dataset.py файл</span></div>
+    </div>`,
+  };
+}
+
 async function rouletteView() {
   const d = await api('/fun/roulette');
   const c = d.cfg;
@@ -972,6 +1089,7 @@ const ROUTES = [
   [/^nets$/, netsView],
   [/^net\/(\d+)$/, netView],
   [/^access$/, accessView],
+  [/^seed$/, seedView],
   [/^roulette$/, rouletteView],
   [/^admin\/log$/, adminLogView],
   [/^admin\/errors$/, adminErrorsView],
@@ -1119,6 +1237,7 @@ const ACT = {
 
   async 'nn-doubt'() {
     const box = document.getElementById('clusters');
+    markTab('doubt');
     box.innerHTML = '<div class="muted" style="margin-top:12px">Считаю…</div>';
     const r = await api(`/chat/${curChat()}/nn/doubt`);
     if (!r.items.length) {
@@ -1150,6 +1269,7 @@ const ACT = {
   async 'nn-clusters'(el) {
     const box = document.getElementById('clusters');
     const scope = el.dataset.scope;
+    markTab(scope);
     box.innerHTML = '<div class="muted" style="margin-top:12px">Считаю…</div>';
     const r = await api(`/chat/${curChat()}/nn/clusters?scope=${scope}`);
     if (!r.items.length) {
@@ -1163,11 +1283,12 @@ const ACT = {
         <div class="label"><b>${i + 1}. ${g.size} шт</b>
           <small>${esc(g.words.join(', ') || '—')}</small></div>
         <div class="muted" style="margin:6px 0">${esc(g.sample.slice(0, 160))}</div>
+        <div class="muted" style="margin:6px 0">${clusterState(g)}</div>
         <div class="row">
-          <button class="btn" data-act="nn-label" data-i="${i}" data-label="spam"
-            data-scope="${scope}">⛔ Спам</button>
-          <button class="btn ghost" data-act="nn-label" data-i="${i}" data-label="ok"
-            data-scope="${scope}">🕊 Норма</button>
+          <button class="btn ghost danger" data-act="nn-label" data-i="${i}"
+            data-label="spam" data-scope="${scope}">⛔ Пометить спамом</button>
+          <button class="btn ghost good" data-act="nn-label" data-i="${i}"
+            data-label="ok" data-scope="${scope}">🕊 Пометить нормой</button>
         </div>
       </div>`).join('');
   },
@@ -1425,6 +1546,60 @@ const ACT = {
     if (!v) return;
     await api('/access', { json: { target: v } });
     render();
+  },
+
+  async 'seed-label'(el) {
+    SEED.label = el.dataset.label;
+    SEED.page = 0;
+    await render();
+  },
+
+  async 'seed-page'(el) {
+    SEED.page = Number(el.dataset.page);
+    await render();
+  },
+
+  async 'seed-search'() {
+    const v = await ask({ title: 'Поиск в наборе',
+                          hint: 'Слово или кусок фразы — например docker, ядро, systemd.' });
+    if (v === null) return;
+    SEED.q = v.trim();
+    SEED.page = 0;
+    await render();
+  },
+
+  async 'seed-clearq'() {
+    SEED.q = '';
+    SEED.page = 0;
+    await render();
+  },
+
+  async 'seed-del'(el) {
+    const r = await api('/seed/delete', { json: { ids: [Number(el.dataset.id)] } });
+    toast(`Удалено: ${r.gone}`);
+    await render();
+  },
+
+  async 'seed-wipe'() {
+    const n = (CACHE.seed && CACHE.seed.total) || 0;
+    if (!await confirmAsk(`Удалить ${n} ${num(n, 'пример', 'примера', 'примеров')} `
+                       + `по «${SEED.q}»? Они пропадут у всех чатов.`)) return;
+    const r = await api('/seed/delete', { json: { label: SEED.label, q: SEED.q } });
+    toast(`Удалено: ${r.gone}`);
+    SEED.q = '';
+    SEED.page = 0;
+    await render();
+  },
+
+  async 'seed-clear'() {
+    const n = (CACHE.seed && CACHE.seed.stats.total) || 0;
+    if (!await confirmAsk(`Удалить весь набор — все ${n}? Молодые чаты снова `
+                       + 'останутся без образцов.')) return;
+    const r = await api('/seed/delete', { json: { all: true } });
+    toast(`Удалено: ${r.gone}`);
+    SEED.q = '';
+    SEED.page = 0;
+    await render();
   },
 
   async 'access-del'(el) {

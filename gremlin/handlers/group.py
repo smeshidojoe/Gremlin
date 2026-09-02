@@ -824,7 +824,8 @@ async def on_join(message: Message, bot: Bot) -> None:
             if not user.is_bot and user.id not in admins and user.id not in config.ADMIN_IDS:
                 scopes = await db.wl_scopes_for(message.chat.id, user.id, user.username)
                 if not scopes & {"all", "watch"}:
-                    await watch.check_user(bot, message.chat, user, s)
+                    await watch.check_user(bot, message.chat, user, s,
+                                           event="join")
     if s.captcha_on:
         admins = await adm_cache.chat_admin_ids(bot, message.chat.id)
         for user in message.new_chat_members or []:
@@ -932,6 +933,8 @@ async def moderate(message: Message, bot: Bot) -> None:
         # служебный аккаунт Telegram приносит в обсуждение посты канала —
         # это не человек, и в статистике чата его быть не должно
         await db.msg_inc(chat.id, user.id, user.username, user.first_name)
+        # запоминаем id — если автора забанят, за ним надо будет убрать
+        moderation.remember_message(chat.id, user.id, message.message_id)
 
     # а вот модерировать задним числом не надо — админы уже всё разрулили
     if stale(message):
@@ -1208,10 +1211,18 @@ async def moderate(message: Message, bot: Bot) -> None:
             )
             return
 
+    # Теневой прогон нейрофильтра: вердикт уходит в журнал и никого не трогает.
+    # Стоит после правил, которые удаляют, — интересно именно то, что они
+    # пропустили. Перед наблюдением: его порогам вердикт нужен как сигнал,
+    # а сам он по-прежнему ничего не решает.
+    nn_hit = False
+    if s.nn_mode > 1:
+        nn_hit = await nn.shadow(chat.id, message, s, seen)
+
     # --- наблюдение за профилями (специфичные правила уже отработали) ---
     if s.watch_on and "watch" not in scopes:
         lvl = await trust.level(bot, chat.id, user.id, s) if s.trust_on else None
-        await watch.check_user(bot, chat, user, s, message, lvl)
+        await watch.check_user(bot, chat, user, s, message, lvl, nn_hit=nn_hit)
 
     # Сообщение прошло всю модерацию — изредка берём такое как образец нормы.
     # Без отрицательных примеров сравнивать не с чем: всё будет «похоже на спам».
@@ -1219,11 +1230,6 @@ async def moderate(message: Message, bot: Bot) -> None:
         await db.sample_add(chat.id, user.id, "random", "ok",
                             " ".join(filter(None, [message.text or message.caption or "",
                                                    seen])))
-
-    # Теневой прогон нейрофильтра: вердикт уходит в журнал и никого не трогает.
-    # Стоит после всей модерации — интересно именно то, что правила пропустили.
-    if s.nn_mode > 1:
-        await nn.shadow(chat.id, message, s, seen)
 
     # --- триггеры (последними: на удалённое модерацией не отвечаем) ---
     # игры зовём здесь, а не отдельным хендлером: иначе сообщение с командой

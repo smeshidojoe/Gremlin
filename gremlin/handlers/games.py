@@ -82,8 +82,9 @@ async def _punish(bot: Bot, chat_id: int, user_id: int, kind: str, minutes: int,
                   reason: str) -> bool:
     from ..services import net
     user = await net.user_stub(user_id)
+    # бан в игре — приз, а не борьба со спамом: сообщения проигравшего не трогаем
     pid = await moderation.apply_punishment(bot, chat_id, user, kind, minutes,
-                                            reason, None)
+                                            reason, None, wipe=False)
     if pid is not None:
         await db.add_event(chat_id, "manual", f"игра: {reason} — {user_id}")
     return pid is not None

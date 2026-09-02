@@ -2292,6 +2292,19 @@ async def cas_stats() -> dict:
 # Набор общий на весь бот, поэтому и правит его только владелец бота: удалил
 # пример — он пропал у всех чатов сразу.
 
+def _like_escape(q: str) -> str:
+    """Экранировать спецсимволы LIKE: в поиске это обычные знаки.
+
+    В LIKE «%» значит «что угодно», «_» — «любой один символ». Без экранирования
+    поиск по «%» находил весь набор, и кнопка «удалить найденное» стирала его
+    целиком — мимо отдельного подтверждения на полную очистку. А «док_р» тихо
+    цеплял и «докер», и «докор»: человек удалял не то, что видел.
+    """
+    for ch in ("\\", "%", "_"):
+        q = q.replace(ch, "\\" + ch)
+    return q
+
+
 def _seed_where(label: str | None, q: str | None) -> tuple[str, list]:
     cond = ["chat_id = ?"]
     args: list = [SEED_CHAT]
@@ -2299,8 +2312,8 @@ def _seed_where(label: str | None, q: str | None) -> tuple[str, list]:
         cond.append("label = ?")
         args.append(label)
     if q:
-        cond.append("text LIKE ? COLLATE NOCASE")
-        args.append(f"%{q}%")
+        cond.append("text LIKE ? ESCAPE '\\' COLLATE NOCASE")
+        args.append(f"%{_like_escape(q)}%")
     return " AND ".join(cond), args
 
 

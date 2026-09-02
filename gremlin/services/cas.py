@@ -25,7 +25,20 @@ logger = logging.getLogger("gremlin.cas")
 # когда сервис лёг, не долбим его каждым сообщением
 _fail_until = 0.0
 _session: aiohttp.ClientSession | None = None
-_lock = asyncio.Lock()
+# замок на каждого человека отдельно: общий выстраивал в очередь и запросы про
+# разных людей, и при заходе толпы наблюдение ждало по таймауту на каждого
+_locks: dict[int, asyncio.Lock] = {}
+
+
+def _lock_for(user_id: int) -> asyncio.Lock:
+    lock = _locks.get(user_id)
+    if lock is None:
+        if len(_locks) > 10000:
+            # чистим только свободные: занятый замок сейчас кого-то держит
+            for uid in [u for u, l in _locks.items() if not l.locked()]:
+                del _locks[uid]
+        lock = _locks[user_id] = asyncio.Lock()
+    return lock
 
 
 async def _get_session() -> aiohttp.ClientSession:
@@ -73,7 +86,7 @@ async def listed(user_id: int) -> bool | None:
     cached = await db.cas_get(user_id, config.CAS_TTL_LISTED, config.CAS_TTL_CLEAN)
     if cached is not None:
         return cached
-    async with _lock:
+    async with _lock_for(user_id):
         # пока ждали замок, ответ мог появиться от соседнего сообщения
         cached = await db.cas_get(user_id, config.CAS_TTL_LISTED, config.CAS_TTL_CLEAN)
         if cached is not None:

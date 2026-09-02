@@ -71,8 +71,10 @@ async def spread(bot: Bot, src_chat: int, user, kind: str, mute_min: int,
                 skipped += 1          # уже наказан там же и тем же — не дублируем
                 continue
             from . import moderation
+            # в чужих чатах сетки человек мог ничего и не писать — убирать
+            # там за ним нечего, и лезть в их переписку мы не будем
             pid = await moderation.apply_punishment(
-                bot, cid, user, kind, mute_min, note, by_id
+                bot, cid, user, kind, mute_min, note, by_id, wipe=False
             )
             if pid is None:
                 failed += 1
@@ -177,7 +179,7 @@ async def spread_warn(bot: Bot, src_chat: int, user, reason: str,
             await db.warn_reset(cid, user.id)
             await moderation.apply_punishment(
                 bot, cid, user, s.warns_punish, s.warns_mute_min,
-                f"набрано {s.warns_limit} варнов", by_id,
+                f"набрано {s.warns_limit} варнов", by_id, wipe=False,
             )
         except Exception:
             failed += 1

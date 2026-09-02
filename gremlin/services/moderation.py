@@ -309,14 +309,24 @@ async def wipe_recent(bot: Bot, chat_id: int, user_id: int, keep: int) -> int:
 
 
 async def punish_ex(bot: Bot, chat_id: int, user: User, kind: str, mute_min: int,
-                    reason: str, by_id: int | None) -> tuple[int | None, str | None]:
+                    reason: str, by_id: int | None,
+                    wipe: bool = True) -> tuple[int | None, str | None]:
     """То же, что apply_punishment, но возвращает и текст ошибки Telegram.
 
     Нужен там, где ответ видит живой админ: «не получилось» без причины
     отправляет искать несуществующую проблему с правами.
+
+    wipe=False — не убирать за человеком его сообщения. Так зовут игры и сетка:
+    в игре бан это приз, а не борьба со спамом, и сносить проигравшему живую
+    переписку незачем; в сетке бан расходится по чужим чатам, где человек мог
+    ничего плохого и не писать.
     """
     if kind == "delete":
         return None, None
+    # запоминаем до подмены: мут не-участнику Telegram применить не может и
+    # ниже он превращается в бан. Убирать сообщения за таким «баном» нельзя —
+    # просили-то тишину на десять минут, а не удаление человека из чата
+    wanted_ban = kind == "ban"
     # спрашиваем до наказания: после бана статус всё равно станет «kicked»,
     # и уже не понять, был человек в чате или писал из комментариев
     member = await adm_cache.is_member(bot, chat_id, user.id)
@@ -356,7 +366,7 @@ async def punish_ex(bot: Bot, chat_id: int, user: User, kind: str, mute_min: int
     )
     # за баном убираем то, что человек успел написать: и автоматическим,
     # и выданным рукой — смысл один
-    if kind == "ban":
+    if wanted_ban and wipe:
         s = await db.get_settings(chat_id)
         if s.ban_wipe:
             await wipe_recent(bot, chat_id, user.id, s.ban_wipe)
@@ -364,13 +374,15 @@ async def punish_ex(bot: Bot, chat_id: int, user: User, kind: str, mute_min: int
 
 
 async def apply_punishment(bot: Bot, chat_id: int, user: User, kind: str,
-                           mute_min: int, reason: str, by_id: int | None) -> int | None:
+                           mute_min: int, reason: str, by_id: int | None,
+                           wipe: bool = True) -> int | None:
     """Применить mute/ban к юзеру, записать в базу. Вернуть id наказания (None если delete).
 
     Тонкая обёртка над punish_ex: текст ошибки нужен не всем, а расходиться
     в поведении две копии одного кода рано или поздно начнут.
     """
-    pid, _ = await punish_ex(bot, chat_id, user, kind, mute_min, reason, by_id)
+    pid, _ = await punish_ex(bot, chat_id, user, kind, mute_min, reason, by_id,
+                             wipe=wipe)
     return pid
 
 

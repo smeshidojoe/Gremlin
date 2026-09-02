@@ -1483,7 +1483,10 @@ async def api_seed(request: web.Request) -> web.Response:
     if label not in ("spam", "ok", None):
         label = None
     q = (request.query.get("q") or "").strip() or None
-    page = max(0, int(request.query.get("page") or 0))
+    try:
+        page = max(0, int(request.query.get("page") or 0))
+    except ValueError:
+        raise web.HTTPBadRequest(text="page: нужно число.")
     total = await db.seed_count(label, q)
     rows = await db.seed_page(label, q, page * SEED_PAGE, SEED_PAGE)
     return js({
@@ -1507,7 +1510,11 @@ async def api_seed_delete(request: web.Request) -> web.Response:
         gone = await db.seed_clear()
         what = "набор очищен"
     elif p.get("ids"):
-        gone = await db.seed_delete([int(x) for x in p["ids"]])
+        try:
+            ids = [int(x) for x in p["ids"]]
+        except (TypeError, ValueError):
+            raise web.HTTPBadRequest(text="ids: нужны числа.")
+        gone = await db.seed_delete(ids)
         what = "удалены примеры"
     else:
         label = p.get("label") if p.get("label") in ("spam", "ok") else None

@@ -312,6 +312,7 @@ async def _finish(bot: Bot, chat_id: int, msg_id: int, winner: int, cfg: dict,
                           "full_name": (row["first_name"] if row else None) or str(winner)})()
     pid = await moderation.apply_punishment(
         bot, chat_id, user, cfg["kind"], cfg["minutes"], "победа в бан-рулетке", by_id,
+        wipe=False,          # рулетка — прикол, переписку победителя не трогаем
     )
     dur = utils.fmt_minutes(cfg["minutes"]) if cfg["kind"] == "mute" else "навсегда"
     if pid is None:

@@ -48,6 +48,8 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
                                               "ban_wipe")),
     "cas": ("🌐 Общий список спамеров", ("cas_on", "cas_join", "cas_suspect",
                                         "cas_score")),
+    "prof": ("🪪 Проверка профиля", ("prof_on", "prof_mode", "prof_punish",
+                                     "prof_mute_min", "prof_score")),
     "games": ("🎪 Приколы", ("games_on", "games_adm", "rus_punish", "rus_min",
                "duel_punish", "duel_min", "battle_punish", "battle_min",
                "court_punish", "court_min")),

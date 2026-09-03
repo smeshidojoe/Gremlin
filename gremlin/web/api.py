@@ -289,7 +289,7 @@ async def _widget(cid: int, widget: str, s) -> dict:
                 "phrases": len(await db.phrases_list(cid))}
 
     if widget == "watch_subs":
-        return {"cas_on": bool(s.cas_on)}
+        return {"cas_on": bool(s.cas_on), "prof_on": bool(s.prof_on)}
 
     if widget == "cas_stats":
         st = await db.cas_stats()

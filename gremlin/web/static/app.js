@@ -465,6 +465,7 @@ function widgetHtml(name, w, cid, d) {
 
     case 'watch_subs':
       return `<div class="card">
+        ${tile(`#/chat/${cid}/s/prof`, '🪪 Проверка профиля', { dot: w.prof_on })}
         ${tile(`#/chat/${cid}/s/cas`, '🌐 Общий список спамеров', { dot: w.cas_on })}
       </div>`;
 

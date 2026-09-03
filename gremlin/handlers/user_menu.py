@@ -526,6 +526,8 @@ async def _render_widget(b: InlineKeyboardBuilder, cid: int, widget: str, s) -> 
                    f"u:s:{cid}:burst"))
 
     elif widget == "watch_subs":
+        b.row(_btn(f"{'✅' if s.prof_on else '🚫'} 🪪 Проверка профиля",
+                   f"u:s:{cid}:prof"))
         b.row(_btn(f"{'✅' if s.cas_on else '🚫'} 🌐 Общий список спамеров",
                    f"u:s:{cid}:cas"))
 

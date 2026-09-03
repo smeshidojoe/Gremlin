@@ -135,6 +135,11 @@ CREATE TABLE IF NOT EXISTS settings(
     nn_seed         INTEGER NOT NULL DEFAULT 1,
     watch_nn        INTEGER NOT NULL DEFAULT 0,
     watch_react     INTEGER NOT NULL DEFAULT 0,
+    prof_on         INTEGER NOT NULL DEFAULT 0,
+    prof_mode       TEXT    NOT NULL DEFAULT 'punish',
+    prof_punish     TEXT    NOT NULL DEFAULT 'ban',
+    prof_mute_min   INTEGER NOT NULL DEFAULT 60,
+    prof_score      INTEGER NOT NULL DEFAULT 80,
     cas_on          INTEGER NOT NULL DEFAULT 0,
     cas_join        INTEGER NOT NULL DEFAULT 1,
     cas_suspect     INTEGER NOT NULL DEFAULT 1,
@@ -409,6 +414,11 @@ class Settings:
     nn_seed: int = 1
     watch_nn: int = 0
     watch_react: int = 0
+    prof_on: int = 0
+    prof_mode: str = "punish"
+    prof_punish: str = "ban"
+    prof_mute_min: int = 60
+    prof_score: int = 80
     cas_on: int = 0
     cas_join: int = 1
     cas_suspect: int = 1
@@ -473,6 +483,11 @@ _SETTINGS_MIGRATIONS = {
     "nn_seed": "INTEGER NOT NULL DEFAULT 1",
     "watch_nn": "INTEGER NOT NULL DEFAULT 0",
     "watch_react": "INTEGER NOT NULL DEFAULT 0",
+    "prof_on": "INTEGER NOT NULL DEFAULT 0",
+    "prof_mode": "TEXT NOT NULL DEFAULT 'punish'",
+    "prof_punish": "TEXT NOT NULL DEFAULT 'ban'",
+    "prof_mute_min": "INTEGER NOT NULL DEFAULT 60",
+    "prof_score": "INTEGER NOT NULL DEFAULT 80",
     "cas_on": "INTEGER NOT NULL DEFAULT 0",
     "cas_join": "INTEGER NOT NULL DEFAULT 1",
     "cas_suspect": "INTEGER NOT NULL DEFAULT 1",
@@ -931,8 +946,12 @@ async def get_settings(chat_id: int) -> Settings:
 
 
 async def set_setting(chat_id: int, field: str, value) -> None:
+    # Строку заводим сразу: без неё UPDATE молча не находил чего править, и
+    # настройка «сохранялась» в никуда. В меню это не всплывало — там раздел
+    # сперва читают, а чтение строку и создаёт.
     if field not in _SETTINGS_FIELDS:
         raise ValueError(f"unknown settings field: {field}")
+    await _db.execute("INSERT OR IGNORE INTO settings (chat_id) VALUES (?)", (chat_id,))
     await _db.execute(f"UPDATE settings SET {field} = ? WHERE chat_id = ?", (value, chat_id))
     await _db.commit()
 

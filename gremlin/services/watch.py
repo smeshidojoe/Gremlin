@@ -329,6 +329,82 @@ def profile_sig(first_name: str | None, last_name: str | None, username: str | N
     return f"{first_name or ''}|{last_name or ''}|{username or ''}"
 
 
+async def profile_check(bot, chat_id: int, user, settings) -> tuple[dict, str] | None:
+    """Найти рекламу в описании профиля и прикреплённом канале.
+
+    Возвращает (данные профиля, причина) или None. Причину ищем теми же тремя
+    способами, что и в сообщениях: буквальные стоп-слова, смысловые фразы и
+    сравнение с профилями, за которые в этом чате уже банили. Ничего нового
+    тут не изобретается — меняется только источник текста.
+    """
+    from .. import config
+    from . import filters as flt
+    from . import nn
+    from . import profile as prof_svc
+
+    data = await prof_svc.fetch(bot, user.id)
+    text = prof_svc.text_of(data)
+    if len(text) < 4:
+        return None
+
+    word = await flt.match_stopword(chat_id, text)
+    if word:
+        return data, f"стоп-слово в профиле: «{word}»"
+
+    if settings.sem_on:
+        hit = await nn.match_phrase(chat_id, text, settings.sem_threshold)
+        if hit is not None:
+            phrase, sim = hit
+            return data, f"профиль похож на фразу «{phrase}» ({sim}%)"
+
+    if settings.watch_nn:
+        # сравниваем личность целиком — тем же видом строки, каким и запоминаем
+        sim = await nn.face_score(chat_id, prof_svc.face_text(user, data))
+        if sim is not None and sim >= config.PROFILE_SIM:
+            return data, f"профиль как у забаненных ({sim}%)"
+    return None
+
+
+async def _profile_punish(bot, chat, user, settings, message, data, why) -> bool:
+    """Режим «наказывать»: удалить сообщение и выдать наказание. True — выдали."""
+    from .. import config, db, utils
+    from . import moderation, nn
+
+    kind = settings.prof_punish
+    if message is not None:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+    body = moderation.message_body(message)
+    pid = None
+    if kind != "delete":
+        pid = await moderation.apply_punishment(
+            bot, chat.id, user, kind, settings.prof_mute_min,
+            f"профиль: {why}", None)
+    who = utils.mention(user.id, user.full_name, user.username)
+    from . import profile as prof_svc
+    head = {"delete": "🗑 <b>Удалено (профиль)</b>",
+            "mute": "🔇 <b>Мут (профиль)</b>",
+            "ban": "⛔ <b>Бан (профиль)</b>"}[kind]
+    card = (
+        f"{head} · {utils.esc(chat.title)}\n"
+        f"👤 {who} (<code>{user.id}</code>)\n"
+        f"📎 Причина: {utils.esc(why)}\n"
+        f"{utils.esc(prof_svc.describe(data))}\n"
+        f"🤖 Кем: Gremlin (автомод)" + body
+    )
+    await db.add_event(chat.id, "watch",
+                       f"профиль: {user.full_name} ({user.id}) — {why}")
+    if kind == "ban" and settings.watch_nn:
+        # такой профиль пригодится: следующий похожий узнается сразу
+        await nn.remember_face(chat.id, user.id,
+                               prof_svc.face_text(user, data), "spam")
+    await moderation.send_card(bot, chat.id, config.BIT_WATCH, card, pid,
+                               kind if kind != "delete" else None, user.id)
+    return True
+
+
 async def check_user(bot, chat, user, settings, message=None, lvl=None,
                      event: str = "message", nn_hit: bool = False) -> None:
     """Полный цикл наблюдения: скоринг профиля (+сообщения), бан или карточка.
@@ -363,8 +439,26 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None,
     if settings.cas_on and settings.cas_join and event == "join":
         cas_pts, cas_reasons = await cas_svc.points(user.id, settings)
 
+    # Описание профиля и прикреплённый канал. Спрашиваем не про всех: про
+    # новичка на входе, про того, кто в чате не состоит (комментаторы под
+    # постами — как раз они), и про того, кто уже чем-то насторожил.
+    prof_pts, prof_reasons = 0, []
+    if settings.prof_on:
+        from . import adm_cache
+        worth = (event == "join" or p_hard or p_cos or hard or cosmetic
+                 or cas_pts or nn_hit
+                 or not await adm_cache.is_member(bot, chat.id, user.id))
+        found = await profile_check(bot, chat.id, user, settings) if worth else None
+        if found is not None:
+            data, why = found
+            if settings.prof_mode == "punish":
+                await _profile_punish(bot, chat, user, settings, message, data, why)
+                return
+            prof_pts = int(settings.prof_score)
+            prof_reasons = [why]
+
     # чисто? тогда и в базу лезть незачем — на каждое сообщение это лишний запрос
-    if not (p_hard or p_cos or hard or cosmetic or cas_pts or nn_hit):
+    if not (p_hard or p_cos or hard or cosmetic or cas_pts or nn_hit or prof_pts):
         return
 
     sig = profile_sig(user.first_name, user.last_name, user.username)
@@ -410,6 +504,9 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None,
     if (settings.cas_on and settings.cas_suspect and not cas_pts
             and (total > 0 or nn_hit)):
         cas_pts, cas_reasons = await cas_svc.points(user.id, settings)
+    if prof_pts:
+        total += prof_pts
+        reasons += prof_reasons
     if cas_pts:
         total += cas_pts
         reasons += cas_reasons

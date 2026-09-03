@@ -77,6 +77,24 @@ async def fetch(bot, user_id: int) -> dict | None:
     return data
 
 
+async def photo_bytes(bot, data: dict | None) -> bytes | None:
+    """Скачать аватарку. Байты кладём в тот же кэш: смотреть их будут один раз,
+    но сообщений от человека может прийти несколько подряд."""
+    if not data or not data.get("photo_id"):
+        return None
+    if "photo_raw" in data:
+        return data["photo_raw"]
+    raw = None
+    try:
+        f = await bot.get_file(data["photo_id"])
+        buf = await bot.download_file(f.file_path)
+        raw = buf.read() if hasattr(buf, "read") else bytes(buf)
+    except Exception as e:
+        logger.debug("аватарка не скачалась: %s", e)
+    data["photo_raw"] = raw
+    return raw
+
+
 def text_of(data: dict | None) -> str:
     """Всё текстовое из профиля одной строкой — её и проверяем правилами.
 

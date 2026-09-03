@@ -305,13 +305,23 @@ async function chatView(cid) {
         <div style="margin-top:10px" class="wrap">${overview}</div>
       </div>
 
-      <div class="card">
-        <div class="tiles">
-          ${d.sections.map((s) => tile(`#/chat/${cid}/s/${s.key}`, s.title,
-            s.on === null ? {} : { dot: s.on })).join('')}
-          ${tile(`#/chat/${cid}/games`, '🎪 Приколы', { dot: d.games_on })}
-        </div>
-      </div>
+      ${(d.groups || []).map((g) => {
+        // «Приколы» — не раздел настроек, а своя страница, поэтому
+        // подмешиваем её к развлечениям вручную
+        const own = d.sections.filter((s) => s.group === g.key);
+        const extra = g.key === 'fun'
+          ? tile(`#/chat/${cid}/games`, '🎪 Приколы', { dot: d.games_on }) : '';
+        if (!own.length && !extra) return '';
+        return `<div class="card">
+          <h2>${esc(g.title)}</h2>
+          <div class="intro">${esc(g.hint)}</div>
+          <div class="tiles" style="margin-top:10px">
+            ${own.map((s) => tile(`#/chat/${cid}/s/${s.key}`, s.title,
+              s.on === null ? {} : { dot: s.on })).join('')}
+            ${extra}
+          </div>
+        </div>`;
+      }).join('')}
 
       <div class="card">
         <div class="tiles">

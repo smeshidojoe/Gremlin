@@ -161,6 +161,7 @@ async def api_chat(request: web.Request) -> web.Response:
         if sec.key == "digest" and digest_svc.tracked_chat() != cid:
             continue
         sections.append({"key": sec.key, "title": sec.title,
+                         "group": schema.group_of(sec.key),
                          "on": bool(getattr(s, sec.fields[0].key))
                          if sec.fields and sec.fields[0].kind == "toggle" else None})
 
@@ -181,6 +182,8 @@ async def api_chat(request: web.Request) -> web.Response:
         "overview": [{"key": k, "label": lbl, "on": bool(getattr(s, k))}
                      for k, lbl in schema.OVERVIEW],
         "sections": sections,
+        "groups": [{"key": k, "title": t, "hint": h}
+                   for k, t, h in schema.SECTION_GROUPS],
         "needs_setup": await um.needs_setup(cid, uid),
         "games_on": bool(s.games_on),
     })

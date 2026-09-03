@@ -332,10 +332,14 @@ def profile_sig(first_name: str | None, last_name: str | None, username: str | N
 async def profile_check(bot, chat_id: int, user, settings) -> tuple[dict, str] | None:
     """Найти рекламу в описании профиля и прикреплённом канале.
 
-    Возвращает (данные профиля, причина) или None. Причину ищем теми же тремя
-    способами, что и в сообщениях: буквальные стоп-слова, смысловые фразы и
-    сравнение с профилями, за которые в этом чате уже банили. Ничего нового
-    тут не изобретается — меняется только источник текста.
+    Возвращает (данные профиля, причина) или None. Ищем теми же способами,
+    что и в сообщениях: буквальные стоп-слова, смысловые фразы и сравнение с
+    профилями, за которые в этом чате уже банили. Ничего нового не изобретается
+    — меняется источник текста.
+
+    Последней смотрим аватарку: она считается около секунды, а половина таких
+    аккаунтов в описании вообще ничего не пишет, и фото — единственное, за что
+    можно зацепиться.
     """
     from .. import config
     from . import filters as flt
@@ -343,25 +347,37 @@ async def profile_check(bot, chat_id: int, user, settings) -> tuple[dict, str] |
     from . import profile as prof_svc
 
     data = await prof_svc.fetch(bot, user.id)
-    text = prof_svc.text_of(data)
-    if len(text) < 4:
+    if not data:
         return None
+    text = prof_svc.text_of(data)
 
-    word = await flt.match_stopword(chat_id, text)
-    if word:
-        return data, f"стоп-слово в профиле: «{word}»"
+    if len(text) >= 4:
+        word = await flt.match_stopword(chat_id, text)
+        if word:
+            return data, f"стоп-слово в профиле: «{word}»"
 
-    if settings.sem_on:
-        hit = await nn.match_phrase(chat_id, text, settings.sem_threshold)
-        if hit is not None:
-            phrase, sim = hit
-            return data, f"профиль похож на фразу «{phrase}» ({sim}%)"
+        if settings.sem_on:
+            hit = await nn.match_phrase(chat_id, text, settings.sem_threshold)
+            if hit is not None:
+                phrase, sim = hit
+                return data, f"профиль похож на фразу «{phrase}» ({sim}%)"
 
-    if settings.watch_nn:
+    if settings.watch_nn and len(text) >= 4:
         # сравниваем личность целиком — тем же видом строки, каким и запоминаем
         sim = await nn.face_score(chat_id, prof_svc.face_text(user, data))
         if sim is not None and sim >= config.PROFILE_SIM:
             return data, f"профиль как у забаненных ({sim}%)"
+
+    # Аватарка последней: она считается около секунды, а текстом такие
+    # аккаунты ловятся чаще и дешевле. Зато если в описании пусто, фото
+    # остаётся единственным, за что можно зацепиться.
+    if settings.prof_photo:
+        from . import nsfw
+        raw = await prof_svc.photo_bytes(bot, data)
+        if raw:
+            got = await nsfw.score(raw)
+            if got is not None and got >= settings.prof_photo_min:
+                return data, f"откровенная аватарка ({got}%)"
     return None
 
 
@@ -445,8 +461,11 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None,
     prof_pts, prof_reasons = 0, []
     if settings.prof_on:
         from . import adm_cache
-        worth = (event == "join" or p_hard or p_cos or hard or cosmetic
-                 or cas_pts or nn_hit
+        # реакция — тоже повод: рекламные аккаунты часто ничего не пишут,
+        # а ставят реакцию, чтобы засветиться. Их и так проверяем не чаще
+        # раза в сутки на человека, лишних запросов не будет
+        worth = (event in ("join", "reaction")
+                 or p_hard or p_cos or hard or cosmetic or cas_pts or nn_hit
                  or not await adm_cache.is_member(bot, chat.id, user.id))
         found = await profile_check(bot, chat.id, user, settings) if worth else None
         if found is not None:

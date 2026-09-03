@@ -140,6 +140,8 @@ CREATE TABLE IF NOT EXISTS settings(
     prof_punish     TEXT    NOT NULL DEFAULT 'ban',
     prof_mute_min   INTEGER NOT NULL DEFAULT 60,
     prof_score      INTEGER NOT NULL DEFAULT 80,
+    prof_photo      INTEGER NOT NULL DEFAULT 1,
+    prof_photo_min  INTEGER NOT NULL DEFAULT 85,
     cas_on          INTEGER NOT NULL DEFAULT 0,
     cas_join        INTEGER NOT NULL DEFAULT 1,
     cas_suspect     INTEGER NOT NULL DEFAULT 1,
@@ -419,6 +421,8 @@ class Settings:
     prof_punish: str = "ban"
     prof_mute_min: int = 60
     prof_score: int = 80
+    prof_photo: int = 1
+    prof_photo_min: int = 85
     cas_on: int = 0
     cas_join: int = 1
     cas_suspect: int = 1
@@ -488,6 +492,8 @@ _SETTINGS_MIGRATIONS = {
     "prof_punish": "TEXT NOT NULL DEFAULT 'ban'",
     "prof_mute_min": "INTEGER NOT NULL DEFAULT 60",
     "prof_score": "INTEGER NOT NULL DEFAULT 80",
+    "prof_photo": "INTEGER NOT NULL DEFAULT 1",
+    "prof_photo_min": "INTEGER NOT NULL DEFAULT 85",
     "cas_on": "INTEGER NOT NULL DEFAULT 0",
     "cas_join": "INTEGER NOT NULL DEFAULT 1",
     "cas_suspect": "INTEGER NOT NULL DEFAULT 1",

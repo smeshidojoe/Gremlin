@@ -251,7 +251,11 @@ SECTIONS: list[Section] = [
         "чем-то насторожил.\n"
         "«Что делать» — наказывать сразу или добавить очки наблюдению и "
         "оставить решение порогам. Очки мягче: одна шутка в описании не "
-        "приведёт к бану.",
+        "приведёт к бану.\n"
+        "«Смотреть на аватарку» — половина таких аккаунтов вообще ничего "
+        "не пишет в описании, вся суть у них на фото. Бот распознаёт "
+        "откровенные снимки и считает это такой же находкой. Работает, "
+        "только если владелец бота поставил распознавание картинок.",
         fields=[
             Field("prof_on", "toggle", "Статус"),
             Field("prof_mode", "cycle", "Что делать",
@@ -263,6 +267,10 @@ SECTIONS: list[Section] = [
             Field("prof_score", "cycle", "Очков за находку",
                   list(config.PROFILE_SCORE_PRESETS), fmt="plain",
                   show_if=("prof_mode", "points")),
+            Field("prof_photo", "toggle", "Смотреть на аватарку"),
+            Field("prof_photo_min", "cycle", "Порог откровенности, %",
+                  list(config.NSFW_PRESETS), fmt="plain",
+                  show_if=("prof_photo", 1)),
         ],
         back="watch",
     ),
@@ -517,6 +525,55 @@ SECTIONS: list[Section] = [
         widgets=["logsel", "cardbits"],
     ),
 ]
+
+# Разделов два десятка, и плоским списком в них путаешься. Раскладываем по
+# смыслу: что защищает от спама, что учится, что про людей, что для веселья,
+# что про порядок и отчёты. Группировка живёт здесь, а не в панели, чтобы
+# новый раздел не пришлось прописывать в двух местах.
+SECTION_GROUPS = (
+    ("guard", "🛡 Защита от спама",
+     "Правила, которые удаляют и наказывают за содержимое сообщений."),
+    ("smart", "🧠 Умные проверки",
+     "То, что учится на вашем чате и смотрит не только на текст."),
+    ("people", "👥 Люди и доверие",
+     "Кому что можно и как строго мерить новичков."),
+    ("fun", "🎉 Развлечения и общение",
+     "Всё, что бот делает не ради модерации."),
+    ("order", "🧹 Порядок и отчёты",
+     "Чистота в чате и то, что бот вам рассказывает."),
+)
+
+GROUP_OF = {
+    "inline": "guard", "links": "guard", "anon": "guard", "words": "guard",
+    "flood": "guard",
+
+    "nn": "smart", "watch": "smart", "read": "smart",
+
+    "trust": "people", "captcha": "people", "warns": "people", "wl": "people",
+
+    "welcome": "fun", "triggers": "fun", "cmds": "fun", "rates": "fun",
+
+    "media": "order", "service": "order", "rules": "order", "digest": "order",
+    "cards": "order",
+}
+
+# порядок разделов внутри блока — тот же, что в GROUP_OF
+GROUP_ORDER = {key: i for i, (key, _, _) in enumerate(SECTION_GROUPS)}
+
+
+def group_of(key: str) -> str:
+    return GROUP_OF.get(key, "order")
+
+
+def grouped_sections() -> list[tuple[str, str, str, list]]:
+    """(ключ блока, название, пояснение, разделы) — только верхний уровень."""
+    out = []
+    for key, title, hint in SECTION_GROUPS:
+        items = [s for s in SECTIONS if not s.back and group_of(s.key) == key]
+        if items:
+            out.append((key, title, hint, items))
+    return out
+
 
 SECTION_BY_KEY = {s.key: s for s in SECTIONS}
 

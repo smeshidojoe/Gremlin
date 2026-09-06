@@ -373,6 +373,35 @@ async def punish_ex(bot: Bot, chat_id: int, user: User, kind: str, mute_min: int
     return pid, None
 
 
+async def kick(bot: Bot, chat_id: int, user: User,
+               reason: str, by_id: int | None) -> tuple[int | None, str | None]:
+    """Выгнать из чата без бана. Возвращает (id записи, текст ошибки).
+
+    Отдельного «кика» в Telegram нет: это бан и сразу же разбан. Разбан
+    обязателен, иначе человек не сможет вернуться даже по ссылке.
+
+    Запись в базе гасим сразу: снимать с кика нечего, а висящее «активное
+    наказание» мешало бы и счётчику, и следующему настоящему бану.
+    """
+    member = await adm_cache.is_member(bot, chat_id, user.id)
+    try:
+        await bot.ban_chat_member(chat_id, user.id)
+        await bot.unban_chat_member(chat_id, user.id, only_if_banned=True)
+    except Exception as e:
+        logger.warning("kick failed in %s for %s", chat_id, user.id, exc_info=True)
+        return None, human_error(e)
+    from . import trust
+    trust.invalidate(chat_id, user.id)
+    adm_cache.invalidate_member(chat_id, user.id)
+    pid = await db.add_punishment(
+        chat_id, user.id, user.username, user.full_name, "kick", reason, None,
+        by_id, was_member=member,
+    )
+    await db.deactivate_punishment(pid)
+    # сообщения не убираем: человека попросили выйти, а не вычистили за спамера
+    return pid, None
+
+
 async def apply_punishment(bot: Bot, chat_id: int, user: User, kind: str,
                            mute_min: int, reason: str, by_id: int | None,
                            wipe: bool = True) -> int | None:
@@ -845,5 +874,7 @@ async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
     sent = await send_card(bot, chat.id, feature_bit, card, pid, applied, user.id)
     if applied != "delete":
         from . import net
-        asyncio.create_task(net.spread_and_note(bot, sent, chat.id, user, applied,
-                                                mute_min, reason, None))
+        # в сетку уходит задуманное наказание, а не подменённое здесь: у соседей
+        # свой расклад, и подменённый бан увозил бы туда «навсегда» вместо срока
+        asyncio.create_task(net.spread_and_note(bot, sent, chat.id, user,
+                                                punish_kind, mute_min, reason, None))

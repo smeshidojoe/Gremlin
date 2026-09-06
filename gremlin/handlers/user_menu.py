@@ -14,7 +14,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .. import config, db, runtime, schema, utils
-from ..services import adm_cache, filters as flt, media, nn, resolve, triggers
+from ..services import filters as flt, media, nn, resolve, triggers
 
 logger = logging.getLogger("gremlin.user_menu")
 
@@ -43,6 +43,8 @@ class Input(StatesGroup):
     mass_ban = State()          # ждём список id для массового бана
     phrase = State()            # ждём фразу-образец для смысловых стоп-слов
     seed_q = State()            # ждём слово для поиска по стартовому набору
+    sub_chat = State()          # ждём канал для проверки подписки
+    prof_words = State()        # ждём слова для списка профилей
 
 
 _HOME_TEXT = "<b>🧌 Gremlin</b>\n\nМодерация и мониторинг чатов."
@@ -58,6 +60,7 @@ _ADD_RIGHTS = "delete_messages+restrict_members+invite_users+pin_messages+manage
 _RESERVED_CMDS = {
     "mute", "мут", "ban", "бан", "warn", "варн", "пред", "unwarn", "снятьварн",
     "report", "репорт", "жалоба", "unmute", "размут", "unban", "разбан",
+    "kick", "кик",
 }
 
 
@@ -106,8 +109,9 @@ async def view_chats(bot: Bot, viewer_id: int, page: int = 0) -> tuple[str, Inli
         for c in chunk:
             title = c["title"] or str(c["chat_id"])
             # у обсуждений название канала важнее собственного: чатов может быть
-            # несколько, и по их именам не понять, к чему они прицеплены
-            _, _, linked = await adm_cache.linked_chat(bot, c["chat_id"])
+            # несколько, и по их именам не понять, к чему они прицеплены.
+            # Берём из базы: спрашивать Telegram на каждую строку списка дорого
+            linked = c["linked_title"] if "linked_title" in c.keys() else None
             label = f"{title} · 📣 {linked}" if linked else title
             b.row(_btn(label[:60], f"u:c:{c['chat_id']}"))
     else:
@@ -270,6 +274,7 @@ async def view_chat(cid: int, viewer_id: int) -> tuple[str, InlineKeyboardMarkup
     b.button(text="🔍 Распознавание", callback_data=f"u:s:{cid}:read")
     b.button(text="🧪 Нейрофильтр", callback_data=f"u:s:{cid}:nn")
     b.button(text="🤖 Капча", callback_data=f"u:s:{cid}:captcha")
+    b.button(text="📣 Вход по подписке", callback_data=f"u:s:{cid}:sub")
     b.button(text="🎖 Доверие", callback_data=f"u:s:{cid}:trust")
     b.button(text="⚠️ Варны", callback_data=f"u:s:{cid}:warns")
     b.button(text="🕊 Вайтлист", callback_data=f"u:s:{cid}:wl")
@@ -298,7 +303,7 @@ async def view_chat(cid: int, viewer_id: int) -> tuple[str, InlineKeyboardMarkup
     b.button(text="📥 Перенести настройки", callback_data=f"u:cp:{cid}")
     b.button(text="🚪 Убрать бота из чата", callback_data=f"a:leave:{cid}")
     b.button(text="⬅️ Назад", callback_data="u:chats")
-    b.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1)
+    b.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1)
     return text, b.as_markup()
 
 
@@ -397,6 +402,8 @@ async def view_section(cid: int, sec: str) -> tuple[str, InlineKeyboardMarkup]:
     text = "\n".join(lines).rstrip()
     if sec == "digest":
         text += await asyncio.to_thread(_digest_state)
+    if sec == "sub":
+        text += await _sub_state(cid, s)
 
     # --- кнопки полей: тумблеры отдельными рядами, селекторы рядом ◀ знач ▶ ---
     for f in section.fields:
@@ -463,6 +470,29 @@ async def _render_widget(b: InlineKeyboardBuilder, cid: int, widget: str, s) -> 
         log_str = str(s.log_chat_id) if s.log_chat_id else "не задан"
         b.row(_btn(f"📍 Лог-чат: {log_str}", f"u:logsel:{cid}"))
 
+    elif widget == "prof_words":
+        n = len(await db.words_list(cid, "prof"))
+        b.row(_btn(f"📝 Слова для профилей: {n}", f"u:pw:{cid}:0"))
+
+    elif widget == "sub_chat":
+        b.row(_btn("🔎 Проверить доступ к каналу", f"u:subwhy:{cid}"))
+        # у бота тут нет под рукой, поэтому название берём из своей базы;
+        # незнакомый канал покажем номером — этого хватает, чтобы узнать его
+        if s.sub_chat_id:
+            row = await db.get_chat(s.sub_chat_id)
+            label = (row["title"] if row and row["title"] else str(s.sub_chat_id))
+        else:
+            label = "привязанный к чату"
+        b.row(_btn(f"📣 Канал: {label}", f"u:subch:{cid}"))
+
+    elif widget == "sub_text":
+        # в режиме отказа письма нет, и заготовка к нему тоже ни к чему
+        if s.sub_action == "hold":
+            rows = await db.ans_list("sub", cid)
+            mark = "✏️" if rows else "⚠️"
+            b.row(_btn(f"{mark} Сообщение в личку: {len(rows)}",
+                       f"u:an:{cid}:s:{cid}:0"))
+
     elif widget == "phrases":
         rows = await db.phrases_list(cid)
         b.row(_btn(f"📝 Фразы-образцы: {len(rows)}", f"u:ph:{cid}"))
@@ -515,6 +545,18 @@ async def _render_widget(b: InlineKeyboardBuilder, cid: int, widget: str, s) -> 
         b.row(_btn(f"✏️ Заготовки: {len(rows)}", f"u:an:{cid}:w:{cid}:0"))
         if s.welcome_text and not rows:
             b.row(_btn("⤴️ Перенести старый текст в заготовки", f"u:wmig:{cid}"))
+
+    elif widget == "nn_shadow":
+        import os as _os
+        from ..services import nn as _nn
+        path = _nn.shadow_path(cid)
+        size = _os.path.getsize(path) if _os.path.exists(path) else 0
+        if s.nn_mode > 1:
+            note = (f"📄 Теневой журнал: {size // 1024} КБ" if size
+                    else "📄 Теневой журнал пуст")
+        else:
+            note = "📄 Теневой журнал: режим не включён"
+        b.row(_btn(note, f"u:s:{cid}:nn"))
 
     elif widget == "nn_subs":
         # смысловые фразы и рассылки — тот же нейрофильтр, только с другой
@@ -792,7 +834,9 @@ async def view_wl_entry(cid: int, row_id: int,
 # Ответов у объекта может быть несколько, бот берёт случайный. Владельца в
 # callback пишем одной буквой: t — триггер, c — счётчик (лимит 64 байта).
 
-ANS_OWNER = {"t": "trig", "c": "cmd", "r": "rules", "w": "welcome"}
+ANS_OWNER = {"t": "trig", "c": "cmd", "r": "rules", "w": "welcome",
+             "s": "sub", "p": "paste"}
+# owner совпадает с названием папки медиа — это же и назначение файла
 ANS_LIMIT = 60   # ответов бывает много: списки-рулетки вроде !судимости
 
 
@@ -829,6 +873,10 @@ def _ans_back(cid: int, code: str, oid: int) -> str:
         return f"u:s:{cid}:rules"
     if code == "w":
         return f"u:s:{cid}:welcome"
+    if code == "s":
+        return f"u:s:{cid}:sub"
+    if code == "p":
+        return f"u:games:{cid}"
     return f"u:cmv:{cid}:{oid}"
 
 
@@ -837,13 +885,14 @@ async def view_answers(cid: int, code: str, oid: int,
     owner = ANS_OWNER[code]
     rows = await db.ans_list(owner, oid)
     chunk, page, pages = _page_slice(rows, page)
-    title = {"t": "🎯 Триггер", "r": "📜 Правила",
-             "w": "👋 Приветствие"}.get(code, "🔢 Счётчик")
+    title = {"t": "🎯 Триггер", "r": "📜 Правила", "w": "👋 Приветствие",
+             "s": "📣 Сообщение о подписке",
+             "p": "📜 Ответ на пасты"}.get(code, "🔢 Счётчик")
     lines = [
         f"<b>{title} · варианты ответа</b>\n",
         "Вариантов несколько — бот отвечает случайным. "
         + ("Можно текст, медиа или медиа с подписью."
-           if code in ("t", "r", "w") else "Только текст: число в скобках дописывается само."),
+           if code != "c" else "Только текст: число в скобках дописывается само."),
         f"\nВсего: <b>{len(rows)}</b> из {ANS_LIMIT}"
         + (f" · страница {page + 1} из {pages}" if pages > 1 else ""),
         "",
@@ -959,6 +1008,54 @@ def _word_label(word: str, mode: str) -> str:
     return f"{word}{'*' if mode == 'stem' else ''}"
 
 
+async def view_prof_words(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """Слова, которые ищем в описании профиля.
+
+    Список свой, а не общий с сообщениями: в сообщениях запрещают темы, а в
+    описании то же слово ловит и того, кто тему осуждает. На этом мы уже
+    забанили живого человека за «не переношу темы про изнасилования».
+    """
+    rows = await db.words_list(cid, "prof")
+    pages = max(1, -(-len(rows) // WORDS_PER_PAGE))
+    page = max(0, min(page, pages - 1))
+    start = page * WORDS_PER_PAGE
+    chunk = rows[start:start + WORDS_PER_PAGE]
+
+    lines = [
+        "<b>📝 Слова для профилей</b>\n",
+        "Ищутся в «о себе», названии канала и его описании. Сюда идут "
+        "рекламные метки — «в лс», «онлифанс», «18+», — а не темы разговора: "
+        "в описании они ловят и тех, кто тему осуждает.",
+        f"\nВсего: <b>{len(rows)}</b>"
+        + (f" · страница {page + 1} из {pages}" if pages > 1 else ""),
+        "",
+    ]
+    b = InlineKeyboardBuilder()
+    if not rows:
+        lines.append("Пусто — по словам профиль не проверяется.")
+    for i, r in enumerate(chunk, start + 1):
+        lines.append(f"{i}. <code>{utils.esc(_word_label(r['word'], r['mode']))}</code>")
+
+    row = []
+    for i, r in enumerate(chunk, start + 1):
+        label = _word_label(r["word"], r["mode"])
+        row.append(_btn(f"❌ {i}. {label[:18]}", f"u:pwd:{cid}:{page}:{r['id']}"))
+        if len(row) == 2:
+            b.row(*row)
+            row = []
+    if row:
+        b.row(*row)
+    if pages > 1:
+        b.row(
+            _btn("⬅️", f"u:pw:{cid}:{page - 1 if page else pages - 1}"),
+            _btn(f"{page + 1}/{pages}", f"u:pw:{cid}:{page}"),
+            _btn("➡️", f"u:pw:{cid}:{page + 1 if page + 1 < pages else 0}"),
+        )
+    b.row(_btn("➕ Добавить", f"u:pwa:{cid}"))
+    b.row(_btn("⬅️ Назад", f"u:s:{cid}:prof"))
+    return "\n".join(lines), b.as_markup()
+
+
 async def view_words(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     """Стоп-слова отдельной страницей: в разделе список не помещался.
 
@@ -1070,11 +1167,13 @@ async def view_games(cid: int) -> tuple[str, InlineKeyboardMarkup]:
         "<b>всем</b> или <b>только админам</b>.\n",
     ]
     b = InlineKeyboardBuilder()
+    paste_n = len(await db.ans_list("paste", cid))
     for bit, label, how, about in config.GAME_BITS:
         on = bool(s.games_on & bit)
         adm = bool(s.games_adm & bit)
-        # у титулов команды нет, бот шлёт их сам — выбирать «кому можно» нечего
-        by_hand = bit != config.GAME_TITLES
+        # приз и «кому можно» есть только у того, что зовут командой: титулы
+        # бот публикует сам, ответ на пасту тоже никто не вызывает руками
+        by_hand = bit in config.GAME_FIELDS
         prize_line = ""
         if by_hand:
             kind = getattr(s, config.GAME_FIELDS[bit][0])
@@ -1082,12 +1181,18 @@ async def view_games(cid: int) -> tuple[str, InlineKeyboardMarkup]:
             prize_line = ("бан" if kind == "ban"
                           else f"мут на {utils.fmt_minutes(minutes)}")
             prize_line = f" · приз: <b>{prize_line}</b>"
+        if bit == config.GAME_PASTE:
+            prize_line = f" · от <b>{s.paste_min}</b> знаков"
+            if s.paste_cd:
+                prize_line += f" · не чаще раза в {utils.fmt_minutes(s.paste_cd)}"
         lines.append(
             f"{'✅' if on else '🚫'} <b>{label}</b> · <code>{how}</code>"
             + (" · только админы" if on and adm and by_hand else "")
             + prize_line
             + f"\n<i>{about}</i>\n"
         )
+        if bit == config.GAME_PASTE and on and not paste_n:
+            lines.append("⚠️ Заготовок нет — отвечать нечем, бот промолчит.\n")
         toggle = _btn(f"{'✅' if on else '🚫'} {label}", f"u:gb:{cid}:{bit}")
         if by_hand:
             kind, minutes = getattr(s, config.GAME_FIELDS[bit][0]), \
@@ -1095,6 +1200,13 @@ async def view_games(cid: int) -> tuple[str, InlineKeyboardMarkup]:
             prize = "бан" if kind == "ban" else utils.fmt_minutes(minutes)
             b.row(toggle, _btn("🛡 админы" if adm else "👥 все", f"u:ga:{cid}:{bit}"),
                   _btn(f"🔨 {prize}", f"u:gp:{cid}:{bit}"))
+        elif bit == config.GAME_PASTE:
+            b.row(toggle,
+                  _btn(f"📏 {s.paste_min}", f"u:pl:{cid}"),
+                  _btn("⏰ " + (utils.fmt_minutes(s.paste_cd) if s.paste_cd
+                               else "без паузы"), f"u:pcd:{cid}"))
+            b.row(_btn(f"{'✏️' if paste_n else '⚠️'} Заготовки ответов: {paste_n}",
+                       f"u:an:{cid}:p:{cid}:0"))
         else:
             b.row(toggle)
     b.row(_btn("⬅️ Назад", f"u:c:{cid}"))
@@ -1187,6 +1299,29 @@ async def cb_game_prize_min(cb: CallbackQuery) -> None:
     text, kb = await view_game_prize(cid, bit)
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer()
+
+
+async def _paste_cycle(cb: CallbackQuery, field: str, presets) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    s = await db.get_settings(cid)
+    vals = list(presets)
+    cur = vals.index(getattr(s, field)) if getattr(s, field) in vals else 0
+    await db.set_setting(cid, field, vals[(cur + 1) % len(vals)])
+    text, kb = await view_games(cid)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:pl:"))
+async def cb_paste_min(cb: CallbackQuery) -> None:
+    await _paste_cycle(cb, "paste_min", config.PASTE_MIN_PRESETS)
+
+
+@router.callback_query(F.data.startswith("u:pcd:"))
+async def cb_paste_cd(cb: CallbackQuery) -> None:
+    await _paste_cycle(cb, "paste_cd", config.PASTE_CD_PRESETS)
 
 
 @router.callback_query(F.data.startswith("u:ga:"))
@@ -1655,12 +1790,22 @@ async def view_active(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarku
     b = InlineKeyboardBuilder()
     for i, r in enumerate(rows, start + 1):
         who = r["name"] or await db.user_label(r["user_id"], r["username"])
+        # имя — ссылка на профиль: ник виден по нажатию и не занимает строку
+        who_link = utils.name_link(r["user_id"], utils.chunk(who, 40),
+                                   r["username"])
         until = ("навсегда" if not r["until_ts"]
                  else f"до {utils.fmt_ts(r['until_ts'])}")
+        # дата выдачи нужна не меньше срока: по «навсегда» непонятно, вчера
+        # это было или полгода назад
+        since = f" · выдан {utils.fmt_ts(r['created'])}" if r["created"] else ""
+        # причина без «сетка · чат:» и без приписки про подмену мута: строка
+        # одна, и место в ней нужно самой причине
+        why, swapped = utils.short_reason(r["reason"])
         lines.append(
-            f"{i}. <b>{utils.esc(utils.chunk(who, 40))}</b> — "
-            f"{_KIND_WORD.get(r['kind'], r['kind'])} {until}\n"
-            f"    <i>{utils.esc(utils.chunk(r['reason'] or '—', 60))}</i>"
+            f"{i}. <b>{who_link}</b> — "
+            f"{_KIND_WORD.get(r['kind'], r['kind'])} {until}{since}\n"
+            f"    <i>{utils.esc(utils.chunk(why, 70))}</i>"
+            + (" <i>· мут→бан</i>" if swapped else "")
         )
         b.row(_btn(f"{i}. 🔓 Снять: {utils.chunk(who, 24)}",
                    f"u:pu:{cid}:{r['id']}:{page}"))
@@ -2194,7 +2339,8 @@ async def trig_reply_input(message: Message, state: FSMContext, bot: Bot) -> Non
             )
             return
         # файл скачиваем сразу — триггер не зависит от сохранности этой переписки
-        path = await triggers.save_media(bot, media.file_id, cid, media.kind)
+        path = await triggers.save_media(bot, media.file_id, cid, media.kind,
+                                         "trig")
         await db.trig_add(cid, phrase, message.html_text or None, path, media.kind)
     note = "✅ Триггер добавлен.\n\n"
     if not (await db.get_settings(cid)).trig_on:
@@ -2716,7 +2862,7 @@ async def cb_answer_add(cb: CallbackQuery, state: FSMContext) -> None:
     hint = ("Пришлите текст, медиа или медиа с подписью.\n"
             "Форматирование и премиум-эмодзи сохраняются; вставить премиум-эмодзи "
             "может только человек с Telegram Premium."
-            if code in ("t", "r", "w") else "Пришлите текст ответа. Число в скобках бот допишет сам.")
+            if code != "c" else "Пришлите текст ответа. Число в скобках бот допишет сам.")
     await _ask(
         cb, state, Input.ans_new,
         f"<b>🎲 Новый вариант ответа</b>\n\n{hint}",
@@ -2734,9 +2880,9 @@ async def ans_new_input(message: Message, state: FSMContext, bot: Bot) -> None:
         await _done(message, bot, state, await view_answers(cid, code, oid, 0))
         return
 
-    media = triggers.extract_media(message) if code in ("t", "r", "w") else None
+    media = triggers.extract_media(message) if code != "c" else None
     if media is None and not raw:
-        hint = ("⚠️ Нужен текст или медиа." if code in ("t", "r", "w")
+        hint = ("⚠️ Нужен текст или медиа." if code != "c"
                 else "⚠️ Нужен текст: у счётчиков ответы только текстовые.")
         await _retry(message, bot, state, f"<b>🎲 Новый вариант ответа</b>\n\n{hint}")
         return
@@ -2744,7 +2890,8 @@ async def ans_new_input(message: Message, state: FSMContext, bot: Bot) -> None:
     path = None
     if media is not None:
         try:
-            path = await triggers.save_media(bot, media.file_id, cid, media.kind)
+            path = await triggers.save_media(bot, media.file_id, cid, media.kind,
+                                             ANS_OWNER[code])
         except Exception:
             await _retry(message, bot, state,
                          "<b>🎲 Новый вариант ответа</b>\n\n⚠️ Не смог скачать файл, попробуйте ещё раз.")
@@ -3760,15 +3907,17 @@ async def words_input(message: Message, state: FSMContext, bot: Bot) -> None:
 
 SEED_PER_PAGE = 5
 
-# что человек сейчас смотрит: user_id -> (метка, поисковое слово, страница).
+# что человек сейчас смотрит: user_id -> (метка, поисковое слово, страница, вид).
 # В callback_data это не влезает — там 64 байта, а слово бывает любым.
-_seed_view: dict[int, tuple[str | None, str | None, int]] = {}
+_seed_view: dict[int, tuple[str | None, str | None, int, str]] = {}
 
 _SEED_LABELS = {None: "все", "spam": "⛔ только спам", "ok": "🕊 только норма"}
+# вид улики: сообщения сравниваются с сообщениями, профили с профилями
+_SEED_KINDS = {"msg": "📨 Сообщения", "prof": "🪪 Профили"}
 
 
-def _seed_state(uid: int) -> tuple[str | None, str | None, int]:
-    return _seed_view.get(uid, (None, None, 0))
+def _seed_state(uid: int) -> tuple[str | None, str | None, int, str]:
+    return _seed_view.get(uid, (None, None, 0, "msg"))
 
 
 async def _seed_admin(cb: CallbackQuery) -> bool:
@@ -3782,51 +3931,59 @@ async def _seed_admin(cb: CallbackQuery) -> bool:
 
 async def view_seed(uid: int) -> tuple[str, InlineKeyboardMarkup]:
     """Главный экран набора: сколько чего и что с этим можно сделать."""
-    st = await db.seed_stats()
+    msg = await db.seed_stats("msg")
+    prof = await db.seed_stats("prof")
     vecs = await db.seed_vec_count()
-    label, q, _ = _seed_state(uid)
+    label, q, _page, kind = _seed_state(uid)
 
     lines = [
         "<b>🌱 Стартовый набор</b>\n",
-        "Чужие примеры спама и обычных сообщений. Ими пользуется чат, пока не "
-        f"накопит своих {config.NN_SEED_UNTIL}; дальше набор отключается сам — "
-        "своя норма всегда точнее чужой.",
+        "Чужие примеры, с которых начинает молодой чат. Два вида, и они не "
+        "смешиваются: сообщение сравнивается с сообщениями, профиль с "
+        "профилями.",
         "",
-        "Набор общий: удалили пример здесь — он пропал у всех чатов сразу. "
-        "Смело выкидывайте то, что к вашим чатам отношения не имеет: чужая "
-        "«норма» из чата про Linux в чате про рыбалку только мешает.",
+        "Набор общий: удалили пример здесь — он пропал у всех чатов сразу.",
         "",
-        f"⛔ Спам: <b>{st['spam']}</b>",
-        f"🕊 Норма: <b>{st['ok']}</b>",
-        f"📦 Всего: <b>{st['total']}</b>",
-        f"🧮 Посчитано векторов: <b>{vecs}</b> "
-        f"(в работе {min(config.NN_SEED_LIMIT, st['total'])} — поровну того и другого)",
+        "<b>📨 Сообщения</b>",
+        f"⛔ Спам: <b>{msg['spam']}</b> · 🕊 Норма: <b>{msg['ok']}</b>",
+        f"В работе {min(config.NN_SEED_LIMIT, msg['total'])} — поровну того и "
+        f"другого, и только пока чат не набрал своих {config.NN_SEED_UNTIL}.",
+        "",
+        "<b>🪪 Профили</b>",
+        f"⛔ Спам: <b>{prof['spam']}</b>",
+        f"В работе {min(config.NN_FACE_SEED, prof['spam'])}, не отключаются: "
+        "рекламный профиль одинаков в любом чате.",
+        "",
+        f"🧮 Посчитано векторов: <b>{vecs}</b>",
     ]
     if q:
-        found = await db.seed_count(label, q)
-        lines += ["", f"🔎 Найдено по «<code>{utils.esc(q)}</code>»: <b>{found}</b>"]
+        found = await db.seed_count(label, q, kind)
+        lines += ["", f"🔎 Найдено по «<code>{utils.esc(q)}</code>» среди "
+                      f"{_SEED_KINDS[kind].lower()}: <b>{found}</b>"]
 
     b = InlineKeyboardBuilder()
+    b.row(*[_btn(("• " if kind == k else "") + name, f"u:seedk:{k}")
+            for k, name in _SEED_KINDS.items()])
     b.row(_btn(f"📋 Смотреть: {_SEED_LABELS[label]}", "u:seedl:0"))
     b.row(_btn("🔎 Найти по слову", "u:seedq"))
     if q:
-        b.row(_btn(f"❌ Удалить всё найденное по «{q[:20]}»", "u:seedw"))
+        b.row(_btn(f"❌ Удалить найденное по «{q[:18]}»", "u:seedw"))
         b.row(_btn("✖️ Сбросить поиск", "u:seedr"))
-    b.row(_btn("🧹 Очистить набор целиком", "u:seedx"))
+    b.row(_btn(f"🧹 Очистить: {_SEED_KINDS[kind].lower()}", "u:seedx"))
     b.row(_btn("⬅️ Назад", "u:home"))
     return "\n".join(lines), b.as_markup()
 
 
 async def view_seed_list(uid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     """Постранично сам список: текст примера плюс кнопка «удалить»."""
-    label, q, _ = _seed_state(uid)
-    total = await db.seed_count(label, q)
+    label, q, _page, kind = _seed_state(uid)
+    total = await db.seed_count(label, q, kind)
     pages = max(1, -(-total // SEED_PER_PAGE))
     page = max(0, min(page, pages - 1))
-    _seed_view[uid] = (label, q, page)
-    rows = await db.seed_page(label, q, page * SEED_PER_PAGE, SEED_PER_PAGE)
+    _seed_view[uid] = (label, q, page, kind)
+    rows = await db.seed_page(label, q, page * SEED_PER_PAGE, SEED_PER_PAGE, kind)
 
-    head = f"<b>🌱 Набор</b> · {_SEED_LABELS[label]}"
+    head = f"<b>🌱 Набор</b> · {_SEED_KINDS[kind]} · {_SEED_LABELS[label]}"
     if q:
         head += f" · поиск «{utils.esc(q)}»"
     lines = [head + "\n",
@@ -3849,9 +4006,11 @@ async def view_seed_list(uid: int, page: int = 0) -> tuple[str, InlineKeyboardMa
             _btn(f"{page + 1}/{pages}", f"u:seedl:{page}"),
             _btn("➡️", f"u:seedl:{page + 1 if page + 1 < pages else 0}"),
         )
-    # фильтр по метке: чаще всего выкидывают именно чужую «норму»
-    b.row(*[_btn(("• " if label == key else "") + name, f"u:seedf:{key or 'all'}")
-            for key, name in _SEED_LABELS.items()])
+    # фильтр по метке: чаще всего выкидывают именно чужую «норму».
+    # У профилей «нормы» не бывает, поэтому там фильтр не нужен
+    if kind == "msg":
+        b.row(*[_btn(("• " if label == key else "") + name, f"u:seedf:{key or 'all'}")
+                for key, name in _SEED_LABELS.items()])
     b.row(_btn("⬅️ Назад", "u:seed"))
     return "\n".join(lines), b.as_markup()
 
@@ -3881,14 +4040,28 @@ async def cb_seed_list(cb: CallbackQuery) -> None:
     await cb.answer()
 
 
+@router.callback_query(F.data.startswith("u:seedk:"))
+async def cb_seed_kind(cb: CallbackQuery) -> None:
+    """Переключить вид улик: сообщения или профили."""
+    if not await _seed_admin(cb):
+        return
+    kind = cb.data.split(":")[2]
+    label, q, _p, _k = _seed_state(cb.from_user.id)
+    # у профилей «нормы» не бывает — сбрасываем фильтр, иначе список пуст
+    _seed_view[cb.from_user.id] = (None if kind == "prof" else label, q, 0, kind)
+    text, kb = await view_seed(cb.from_user.id)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer(_SEED_KINDS[kind])
+
+
 @router.callback_query(F.data.startswith("u:seedf:"))
 async def cb_seed_filter(cb: CallbackQuery) -> None:
     if not await _seed_admin(cb):
         return
     key = cb.data.split(":")[2]
     label = None if key == "all" else key
-    _, q, _ = _seed_state(cb.from_user.id)
-    _seed_view[cb.from_user.id] = (label, q, 0)
+    _, q, _p, kind = _seed_state(cb.from_user.id)
+    _seed_view[cb.from_user.id] = (label, q, 0, kind)
     text, kb = await view_seed_list(cb.from_user.id, 0)
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer()
@@ -3904,7 +4077,7 @@ async def cb_seed_delete(cb: CallbackQuery) -> None:
         _seed_changed()
         await db.add_event(None, "nn", f"из набора удалён пример #{sid} "
                                        f"by {cb.from_user.id}")
-    _, _, page = _seed_state(cb.from_user.id)
+    _l, _q, page, _k = _seed_state(cb.from_user.id)
     text, kb = await view_seed_list(cb.from_user.id, page)
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer("Удалено" if gone else "Уже удалено")
@@ -3914,8 +4087,8 @@ async def cb_seed_delete(cb: CallbackQuery) -> None:
 async def cb_seed_reset(cb: CallbackQuery) -> None:
     if not await _seed_admin(cb):
         return
-    label, _, _ = _seed_state(cb.from_user.id)
-    _seed_view[cb.from_user.id] = (label, None, 0)
+    label, _q, _p, kind = _seed_state(cb.from_user.id)
+    _seed_view[cb.from_user.id] = (label, None, 0, kind)
     text, kb = await view_seed(cb.from_user.id)
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer("Поиск сброшен")
@@ -3941,8 +4114,8 @@ async def seed_search_input(message: Message, state: FSMContext, bot: Bot) -> No
     if q == "/cancel" or not q:
         await _done(message, bot, state, await view_seed(uid))
         return
-    label, _, _ = _seed_state(uid)
-    _seed_view[uid] = (label, q, 0)
+    label, _q, _p, kind = _seed_state(uid)
+    _seed_view[uid] = (label, q, 0, kind)
     await _done(message, bot, state, await view_seed_list(uid, 0))
 
 
@@ -3950,11 +4123,11 @@ async def seed_search_input(message: Message, state: FSMContext, bot: Bot) -> No
 async def cb_seed_wipe_ask(cb: CallbackQuery) -> None:
     if not await _seed_admin(cb):
         return
-    label, q, _ = _seed_state(cb.from_user.id)
+    label, q, _p, kind = _seed_state(cb.from_user.id)
     if not q:
         await cb.answer("Сначала найдите что-нибудь.", show_alert=True)
         return
-    found = await db.seed_count(label, q)
+    found = await db.seed_count(label, q, kind)
     b = InlineKeyboardBuilder()
     b.row(_btn(f"❌ Да, удалить {found}", "u:seedwy"))
     b.row(_btn("⬅️ Отмена", "u:seed"))
@@ -3971,13 +4144,13 @@ async def cb_seed_wipe_ask(cb: CallbackQuery) -> None:
 async def cb_seed_wipe(cb: CallbackQuery) -> None:
     if not await _seed_admin(cb):
         return
-    label, q, _ = _seed_state(cb.from_user.id)
-    gone = await db.seed_delete_where(label, q)
+    label, q, _p, kind = _seed_state(cb.from_user.id)
+    gone = await db.seed_delete_where(label, q, kind)
     if gone:
         _seed_changed()
         await db.add_event(None, "nn", f"из набора удалено по «{q}»: {gone} "
                                        f"by {cb.from_user.id}")
-    _seed_view[cb.from_user.id] = (label, None, 0)
+    _seed_view[cb.from_user.id] = (label, None, 0, kind)
     text, kb = await view_seed(cb.from_user.id)
     await cb.message.edit_text(f"✅ Удалено примеров: {gone}.\n\n" + text,
                                reply_markup=kb)
@@ -3988,16 +4161,18 @@ async def cb_seed_wipe(cb: CallbackQuery) -> None:
 async def cb_seed_clear_ask(cb: CallbackQuery) -> None:
     if not await _seed_admin(cb):
         return
-    st = await db.seed_stats()
+    _l, _q, _p, kind = _seed_state(cb.from_user.id)
+    st = await db.seed_stats(kind)
     b = InlineKeyboardBuilder()
     b.row(_btn(f"🧹 Да, удалить все {st['total']}", "u:seedxy"))
     b.row(_btn("⬅️ Отмена", "u:seed"))
     await cb.message.edit_text(
-        f"<b>🧹 Очистить набор</b>\n\nБудут удалены все <b>{st['total']}</b> "
-        "примеров. Молодые чаты снова останутся без образцов и будут молчать, "
-        "пока не накопят своих.\n"
-        "Загрузить набор заново можно только с машины: "
-        "<code>python tools/import_dataset.py файл</code>.",
+        f"<b>🧹 Очистить: {_SEED_KINDS[kind].lower()}</b>\n\nБудут удалены "
+        f"все <b>{st['total']}</b> примеров этого вида. Второй вид останется "
+        "как был.\n"
+        "Загрузить сообщения заново можно с машины "
+        "(<code>python tools/import_dataset.py файл</code>), профили — только "
+        "заново собрать сборщиком.",
         reply_markup=b.as_markup())
     await cb.answer()
 
@@ -4006,12 +4181,199 @@ async def cb_seed_clear_ask(cb: CallbackQuery) -> None:
 async def cb_seed_clear(cb: CallbackQuery) -> None:
     if not await _seed_admin(cb):
         return
-    gone = await db.seed_clear()
+    _l, _q, _p, kind = _seed_state(cb.from_user.id)
+    gone = await db.seed_delete_where(None, None, kind)
     _seed_changed()
-    await db.add_event(None, "nn", f"стартовый набор очищен: {gone} "
+    await db.add_event(None, "nn", f"стартовый набор ({kind}) очищен: {gone} "
                                    f"by {cb.from_user.id}")
-    _seed_view.pop(cb.from_user.id, None)
+    _seed_view[cb.from_user.id] = (None, None, 0, kind)
     text, kb = await view_seed(cb.from_user.id)
     await cb.message.edit_text(f"🧹 Удалено примеров: {gone}.\n\n" + text,
                                reply_markup=kb)
     await cb.answer()
+
+
+# ---------- канал для проверки подписки ----------
+
+@router.callback_query(F.data.startswith("u:subch:"))
+async def cb_sub_channel(cb: CallbackQuery, state: FSMContext) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    await _ask(
+        cb, state, Input.sub_chat,
+        "<b>📣 Канал для проверки подписки</b>\n\n"
+        "Пришлите @юзернейм канала или его id.\n"
+        "Чтобы вернуть привязанный к чату канал, пришлите <code>-</code>.\n\n"
+        "Бот должен быть админом в этом канале — иначе он не сможет спросить, "
+        "подписан ли человек.",
+        f"u:s:{cid}:sub", cid=cid,
+    )
+
+
+@router.message(StateFilter(Input.sub_chat))
+async def sub_chat_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    cid = data["cid"]
+    raw = (message.text or "").strip()
+    if raw == "/cancel":
+        await _done(message, bot, state, await view_section(cid, "sub"))
+        return
+    if raw == "-":
+        await db.set_setting(cid, "sub_chat_id", 0)
+        _forget_sub_access(cid)
+        await _done(message, bot, state, await view_section(cid, "sub"),
+                    "✅ Снова смотрим на привязанный канал.\n\n")
+        return
+
+    target = None
+    if raw.lstrip("-").isdigit():
+        target = int(raw)
+    elif raw.startswith("@") and len(raw) > 2:
+        target = raw
+    if target is None:
+        await _retry(message, bot, state,
+                     "<b>📣 Канал</b>\n\n⚠️ Нужен @юзернейм, id или «-».")
+        return
+    try:
+        ch = await bot.get_chat(target)
+    except Exception as e:
+        await _retry(message, bot, state,
+                     f"<b>📣 Канал</b>\n\n⚠️ Не открылся: {utils.esc(str(e))}\n"
+                     "Проверьте, что бот добавлен в канал администратором.")
+        return
+    if ch.type not in ("channel", "supergroup", "group"):
+        await _retry(message, bot, state,
+                     "<b>📣 Канал</b>\n\n⚠️ Это не канал и не группа.")
+        return
+    await db.set_setting(cid, "sub_chat_id", ch.id)
+    _forget_sub_access(cid)
+    name = utils.esc(ch.title or str(ch.id))
+    await _done(message, bot, state, await view_section(cid, "sub"),
+                f"✅ Канал: {name}\n\n")
+
+
+# ---------- слова для профилей ----------
+
+@router.callback_query(F.data.startswith("u:pw:"))
+async def cb_prof_words(cb: CallbackQuery) -> None:
+    _, _, cid, page = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    text, kb = await view_prof_words(cid, int(page))
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:pwd:"))
+async def cb_prof_word_del(cb: CallbackQuery) -> None:
+    _, _, cid, page, rid = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    await db.words_remove(int(rid))
+    flt.invalidate_words(cid)
+    text, kb = await view_prof_words(cid, int(page))
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer("Удалено")
+
+
+@router.callback_query(F.data.startswith("u:pwa:"))
+async def cb_prof_word_add(cb: CallbackQuery, state: FSMContext) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    await _ask(
+        cb, state, Input.prof_words,
+        "<b>📝 Слова для профилей</b>\n\nПришлите слова через запятую или с "
+        "новой строки.\n<code>слово</code> — точное совпадение, "
+        "<code>слово*</code> — с любыми окончаниями.",
+        f"u:pw:{cid}:0", cid=cid,
+    )
+
+
+@router.message(StateFilter(Input.prof_words))
+async def prof_words_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    cid = data["cid"]
+    if text == "/cancel":
+        await _done(message, bot, state, await view_prof_words(cid, 0))
+        return
+    added, dupes = 0, 0
+    for raw in text.replace("\n", ",").split(","):
+        w = raw.strip().lower()
+        if not w:
+            continue
+        mode = "stem" if w.endswith("*") else "strict"
+        w = w.rstrip("*")
+        if w:
+            if await db.words_add(cid, w, mode, "prof"):
+                added += 1
+            else:
+                dupes += 1
+    if not added and not dupes:
+        await _retry(message, bot, state,
+                     "<b>📝 Слова для профилей</b>\n\n⚠️ Не нашёл ни одного слова.")
+        return
+    flt.invalidate_words(cid)
+    note = f"✅ Добавлено: {added}."
+    if dupes:
+        note += f" Уже были: {dupes}."
+    await _done(message, bot, state, await view_prof_words(cid, 0), note + "\n\n")
+
+
+@router.callback_query(F.data.startswith("u:subwhy:"))
+async def cb_sub_why(cb: CallbackQuery) -> None:
+    """Перепроверить доступ к каналу прямо сейчас."""
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    from ..services import subscribe as sub_svc
+    sub_svc.forget_access(cid)          # спрашиваем заново, а не из кэша
+    await cb.answer("Проверяю…")
+    text, kb = await view_section(cid, "sub")
+    await cb.message.edit_text(text, reply_markup=kb)
+
+
+async def _sub_state(cid: int, s) -> str:
+    """Строка состояния под разделом «Вход по подписке».
+
+    Проверяем доступ бота к каналу прямо при открытии: раньше поломка
+    вылезала только после первой заявки, а до тех пор раздел выглядел
+    работающим.
+    """
+    from ..services import subscribe as sub_svc
+    lines = []
+    bot = runtime.bot()
+    if bot is not None:
+        why, ok = await sub_svc.access_state(bot, cid, s)
+        lines.append(("\n\n✅ " if ok else "\n\n⚠️ ") + utils.esc(why))
+    if s.sub_action == "hold":
+        if not s.sub_dm:
+            lines.append("\n⚠️ «Держать и ждать» без сообщения в личку не "
+                         "работает: человек не узнает, что от него хотят, и "
+                         "заявка просто повиснет.")
+        elif not await db.ans_list("sub", cid):
+            lines.append("\n⚠️ Заготовка сообщения не задана — отправлять "
+                         "нечего, и заявка повиснет молча.")
+    else:
+        lines.append("\n📄 Отказ молчаливый: человек ничего не получит, "
+                     "вам придёт карточка в лог-чат.")
+    if s.sub_pass == "skip":
+        lines.append("\n🙅 Подписанных бот не впускает сам — их заявки висят "
+                     "и ждут вас. Карточку по ним не шлём: заявка и так на виду.")
+    elif s.sub_pass == "button":
+        lines.append("\n🔘 Сам бот заявки не одобряет, но того, кто подписался "
+                     "и нажал «Я подписался» в личке, впустит.")
+        if s.sub_action != "hold" or not s.sub_dm:
+            lines.append("\n⚠️ Кнопка живёт только в сообщении из режима "
+                         "«держать и ждать». Сейчас нажимать нечего, и режим "
+                         "работает как «не трогать».")
+    return "".join(lines)
+
+
+def _forget_sub_access(cid: int) -> None:
+    from ..services import subscribe as sub_svc
+    sub_svc.forget_access(cid)

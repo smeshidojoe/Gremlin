@@ -98,19 +98,28 @@ def link_allowed(link: str, usernames: set[str], chat_ids: set[int]) -> bool:
 # ---------- стоп-слова ----------
 
 # chat_id -> compiled regex | None; сбрасывается при изменении списка
-_word_cache: dict[int, re.Pattern | None] = {}
+# (чат, вид списка) -> готовая регулярка
+_word_cache: dict[tuple[int, str], re.Pattern | None] = {}
 
 
 def invalidate_words(chat_id: int) -> None:
-    _word_cache.pop(chat_id, None)
+    for kind in ("msg", "prof"):
+        _word_cache.pop((chat_id, kind), None)
 
 
-async def match_stopword(chat_id: int, text: str) -> str | None:
-    """Вернуть найденное стоп-слово или None."""
-    if chat_id not in _word_cache:
-        rows = await db.words_list(chat_id)
+async def match_stopword(chat_id: int, text: str,
+                         kind: str = "msg") -> str | None:
+    """Вернуть найденное стоп-слово или None.
+
+    kind='prof' — список для описаний профиля. Он свой не для порядка:
+    словам про темы разговора в описании верить нельзя, там они ловят и тех,
+    кто тему осуждает.
+    """
+    key = (chat_id, kind)
+    if key not in _word_cache:
+        rows = await db.words_list(chat_id, kind)
         if not rows:
-            _word_cache[chat_id] = None
+            _word_cache[key] = None
         else:
             parts = []
             for r in rows:
@@ -119,10 +128,10 @@ async def match_stopword(chat_id: int, text: str) -> str | None:
                     parts.append(rf"{w}\w*")  # слово + любые окончания
                 else:
                     parts.append(w)
-            _word_cache[chat_id] = re.compile(
+            _word_cache[key] = re.compile(
                 r"(?<!\w)(" + "|".join(parts) + r")(?!\w)", re.IGNORECASE | re.UNICODE
             )
-    rx = _word_cache[chat_id]
+    rx = _word_cache[key]
     if rx is None:
         return None
     m = rx.search(text)

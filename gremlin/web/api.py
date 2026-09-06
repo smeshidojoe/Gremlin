@@ -19,8 +19,9 @@ from aiohttp import web
 
 from .. import config, db, schema, utils
 from ..handlers import fun as fun_h, user_menu as um
-from ..services import (adm_cache, cas, digest as digest_svc, filters as flt,
-                        media, moderation, net as net_svc, nn, resolve, transfer)
+from ..services import (cas, digest as digest_svc, filters as flt,
+                        media, moderation, net as net_svc, nn, resolve,
+                        transfer, triggers)
 from . import auth
 
 logger = logging.getLogger("gremlin.web.api")
@@ -87,15 +88,23 @@ def _strip_tags(text: str | None) -> str:
     return re.sub(r"<[^>]+>", "", text or "")
 
 
+def _short_reason(reason: str | None) -> str:
+    """Причина для списка: без «сетка · чат:» и приписки про подмену мута."""
+    why, swapped = utils.short_reason(_strip_tags(reason))
+    return why + (" · мут→бан" if swapped else "")
+
+
 # ---------- главная ----------
 
 async def _chat_brief(bot, row) -> dict:
-    """Строка чата для списка: название плюс канал, к которому он прицеплен."""
+    """Строка чата для списка: название плюс канал, к которому он прицеплен.
+
+    Канал берём из базы. Раньше его спрашивали у Telegram на каждый чат, и
+    открытие панели росло вместе с их числом — до двух запросов на строку.
+    Обновляется он при регистрации чата и сверкой на старте.
+    """
     cid = row["chat_id"]
-    try:
-        _, _, linked = await adm_cache.linked_chat(bot, cid)
-    except Exception:
-        linked = None
+    linked = row["linked_title"] if "linked_title" in row.keys() else None
     return {
         "chat_id": cid,
         "title": row["title"] or str(cid),
@@ -286,6 +295,26 @@ async def _widget(cid: int, widget: str, s) -> dict:
     if widget == "read_stats":
         return {"ocr": media.status(), "asr": media.asr_status(),
                 "asr_url": bool(config.ASR_URL)}
+
+    if widget == "prof_words":
+        return {"count": len(await db.words_list(cid, "prof"))}
+
+    if widget == "sub_chat":
+        title = None
+        if s.sub_chat_id:
+            row = await db.get_chat(s.sub_chat_id)
+            title = row["title"] if row and row["title"] else str(s.sub_chat_id)
+        return {"chat_id": s.sub_chat_id, "title": title}
+
+    if widget == "sub_text":
+        # в режиме отказа письма нет — прячем и заготовку
+        return {"count": len(await db.ans_list("sub", cid)),
+                "shown": s.sub_action == "hold"}
+
+    if widget == "nn_shadow":
+        path = nn.shadow_path(cid)
+        size = os.path.getsize(path) if os.path.exists(path) else 0
+        return {"size": size, "on": s.nn_mode > 1, "path": path}
 
     if widget == "nn_subs":
         return {"sem_on": bool(s.sem_on), "burst_on": bool(s.burst_on),
@@ -485,19 +514,28 @@ async def api_text(request: web.Request) -> web.Response:
 
 # ---------- стоп-слова ----------
 
+def _word_kind(request) -> str:
+    """Какой список правим: слова сообщений или слова профилей."""
+    raw = request.query.get("kind") or ""
+    return "prof" if raw == "prof" else "msg"
+
+
 @routes.get("/api/chat/{cid}/words")
 async def api_words(request: web.Request) -> web.Response:
     cid = await cid_of(request)
+    kind = _word_kind(request)
     return js({"items": [{"id": r["id"], "word": r["word"], "mode": r["mode"],
                           "label": um._word_label(r["word"], r["mode"])}
-                         for r in await db.words_list(cid)]})
+                         for r in await db.words_list(cid, kind)]})
 
 
 @routes.post("/api/chat/{cid}/words")
 async def api_words_add(request: web.Request) -> web.Response:
     """Список через запятую или с новой строки; звёздочка = любые окончания."""
     cid = await cid_of(request)
-    text = (await body(request)).get("text") or ""
+    payload = await body(request)
+    text = payload.get("text") or ""
+    kind = "prof" if payload.get("kind") == "prof" else "msg"
     added = dupes = 0
     for raw in text.replace("\n", ",").split(","):
         w = raw.strip().lower()
@@ -507,7 +545,7 @@ async def api_words_add(request: web.Request) -> web.Response:
         w = w.rstrip("*")
         if not w:
             continue
-        if await db.words_add(cid, w, mode):
+        if await db.words_add(cid, w, mode, kind):
             added += 1
         else:
             dupes += 1
@@ -526,9 +564,10 @@ async def api_words_del(request: web.Request) -> web.Response:
 @routes.post("/api/chat/{cid}/words/clear")
 async def api_words_clear(request: web.Request) -> web.Response:
     cid = await cid_of(request)
-    n = await db.words_clear(cid)
+    n = await db.words_clear(cid, _word_kind(request))
     flt.invalidate_words(cid)
     return js({"removed": n})
+
 
 
 # ---------- вайтлист людей ----------
@@ -816,7 +855,7 @@ async def api_cmd_del(request: web.Request) -> web.Response:
 
 # ---------- варианты ответов (триггеры, счётчики, приветствие, правила) ----------
 
-_ANS_OWNERS = {"trig", "cmd", "welcome", "rules"}
+_ANS_OWNERS = {"trig", "cmd", "welcome", "rules", "sub", "paste"}
 
 
 async def _ans_scope(request) -> tuple[int, str, int]:
@@ -829,7 +868,7 @@ async def _ans_scope(request) -> tuple[int, str, int]:
     oid = int(oid)
     # у приветствия и правил владелец — сам чат; у триггера и счётчика
     # проверяем, что запись принадлежит именно этому чату
-    if owner in ("welcome", "rules"):
+    if owner in ("welcome", "rules", "sub", "paste"):
         if oid != cid:
             raise web.HTTPForbidden(text="not your object")
     else:
@@ -885,10 +924,10 @@ async def api_answer_upload(request: web.Request) -> web.Response:
             if owner not in _ANS_OWNERS or oid is None:
                 raise web.HTTPBadRequest(text="сначала owner и oid")
             kind = _media_kind(part.filename or "")
-            saved = await _save_upload(part, cid, kind)
+            saved = await _save_upload(part, cid, kind, owner)
     if saved is None:
         raise web.HTTPBadRequest(text="Файл не пришёл.")
-    if owner in ("welcome", "rules"):
+    if owner in ("welcome", "rules", "sub"):
         if oid != cid:
             raise web.HTTPForbidden(text="not your object")
     else:
@@ -916,11 +955,11 @@ def _media_kind(filename: str) -> str:
     return "document"
 
 
-async def _save_upload(part, cid: int, kind: str) -> str:
+async def _save_upload(part, cid: int, kind: str, purpose: str = "trig") -> str:
     """Слить файл на диск с потолком по размеру. Возвращает путь."""
-    os.makedirs(config.TRIG_DIR, exist_ok=True)
     ext = os.path.splitext(part.filename or "")[1][:8] or ".bin"
-    path = os.path.join(config.TRIG_DIR, f"{cid}_{int(time.time() * 1000)}{ext}")
+    path = os.path.join(triggers.media_dir(cid, purpose),
+                        f"{int(time.time() * 1000)}{ext}")
     size = 0
     with open(path, "wb") as f:
         while True:
@@ -999,9 +1038,15 @@ async def api_active(request: web.Request) -> web.Response:
         items.append({
             "id": r["id"], "user_id": r["user_id"],
             "who": r["name"] or await db.user_label(r["user_id"], r["username"]),
+            # ник отдаём отдельно: панель вешает его ссылкой на само имя,
+            # чтобы строка не росла вширь
+            "username": r["username"],
+            "link": (f"https://t.me/{r['username']}" if r["username"]
+                     else f"tg://user?id={r['user_id']}"),
             "kind": r["kind"], "kind_label": um._KIND_WORD.get(r["kind"], r["kind"]),
             "until": "навсегда" if not r["until_ts"] else utils.fmt_ts(r["until_ts"]),
-            "reason": _strip_tags(r["reason"]) or "—",
+            "since": utils.fmt_ts(r["created"]) if r["created"] else None,
+            "reason": _short_reason(r["reason"]),
         })
     return js({"items": items})
 
@@ -1150,10 +1195,17 @@ async def api_games(request: web.Request) -> web.Response:
     s = await db.get_settings(cid)
     items = []
     for bit, label, how, about in config.GAME_BITS:
-        by_hand = bit != config.GAME_TITLES
+        by_hand = bit in config.GAME_FIELDS
         item = {"bit": bit, "label": label, "how": how, "about": about,
                 "on": bool(s.games_on & bit), "admins": bool(s.games_adm & bit),
                 "by_hand": by_hand}
+        if bit == config.GAME_PASTE:
+            item["paste"] = True
+            item["min"] = s.paste_min
+            item["cd"] = s.paste_cd
+            item["cd_label"] = (utils.fmt_minutes(s.paste_cd) if s.paste_cd
+                                else "без паузы")
+            item["answers"] = len(await db.ans_list("paste", cid))
         if by_hand:
             kind_field, min_field = config.GAME_FIELDS[bit]
             kind, minutes = getattr(s, kind_field), getattr(s, min_field)
@@ -1163,7 +1215,11 @@ async def api_games(request: web.Request) -> web.Response:
         items.append(item)
     return js({"items": items,
                "mutes": [{"value": m, "label": utils.fmt_minutes(m)}
-                         for m in config.MUTE_PRESETS]})
+                         for m in config.MUTE_PRESETS],
+               "paste_mins": list(config.PASTE_MIN_PRESETS),
+               "paste_cds": [{"value": c,
+                              "label": utils.fmt_minutes(c) if c else "без паузы"}
+                             for c in config.PASTE_CD_PRESETS]})
 
 
 @routes.post("/api/chat/{cid}/games/prize")
@@ -1183,6 +1239,24 @@ async def api_game_prize(request: web.Request) -> web.Response:
         if minutes not in config.MUTE_PRESETS:
             raise web.HTTPBadRequest(text="bad minutes")
         await db.set_setting(cid, min_field, minutes)
+    return js({"ok": True})
+
+
+@routes.post("/api/chat/{cid}/games/paste")
+async def api_game_paste(request: web.Request) -> web.Response:
+    """Порог длины и пауза у ответа на пасты."""
+    cid = await cid_of(request)
+    data = await body(request)
+    if "min" in data:
+        value = int(data["min"])
+        if value not in config.PASTE_MIN_PRESETS:
+            raise web.HTTPBadRequest(text="bad min")
+        await db.set_setting(cid, "paste_min", value)
+    if "cd" in data:
+        value = int(data["cd"])
+        if value not in config.PASTE_CD_PRESETS:
+            raise web.HTTPBadRequest(text="bad cd")
+        await db.set_setting(cid, "paste_cd", value)
     return js({"ok": True})
 
 
@@ -1479,21 +1553,46 @@ async def api_roulette_spin(request: web.Request) -> web.Response:
 SEED_PAGE = 20
 
 
+@routes.post("/api/chat/{cid}/sub-chat")
+async def api_sub_chat(request: web.Request) -> web.Response:
+    """Канал, подписку на который проверяем у входящих."""
+    cid = await cid_of(request)
+    raw = ((await body(request)).get("target") or "").strip()
+    if raw in ("", "-"):
+        await db.set_setting(cid, "sub_chat_id", 0)
+        return js({"ok": True, "chat_id": 0})
+    target = int(raw) if raw.lstrip("-").isdigit() else raw
+    try:
+        ch = await bot_of(request).get_chat(target)
+    except Exception as e:
+        raise web.HTTPBadRequest(
+            text=f"Канал не открылся: {e}. Бот должен быть в нём администратором.")
+    if ch.type not in ("channel", "supergroup", "group"):
+        raise web.HTTPBadRequest(text="Это не канал и не группа.")
+    await db.set_setting(cid, "sub_chat_id", ch.id)
+    return js({"ok": True, "chat_id": ch.id, "title": ch.title})
+
+
 @routes.get("/api/seed")
 async def api_seed(request: web.Request) -> web.Response:
     owner_only(request)
     label = request.query.get("label") or None
     if label not in ("spam", "ok", None):
         label = None
+    kind = "prof" if request.query.get("kind") == "prof" else "msg"
     q = (request.query.get("q") or "").strip() or None
     try:
         page = max(0, int(request.query.get("page") or 0))
     except ValueError:
         raise web.HTTPBadRequest(text="page: нужно число.")
-    total = await db.seed_count(label, q)
-    rows = await db.seed_page(label, q, page * SEED_PAGE, SEED_PAGE)
+    total = await db.seed_count(label, q, kind)
+    rows = await db.seed_page(label, q, page * SEED_PAGE, SEED_PAGE, kind)
     return js({
-        "stats": await db.seed_stats(),
+        "kind": kind,
+        "stats": await db.seed_stats(kind),
+        "msg_stats": await db.seed_stats("msg"),
+        "prof_stats": await db.seed_stats("prof"),
+        "face_seed": config.NN_FACE_SEED,
         "vecs": await db.seed_vec_count(),
         "in_work": config.NN_SEED_LIMIT,
         "until": config.NN_SEED_UNTIL,
@@ -1509,9 +1608,10 @@ async def api_seed(request: web.Request) -> web.Response:
 async def api_seed_delete(request: web.Request) -> web.Response:
     owner_only(request)
     p = await body(request)
+    kind = "prof" if p.get("kind") == "prof" else "msg"
     if p.get("all"):
-        gone = await db.seed_clear()
-        what = "набор очищен"
+        gone = await db.seed_delete_where(None, None, kind)
+        what = f"очищен вид {kind}"
     elif p.get("ids"):
         try:
             ids = [int(x) for x in p["ids"]]
@@ -1524,7 +1624,7 @@ async def api_seed_delete(request: web.Request) -> web.Response:
         q = (p.get("q") or "").strip() or None
         if not label and not q:
             raise web.HTTPBadRequest(text="Нечего удалять: задайте поиск или метку.")
-        gone = await db.seed_delete_where(label, q)
+        gone = await db.seed_delete_where(label, q, kind)
         what = f"удалено по фильтру ({q or label})"
     if gone:
         nn.invalidate()          # набор подмешан всем молодым чатам

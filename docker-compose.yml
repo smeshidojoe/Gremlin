@@ -13,6 +13,9 @@ services:
       DB_PATH: /app/data/gremlin.sqlite3
       LOG_PATH: /app/data/bot.log
       STATS_DB: /app/data/chat_stats.db
+      # медиа заготовок: data/media/<чат>/<назначение>. Старая общая
+      # папка остаётся заданной — из неё файлы переезжают при первом запуске
+      MEDIA_DIR: /app/data/media
       TRIG_DIR: /app/data/triggers
       BACKUP_DIR: /app/data/backups
       TG_SESSION: /app/data/audit_session

@@ -7,7 +7,11 @@ from aiogram import Bot, F, Router
 from aiogram.filters import (
     ADMINISTRATOR, IS_MEMBER, IS_NOT_MEMBER, MEMBER, ChatMemberUpdatedFilter,
 )
-from aiogram.types import ChatMemberUpdated, Message, MessageReactionUpdated
+from aiogram.types import (
+    CallbackQuery, ChatJoinRequest, ChatMemberUpdated, InlineKeyboardButton,
+    Message, MessageReactionUpdated,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .. import config, db, utils
 from ..services import adm_cache, moderation
@@ -63,6 +67,16 @@ async def bot_added(update: ChatMemberUpdated, bot: Bot) -> None:
         if by_admin is not None:
             owner_id, allowed = by_admin, True
     if not allowed:
+        # служебный канал (подписка, лог, привязанный к обсуждению) — не чужой:
+        # его уже назначили в настройках, значит добавляют по делу
+        serves, serves_owner = await db.serves_chat(chat.id)
+        if serves:
+            await db.upsert_chat(chat.id, chat.title, chat.username,
+                                 owner_id or serves_owner, chat.type)
+            logger.info("служебный чат %s (%s) зарегистрирован молча",
+                        chat.id, chat.title)
+            return
+    if not allowed:
         who = (
             utils.mention(adder.id, adder.full_name, adder.username) if adder else "неизвестно"
         )
@@ -86,7 +100,13 @@ async def bot_added(update: ChatMemberUpdated, bot: Bot) -> None:
                 logger.warning("unauthorized-add notice failed for %s", admin_id, exc_info=True)
         return
 
-    await db.upsert_chat(chat.id, chat.title, chat.username, owner_id)
+    await db.upsert_chat(chat.id, chat.title, chat.username, owner_id, chat.type)
+    # привязанный канал спрашиваем один раз здесь — дальше списки берут его
+    # из базы и в Telegram по этому поводу не ходят
+    try:
+        await adm_cache.refresh_linked(bot, chat.id)
+    except Exception:
+        logger.debug("привязанный канал %s не узнали", chat.id, exc_info=True)
     await db.add_event(chat.id, "bot", f"добавлен в чат «{chat.title}» юзером {owner_id}")
     note = ""
     if chat.type == "group":
@@ -412,19 +432,22 @@ async def title_changed(message: Message) -> None:
 # ---------- заявки на вступление ----------
 
 @router.chat_join_request()
-async def join_request(update, bot: Bot) -> None:
-    """Заявку от недавно разбаненного одобряем сами.
+async def join_request(update: ChatJoinRequest, bot: Bot) -> None:
+    """Заявка на вступление. Два разных повода, и оба сюда.
 
-    Чат закрыт: попасть в него можно только по ссылке с подтверждением. Разбан
-    сам по себе туда не возвращает, поэтому вместе со ссылкой в лог-чат кладём
-    «пропуск» на config.UNBAN_PASS_HOURS — по нему заявка проходит без админа.
-    Всем остальным заявку не трогаем: решают админы чата.
+    Первый: человек вернулся после разбана — у него есть «пропуск», и заявку
+    одобряем сами. Второй: проверка подписки на канал. Ни то ни другое не
+    подошло — заявку не трогаем, решают админы чата.
+
+    Обработчик один, потому что aiogram отдаёт обновление первому подошедшему
+    и дальше не идёт: два отдельных просто не работали бы.
     """
     chat_id = update.chat.id
     user = update.from_user
     if await db.get_chat(chat_id) is None:
         return
     if not await moderation.unban_pass_valid(chat_id, user.id):
+        await _sub_join_request(update, bot)
         return
     try:
         await bot.approve_chat_join_request(chat_id, user.id)
@@ -449,3 +472,222 @@ async def join_request(update, bot: Bot) -> None:
             )
         except Exception:
             pass
+
+
+# ---------- вход в чат только по подписке на канал ----------
+
+
+class _Chat:
+    """Заглушка чата для карточки: из callback приходит только id."""
+
+    def __init__(self, chat_id: int, title: str):
+        self.id = chat_id
+        self.title = title
+
+async def _sub_join_request(update: ChatJoinRequest, bot: Bot) -> None:
+    """Пускаем, если человек подписан на канал.
+
+    Молчим и ничего не решаем, когда проверка выключена, канала нет или
+    спросить про подписку не вышло: заявка просто останется висеть, и её
+    разберут админы руками. Закрывать вход всем из-за своей же ошибки в
+    настройках — худшее, что тут можно сделать.
+    """
+    chat, user = update.chat, update.from_user
+    if user is None or user.is_bot:
+        return
+    if not await db.get_chat(chat.id):
+        return
+    s = await db.get_settings(chat.id)
+    if not s.sub_on:
+        return
+
+    from ..services import subscribe as sub
+    target = await sub.target_channel(bot, chat.id, s)
+    if not target:
+        logger.warning("подписка: в чате %s канал не задан и не привязан", chat.id)
+        return
+
+    try:
+        state = await sub.subscribed(bot, target, user.id)
+    except sub.SubError as e:
+        # Настройка сломана: канала нет или бот в нём не админ. Заявку не
+        # трогаем — закрывать вход всем из-за своей же ошибки нельзя, — но и
+        # молчать нельзя: снаружи это выглядит как «функция не работает».
+        await _sub_broken(bot, chat, sub.note_problem(chat.id, str(e)))
+        return
+    sub.clear_problem(chat.id)
+
+    if state:
+        if s.sub_pass != "approve":
+            # чистое сито: бот отсекает неподписанных, а решение по остальным
+            # оставляет админам. Карточку не шлём — заявка и так висит на виду.
+            # «только по кнопке» ведёт себя тут так же: сам бот не впускает,
+            # но оставляет ход человеку, который подписался по нашей просьбе
+            sub.forget(chat.id, user.id)
+            await sub.note_event(chat.id, "подписан", user, "— оставлен админам")
+            return
+        try:
+            await bot.approve_chat_join_request(chat.id, user.id)
+        except Exception as e:
+            logger.warning("заявку %s в %s не одобрить: %s", user.id, chat.id, e)
+            return
+        sub.forget(chat.id, user.id)
+        await sub.note_event(chat.id, "впущен", user, "— подписан")
+        await _sub_card(bot, chat, user, "✅ <b>Впущен по подписке</b>", "")
+        return
+
+    # Заявку можно отозвать и подать заново сколько угодно раз. Решаем по
+    # каждой честно, а вот рассказывать об одном и том же человеке каждый раз
+    # незачем: карточку показываем на первую и на ту, после которой попытки
+    # уже похожи на долбёжку.
+    tries = sub.note_request(chat.id, user.id)
+    loud = sub.card_due(tries)
+    # без разметки: в карточке пояснение проходит через esc()
+    again = ("" if tries < 2 else
+             f"\n🔁 Заявка подряд {tries}-я, о промежуточных не сообщал")
+
+    # не подписан: сперва пишем в личку, потом решаем судьбу заявки —
+    # после отклонения окно на сообщение Telegram закрывает.
+    # В режиме отказа _sub_dm сам ничего не отправит: письмо там ни к чему
+    sent = await _sub_dm(bot, chat, user, update.user_chat_id, target, s) if loud else False
+    if s.sub_action == "hold":
+        sub.remember(chat.id, user.id)
+        note = "заявка ждёт подписки" + ("" if sent else ", но написать в личку не вышло")
+        await sub.note_event(chat.id, "ждёт", user)
+        if loud:
+            await _sub_card(bot, chat, user, "⏳ <b>Заявка ждёт подписки</b>",
+                            note + again)
+        return
+    try:
+        await bot.decline_chat_join_request(chat.id, user.id)
+    except Exception as e:
+        logger.warning("заявку %s в %s не отклонить: %s", user.id, chat.id, e)
+        return
+    await sub.note_event(chat.id, "отклонён", user, "— не подписан")
+    if loud:
+        await _sub_card(bot, chat, user, "🚫 <b>Заявка отклонена</b>",
+                        "не подписан на канал" + again)
+
+
+async def _sub_broken(bot: Bot, chat, why: str) -> None:
+    """Сказать владельцу чата, что проверка подписки сломана. Раз в сутки."""
+    if not sub_warn_due(chat.id):
+        return
+    row = await db.get_chat(chat.id)
+    owner = row["owner_id"] if row else None
+    text = (f"⚠️ <b>Вход по подписке не работает</b> · "
+            f"{utils.esc(chat.title or chat.id)}\n\n"
+            f"{utils.esc(why)}.\n\n"
+            "Заявки я не трогаю — закрывать вход всем из-за неверной настройки "
+            "нельзя. Они висят и ждут вас.\n\n"
+            "Чаще всего лечится так: добавьте бота администратором в канал, "
+            "подписку на который проверяем. Особых прав не нужно — важен сам "
+            "факт, что он админ.")
+    await db.add_event(chat.id, "sub", f"проверка подписки сломана: {why}")
+    for uid in filter(None, {owner, *config.ADMIN_IDS}):
+        try:
+            await bot.send_message(uid, text)
+        except Exception:
+            logger.info("не сказать %s о поломке подписки", uid, exc_info=True)
+
+
+def sub_warn_due(chat_id: int) -> bool:
+    from ..services import subscribe as sub
+    return sub.warn_due(chat_id)
+
+
+async def _sub_dm(bot: Bot, chat, user, user_chat_id: int | None,
+                  target: int, s) -> bool:
+    """Написать человеку, почему не пустили. True — дошло."""
+    # Письмо привязано к режиму ожидания, а не к тумблеру: в режиме отказа
+    # заявки уже нет, кнопка «я подписался» ничего бы не одобрила, и человек
+    # получил бы письмо про действие, которого не существует.
+    if s.sub_action != "hold" or not s.sub_dm or not user_chat_id:
+        return False
+    ans = await db.ans_pick("sub", chat.id)
+    if ans is None:
+        return False
+
+    from ..services import subscribe as sub
+    from ..services import triggers
+    link = await sub.channel_link(bot, target)
+    b = InlineKeyboardBuilder()
+    if link:
+        b.row(InlineKeyboardButton(text="📣 Подписаться", url=link))
+    if s.sub_action == "hold":
+        # кнопка нужна только придержанной заявке: отклонённую одобрять нечего
+        b.row(InlineKeyboardButton(text="✅ Я подписался",
+                                   callback_data=f"sub:chk:{chat.id}"))
+    subs = {"{name}": utils.esc(user.full_name), "{chat}": utils.esc(chat.title or "")}
+    try:
+        await triggers.send_answer_to(bot, user_chat_id, ans, subs,
+                                      b.as_markup() if b.buttons else None)
+        return True
+    except Exception as e:
+        # человек мог закрыть личку — это обычное дело, не ошибка
+        logger.info("не написать в личку %s: %s", user.id, e)
+        return False
+
+
+async def _sub_card(bot: Bot, chat, user, head: str, note: str) -> None:
+    from ..services import moderation
+    who = utils.mention(user.id, user.full_name, user.username)
+    card = (f"{head} · {utils.esc(chat.title or chat.id)}\n"
+            f"👤 {who} (<code>{user.id}</code>)"
+            + (f"\n📎 {utils.esc(note)}" if note else ""))
+    await moderation.send_card(bot, chat.id, config.BIT_SUB, card)
+
+
+@router.callback_query(F.data.startswith("sub:chk:"))
+async def sub_recheck(cb: CallbackQuery, bot: Bot) -> None:
+    """Кнопка «я подписался» под сообщением в личке."""
+    chat_id = int(cb.data.split(":")[2])
+    s = await db.get_settings(chat_id)
+    from ..services import subscribe as sub
+    target = await sub.target_channel(bot, chat_id, s)
+    if not target:
+        await cb.answer("Канал больше не задан — напишите админам чата.",
+                        show_alert=True)
+        return
+
+    try:
+        state = await sub.subscribed(bot, target, cb.from_user.id)
+    except sub.SubError:
+        await cb.answer("Не получилось проверить подписку. Напишите админам "
+                        "чата — у бота нет доступа к каналу.", show_alert=True)
+        return
+    if not state:
+        link = await sub.channel_link(bot, target)
+        await cb.answer(
+            "Подписки пока не видно.\n\nПодпишитесь на канал по кнопке выше"
+            + (f":\n{link}" if link else "")
+            + "\n\nи нажмите эту кнопку ещё раз.", show_alert=True)
+        return
+
+    if s.sub_pass == "skip":
+        # «не трогать» — значит совсем: иначе кнопка была бы дырой в настройке,
+        # ради которой её и включили. Кому нужен обратный случай, ставит
+        # «только по кнопке»: там ход остаётся за человеком
+        await cb.answer("Подписка есть — спасибо! Заявку теперь смотрят админы "
+                        "чата, ждите.", show_alert=True)
+        return
+    if not sub.waiting(chat_id, cb.from_user.id):
+        await cb.answer("Заявка уже не висит — подайте её заново, теперь пустим.",
+                        show_alert=True)
+        return
+    try:
+        await bot.approve_chat_join_request(chat_id, cb.from_user.id)
+    except Exception as e:
+        logger.info("заявку %s в %s не одобрить по кнопке: %s",
+                    cb.from_user.id, chat_id, e)
+        await cb.answer("Заявка не нашлась — подайте её заново, теперь пустим.",
+                        show_alert=True)
+        sub.forget(chat_id, cb.from_user.id)
+        return
+    sub.forget(chat_id, cb.from_user.id)
+    await sub.note_event(chat_id, "впущен", cb.from_user, "— по кнопке")
+    ch = await db.get_chat(chat_id)
+    chat = _Chat(chat_id, ch["title"] if ch else str(chat_id))
+    await _sub_card(bot, chat, cb.from_user, "✅ <b>Впущен по подписке</b>",
+                    "подписался и нажал кнопку")
+    await cb.answer("Готово, вы в чате!", show_alert=True)

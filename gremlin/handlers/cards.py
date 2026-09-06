@@ -59,7 +59,12 @@ async def card_lift(cb: CallbackQuery, bot: Bot) -> None:
         if not moved:
             last = await db.sample_last_for(p["chat_id"], p["user_id"])
             if last is not None:
-                await db.sample_relabel(last["id"], "ok", origin="card")
+                # улику профиля оставляем в её списке: origin='profile' — это
+                # адрес, по которому её ищет сравнение профилей, а не пометка
+                # происхождения. Меняем только оценку
+                keep = last["origin"] == "profile"
+                await db.sample_relabel(last["id"], "ok",
+                                        origin=None if keep else "card")
         from ..services import nn
         nn.invalidate(p["chat_id"])          # профиль изменился
     if p is not None:

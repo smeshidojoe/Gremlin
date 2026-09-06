@@ -298,14 +298,43 @@ def _one_line(text: str, limit: int = 200) -> str:
     return " ".join((text or "").split())[:limit]
 
 
-def _append(line: str) -> None:
-    """Дописать в файл, при переполнении отложив старое в .1.
+def shadow_path(chat_id: int) -> str:
+    """Файл теневых решений этого чата.
+
+    Свой на чат: в общей простыне чаты перемешивались, и «что фильтр наловил
+    здесь за неделю» превращалось в поиск. Имя — по id, название чата меняется
+    и в имени файла только мешало бы.
+    """
+    return os.path.join(config.NN_LOG_DIR, f"{chat_id}.log")
+
+
+def shadow_files() -> list[tuple[int, int]]:
+    """Что уже накопилось: [(chat_id, размер в байтах)] — для меню."""
+    out = []
+    try:
+        for name in os.listdir(config.NN_LOG_DIR):
+            if not name.endswith(".log"):
+                continue
+            try:
+                cid = int(name[:-4])
+            except ValueError:
+                continue
+            out.append((cid, os.path.getsize(
+                os.path.join(config.NN_LOG_DIR, name))))
+    except OSError:
+        return []
+    return sorted(out, key=lambda x: -x[1])
+
+
+def _append(chat_id: int, line: str) -> None:
+    """Дописать в файл чата, при переполнении отложив старое в .1.
 
     Держим ровно одну старую копию: файл нужен, чтобы глазами посмотреть,
     что фильтр наловил за неделю, а не как вечный архив.
     """
-    path = config.NN_LOG
+    path = shadow_path(chat_id)
     try:
+        os.makedirs(config.NN_LOG_DIR, exist_ok=True)
         if os.path.exists(path) and os.path.getsize(path) > config.NN_LOG_MAX:
             os.replace(path, path + ".1")
         with open(path, "a", encoding="utf-8") as f:
@@ -337,7 +366,7 @@ async def log_verdict(chat_id: int, title: str | None, user_id, text: str,
     ]
     if near is not None:
         lines.append(f"    ~ {_one_line(near['text'], 120)}")
-    await asyncio.to_thread(_append, "\n".join(lines) + "\n\n")
+    await asyncio.to_thread(_append, chat_id, "\n".join(lines) + "\n\n")
 
 
 async def shadow(chat_id: int, message, s, extra: str = "") -> bool:
@@ -598,6 +627,10 @@ async def face_score(chat_id: int, name: str) -> int | None:
     if not cached or now - cached[0] > PROFILE_TTL:
         rows = [r for r in await db.samples_of_origin(chat_id, "profile")
                 if r["label"] == "spam"]
+        # Общий набор спам-профилей подмешиваем всегда, а не «пока чат молодой»,
+        # как у текстовых улик. Причина простая: рекламные профили одинаковые
+        # везде, своей нормы у профиля не бывает, и уточнять тут нечего.
+        rows = list(rows) + list(await db.samples_seed_faces(config.NN_FACE_SEED))
         if len(rows) < 5:            # на трёх примерах сравнивать нечего
             _faces[chat_id] = (now, None, [])
             return None

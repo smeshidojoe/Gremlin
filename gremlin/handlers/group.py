@@ -141,6 +141,8 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
         return
 
     mute_min = config.MANUAL_MUTE_DEFAULT      # срок не указали — сутки
+    if kind == "kick":
+        mute_min = 0                           # кик мгновенный, срока у него нет
     if kind == "mute" and parts:
         parsed = utils.parse_duration(parts[0])
         if parsed is not None:
@@ -150,13 +152,22 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
     # текст берём до удаления — он уходит в карточку
     body = moderation.message_body(message.reply_to_message)  # None -> пусто
 
-    pid, err = await moderation.punish_ex(
-        bot, message.chat.id, target, kind, mute_min, reason, message.from_user.id
-    )
+    if kind == "kick":
+        pid, err = await moderation.kick(
+            bot, message.chat.id, target, reason, message.from_user.id)
+    else:
+        pid, err = await moderation.punish_ex(
+            bot, message.chat.id, target, kind, mute_min, reason,
+            message.from_user.id)
     if pid is None:
         await message.reply(f"Не получилось: {utils.esc(err or 'Telegram отказал')}.")
         return
     until = utils.until_ts(mute_min) if kind == "mute" else None
+    # По сетке рассылаем то, о чём просили, а не то, во что это превратилось
+    # здесь: в соседнем чате человек может быть участником, и там мут применим
+    # как есть. Раньше уходил уже подменённый «ban», и вместе с ним терялся
+    # срок — семидневный мут расходился по сетке вечным баном.
+    net_kind = kind
     # мут не-участнику превращается в бан на тот же срок — в карточке должно
     # быть то, что случилось, иначе админ будет искать несуществующий мут
     row = await db.get_punishment(pid)
@@ -165,7 +176,10 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
 
     # В чат ничего не пишем: наказание и так видно в лог-чате, а сообщение
     # нарушителя вместе с командой убираем, чтобы лента осталась чистой.
-    for msg in (message.reply_to_message, message):
+    # Кик — исключение: человека попросили выйти, а написанное им не обязательно
+    # плохое. Убираем только саму команду.
+    doomed = (message,) if kind == "kick" else (message.reply_to_message, message)
+    for msg in doomed:
         if msg is None:
             continue
         try:
@@ -186,15 +200,21 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
             pid=pid,
         )
 
-    bit = config.BIT_BAN if kind == "ban" else config.BIT_MUTE
+    # кик показываем как действие админа: отменять там нечего, и в биты
+    # «баны/муты» он не укладывается
+    bit = {"ban": config.BIT_BAN, "mute": config.BIT_MUTE}.get(kind, config.BIT_ADMIN)
     card = _manual_card_text(
         kind, message.chat.title, target, reason, until, message.from_user, body,
     )
-    sent = await moderation.send_card(bot, message.chat.id, bit, card, pid, kind)
-    asyncio.create_task(net.spread_and_note(
-        bot, sent, message.chat.id, target, kind, mute_min, reason,
-        message.from_user.id,
-    ))
+    sent = await moderation.send_card(bot, message.chat.id, bit, card, pid, kind,
+                                      target.id if kind == "kick" else None)
+    if kind != "kick":
+        # кик по сетке не расходится: выгнать человека из шести чатов за то,
+        # что он мешал в одном, — не то, о чём просили
+        asyncio.create_task(net.spread_and_note(
+            bot, sent, message.chat.id, target, net_kind, mute_min, reason,
+            message.from_user.id,
+        ))
     await db.add_event(
         message.chat.id, "manual",
         f"{kind}: {target.full_name} ({target.id}) — {reason} | by {message.from_user.id}",
@@ -237,6 +257,11 @@ async def _punish_sender_chat(message: Message, bot: Bot, kind: str, reply) -> N
 @router.message(F.text.regexp(r"^!(mute|мут)(\s|$)"))
 async def cmd_mute(message: Message, bot: Bot) -> None:
     await _manual_punish(message, bot, "mute")
+
+
+@router.message(F.text.regexp(r"^!(kick|кик)(\s|$)"))
+async def cmd_kick(message: Message, bot: Bot) -> None:
+    await _manual_punish(message, bot, "kick")
 
 
 @router.message(F.text.regexp(r"^!(ban|бан)(\s|$)"))
@@ -690,6 +715,34 @@ async def fire_games(bot: Bot, message: Message) -> bool:
     return await games.fire_game(bot, message)
 
 
+# когда чат в последний раз получал ответ на пасту: пауза общая на чат
+_paste_fired: dict[int, float] = {}
+
+
+async def fire_paste(bot: Bot, message: Message, s) -> None:
+    """Ответить заготовкой на простыню. Работает для всех, как триггеры."""
+    if (not s.games_on & config.GAME_PASTE or message.edit_date is not None
+            or stale(message)):
+        return
+    body = message.text or message.caption or ""
+    if len(body) < s.paste_min:
+        return
+    now = time.monotonic()
+    if s.paste_cd and now - _paste_fired.get(message.chat.id, 0) < s.paste_cd * 60:
+        return
+    ans = await db.ans_pick("paste", message.chat.id)
+    if ans is None:
+        return          # заготовок нет — молчим, а не отвечаем пустотой
+    _paste_fired[message.chat.id] = now
+    try:
+        await triggers.send_answer(message, ans)
+    except Exception as e:
+        if utils.msg_gone(e):
+            logger.info("паста: отвечать уже некому в %s", message.chat.id)
+        else:
+            logger.warning("паста: не ответить в %s", message.chat.id, exc_info=True)
+
+
 async def fire_trigger(bot: Bot, message: Message, s) -> None:
     """Ответить триггером, если фраза совпала. Работает для всех, включая админов."""
     if not s.trig_on or message.edit_date is not None or stale(message):
@@ -990,12 +1043,14 @@ async def moderate(message: Message, bot: Bot) -> None:
         if await fire_rates(bot, message, s) or await fire_games(bot, message):
             return
         await fire_trigger(bot, message, s)
+        await fire_paste(bot, message, s)
         await fire_counter(bot, message, s)
         return
     if user.id in await adm_cache.chat_admin_ids(bot, chat.id):
         if await fire_games(bot, message):
             return
         await fire_trigger(bot, message, s)
+        await fire_paste(bot, message, s)
         await fire_counter(bot, message, s)
         return
     scopes = await db.wl_scopes_for(chat.id, user.id, user.username)
@@ -1003,6 +1058,7 @@ async def moderate(message: Message, bot: Bot) -> None:
         if await fire_games(bot, message):
             return
         await fire_trigger(bot, message, s)
+        await fire_paste(bot, message, s)
         await fire_counter(bot, message, s)
         return
 
@@ -1237,4 +1293,5 @@ async def moderate(message: Message, bot: Bot) -> None:
     if await fire_rates(bot, message, s) or await fire_games(bot, message):
         return
     await fire_trigger(bot, message, s)
+    await fire_paste(bot, message, s)
     await fire_counter(bot, message, s)

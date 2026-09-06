@@ -168,6 +168,40 @@ def mention(user_id: int, name: str | None, username: str | None = None) -> str:
     return f'<a href="tg://user?id={user_id}">{label}</a>'
 
 
+_NET_PREFIX = re.compile(r"^сетка · [^:]{1,64}: ")
+_SWAP_TAIL = re.compile(r"\s*·\s*мут не-участнику невозможен, заменён баном"
+                        r"(?: на тот же срок)?\s*$")
+
+
+def short_reason(reason: str | None) -> tuple[str, bool]:
+    """Причина без служебных приписок -> (текст, был ли мут подменён баном).
+
+    В списке наказаний строка одна, и половину её съедали «сетка · чат:» и
+    «мут не-участнику невозможен, заменён баном на тот же срок» — от чего
+    наказали, приходилось угадывать по обрезку. Откуда прилетело и как оно
+    применилось, видно в лог-чате; здесь важнее сама причина.
+    """
+    text = (reason or "").strip()
+    text = _NET_PREFIX.sub("", text)
+    swapped = bool(_SWAP_TAIL.search(text))
+    if swapped:
+        text = _SWAP_TAIL.sub("", text)
+    return text.strip() or "—", swapped
+
+
+def name_link(user_id: int, name: str | None, username: str | None = None) -> str:
+    """Имя человека ссылкой на его профиль.
+
+    В списках нужен и ник, и имя, но строкой «Вася @vasya (12345)» список
+    расплывается на два экрана. Поэтому ник прячем в саму ссылку: видно имя,
+    нажатие открывает профиль.
+    """
+    label = html.escape(name or username or str(user_id))
+    href = (f"https://t.me/{html.escape(username)}" if username
+            else f"tg://user?id={user_id}")
+    return f'<a href="{href}">{label}</a>'
+
+
 def plural(n: int, one: str, few: str, many: str) -> str:
     """Русское склонение по числу: 1 чат, 2 чата, 5 чатов."""
     n = abs(n) % 100

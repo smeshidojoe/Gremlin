@@ -329,7 +329,8 @@ def profile_sig(first_name: str | None, last_name: str | None, username: str | N
     return f"{first_name or ''}|{last_name or ''}|{username or ''}"
 
 
-async def profile_check(bot, chat_id: int, user, settings) -> tuple[dict, str] | None:
+async def profile_check(bot, chat_id: int, user, settings,
+                        data: dict | None = None) -> tuple[dict, str] | None:
     """Найти рекламу в описании профиля и прикреплённом канале.
 
     Возвращает (данные профиля, причина) или None. Ищем теми же способами,
@@ -346,21 +347,19 @@ async def profile_check(bot, chat_id: int, user, settings) -> tuple[dict, str] |
     from . import nn
     from . import profile as prof_svc
 
-    data = await prof_svc.fetch(bot, user.id)
+    if data is None:
+        data = await prof_svc.fetch(bot, user.id)
     if not data:
         return None
     text = prof_svc.text_of(data)
 
-    if len(text) >= 4:
-        word = await flt.match_stopword(chat_id, text)
+    # Смысловые фразы к профилю не применяем сознательно: они пишутся под
+    # сообщения, а в описании тот же смысл живёт наоборот — «не переношу
+    # тему X» ловится наравне с тем, кто X продаёт.
+    if len(text) >= 4 and settings.prof_words:
+        word = await flt.match_stopword(chat_id, text, "prof")
         if word:
             return data, f"стоп-слово в профиле: «{word}»"
-
-        if settings.sem_on:
-            hit = await nn.match_phrase(chat_id, text, settings.sem_threshold)
-            if hit is not None:
-                phrase, sim = hit
-                return data, f"профиль похож на фразу «{phrase}» ({sim}%)"
 
     if settings.watch_nn and len(text) >= 4:
         # сравниваем личность целиком — тем же видом строки, каким и запоминаем
@@ -368,17 +367,31 @@ async def profile_check(bot, chat_id: int, user, settings) -> tuple[dict, str] |
         if sim is not None and sim >= config.PROFILE_SIM:
             return data, f"профиль как у забаненных ({sim}%)"
 
-    # Аватарка последней: она считается около секунды, а текстом такие
-    # аккаунты ловятся чаще и дешевле. Зато если в описании пусто, фото
-    # остаётся единственным, за что можно зацепиться.
-    if settings.prof_photo:
-        from . import nsfw
-        raw = await prof_svc.photo_bytes(bot, data)
-        if raw:
-            got = await nsfw.score(raw)
-            if got is not None and got >= settings.prof_photo_min:
-                return data, f"откровенная аватарка ({got}%)"
     return None
+
+
+async def photo_points(bot, chat_id: int, user, settings,
+                       data: dict | None = None) -> tuple[int, list[str]]:
+    """Очки за откровенную аватарку. Наказывать по ней одной нельзя.
+
+    Распознавание путает «эффектно» с «откровенно»: обычный портрет в платье
+    получил 92% и стоил живому человеку бана. При этом сигнал не пустой — у
+    настоящего рекламного аккаунта было 100%, у обычных людей 0-3%. Поэтому
+    фото не решает ничего в одиночку, а складывается с остальным о человеке.
+    """
+    if not settings.prof_on or not settings.prof_photo:
+        return 0, []
+    from . import nsfw
+    from . import profile as prof_svc
+    if data is None:
+        data = await prof_svc.fetch(bot, user.id)
+    raw = await prof_svc.photo_bytes(bot, data)
+    if not raw:
+        return 0, []
+    got = await nsfw.score(raw)
+    if got is None or got < settings.prof_photo_min:
+        return 0, []
+    return int(settings.prof_photo_score), [f"откровенная аватарка ({got}%)"]
 
 
 async def _profile_punish(bot, chat, user, settings, message, data, why) -> bool:
@@ -467,14 +480,31 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None,
         worth = (event in ("join", "reaction")
                  or p_hard or p_cos or hard or cosmetic or cas_pts or nn_hit
                  or not await adm_cache.is_member(bot, chat.id, user.id))
-        found = await profile_check(bot, chat.id, user, settings) if worth else None
-        if found is not None:
-            data, why = found
-            if settings.prof_mode == "punish":
-                await _profile_punish(bot, chat, user, settings, message, data, why)
-                return
-            prof_pts = int(settings.prof_score)
-            prof_reasons = [why]
+        # Своих можно и не трогать. Спам приходит от тех, кто в чат не
+        # вступал — комментаторы под постами канала, — а у старожила
+        # «18+» в описании его же канала это просто его канал.
+        # Новичка на входе проверяем в любом случае: он для того и новичок.
+        if (worth and not settings.prof_members and event != "join"
+                and await adm_cache.is_member(bot, chat.id, user.id)):
+            worth = False
+        if worth:
+            # профиль спрашиваем один раз и отдаём обеим проверкам
+            from . import profile as prof_svc
+            pdata = await prof_svc.fetch(bot, user.id)
+            found = await profile_check(bot, chat.id, user, settings, pdata)
+            if found is not None:
+                data, why = found
+                if settings.prof_mode == "punish":
+                    await _profile_punish(bot, chat, user, settings, message,
+                                          data, why)
+                    return
+                prof_pts = int(settings.prof_score)
+                prof_reasons = [why]
+            # аватарка идёт очками всегда, даже в режиме «наказывать»:
+            # одна она ничего не доказывает
+            pts, why_photo = await photo_points(bot, chat.id, user, settings, pdata)
+            prof_pts += pts
+            prof_reasons += why_photo
 
     # чисто? тогда и в базу лезть незачем — на каждое сообщение это лишний запрос
     if not (p_hard or p_cos or hard or cosmetic or cas_pts or nn_hit or prof_pts):

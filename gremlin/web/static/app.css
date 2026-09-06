@@ -261,3 +261,14 @@ pre.log {
   margin: 0;
   color: var(--text);
 }
+
+/* Заголовок группы владельца: он же кнопка сворачивания. Выглядит строкой,
+   а не кнопкой — это подпись к списку, а не действие над чатами. */
+.fold {
+  display: flex; align-items: center; justify-content: space-between;
+  width: 100%; gap: 8px; margin: 10px 0 4px; padding: 6px 8px;
+  background: color-mix(in srgb, var(--hint) 12%, transparent);
+  border: 0; border-radius: 8px; cursor: pointer;
+  color: var(--text); font: inherit; font-weight: 600; text-align: left;
+}
+.fold:active { opacity: .75; }

@@ -202,7 +202,26 @@ function groupByOwner(items, mineId) {
   return [...byOwner.entries()]
     .sort((a, b) => (a[0] === mine ? -1 : b[0] === mine ? 1
       : a[1].owner.localeCompare(b[1].owner, 'ru')))
-    .map(([, g]) => g);
+    // key — по нему запоминаем, какие группы человек свернул
+    .map(([k, g]) => ({ ...g, key: String(k) }));
+}
+
+/* ---------- свёрнутые группы владельцев ----------
+   У владельца бота в списке чаты нескольких человек, и обычно нужен один.
+   Что свёрнуто, помним между заходами: иначе каждый раз сворачивай заново.
+   Хранилище может быть недоступно (приватное окно, запрет на данные сайтов),
+   поэтому любое обращение к нему — под try. */
+
+const FOLD_KEY = 'gremlin.folded';
+let FOLDED = new Set();
+try {
+  FOLDED = new Set(JSON.parse(localStorage.getItem(FOLD_KEY) || '[]'));
+} catch (e) { /* не запомнили — не беда, покажем всё развёрнутым */ }
+
+function saveFolded() {
+  try {
+    localStorage.setItem(FOLD_KEY, JSON.stringify([...FOLDED]));
+  } catch (e) { /* некуда сохранить — свёрнутое живёт до перезахода */ }
 }
 
 /* ---------- страницы ---------- */
@@ -216,10 +235,19 @@ async function homeView() {
     </button>`;
   // у владельца бота в списке чаты разных людей — группируем по хозяину,
   // иначе список превращается в кашу
-  const chats = d.owner ? groupByOwner(d.chats).map((g) => `
-      <div class="label" style="margin:10px 0 4px">👤 ${esc(g.owner)}
-        <small>${g.items.length} ${num(g.items.length, 'чат', 'чата', 'чатов')}</small></div>
-      <div class="tiles">${g.items.map(tileFor).join('')}</div>`).join('')
+  const groups = d.owner ? groupByOwner(d.chats) : [];
+  const allFolded = groups.length > 0 && groups.every((g) => FOLDED.has(g.key));
+  const chats = d.owner ? `
+    ${groups.length > 1 ? `<button class="btn ghost small" style="margin:4px 0"
+      data-act="fold-all">${allFolded ? '▼ Развернуть все' : '▶ Свернуть все'}</button>` : ''}
+    ${groups.map((g) => {
+      const off = FOLDED.has(g.key);
+      return `<button class="fold" data-act="fold" data-key="${esc(g.key)}">
+          <span>${off ? '▶' : '▼'} 👤 ${esc(g.owner)}</span>
+          <span class="muted">${g.items.length} ${num(g.items.length, 'чат', 'чата', 'чатов')}</span>
+        </button>
+        ${off ? '' : `<div class="tiles">${g.items.map(tileFor).join('')}</div>`}`;
+    }).join('')}`
     : `<div class="tiles">${d.chats.map(tileFor).join('')}</div>`;
 
   const ownerTiles = d.owner ? `
@@ -464,6 +492,43 @@ function widgetHtml(name, w, cid, d) {
           Для сравнения нужно хотя бы ${w.min} улик — пока копим.</div>` : ''}
       </div>`;
 
+    case 'prof_words':
+      return `<div class="card">${linkRow(`#/chat/${cid}/profwords`,
+        '📝 Слова для профилей', w.count)}
+        ${w.count ? '' : `<div class="intro" style="margin-top:8px">Пусто —
+          по словам профиль не проверяется. Список свой, отдельный от стоп-слов
+          чата: в сообщениях запрещают темы, а в описании то же слово ловит и
+          того, кто тему осуждает.</div>`}
+      </div>`;
+
+    case 'sub_chat':
+      return `<div class="card">
+        <div class="row"><div class="label">📣 Канал<small>бот должен быть в нём
+          администратором</small></div>
+          <div class="value">${esc(w.title || 'привязанный к чату')}</div></div>
+        <button class="btn ghost wide" style="margin-top:10px" data-act="sub-chan">
+          Выбрать канал</button>
+      </div>`;
+
+    case 'sub_text':
+      if (!w.shown) return '';
+      return `<div class="card">${linkRow(`#/chat/${cid}/answers/sub/${cid}`,
+        '✉️ Сообщение в личку', w.count || 'не задано')}
+        ${w.count ? '' : `<div class="intro" style="margin-top:8px">Пока не
+          задано — бот ничего не напишет, а «держать и ждать» без этого
+          бессмысленно: человек не узнает, чего от него хотят.</div>`}
+      </div>`;
+
+    case 'nn_shadow':
+      return `<div class="card">
+        <div class="row"><div class="label">📄 Теневой журнал
+          <small>решения фильтра, которые ни на что не влияли</small></div>
+          <div class="value">${w.on ? (w.size ? Math.round(w.size / 1024) + ' КБ' : 'пуст')
+                                    : 'режим не включён'}</div></div>
+        <div class="intro" style="margin-top:8px">Свой файл на чат:
+          <span class="mono">${esc(w.path)}</span></div>
+      </div>`;
+
     case 'nn_subs':
       // смысловые фразы и рассылки — тот же нейрофильтр, другая копилка;
       // отдельными пунктами меню они выглядели как три разных механизма
@@ -564,21 +629,32 @@ function widgetHtml(name, w, cid, d) {
 
 /* --- списки --- */
 
-async function wordsView(cid) {
-  const d = await api(`/chat/${cid}/words`);
+async function profWordsView(cid) {
+  return wordsView(cid, 'prof');
+}
+
+async function wordsView(cid, kind) {
+  const prof = kind === 'prof';
+  const d = await api(`/chat/${cid}/words${prof ? '?kind=prof' : ''}`);
   return {
-    title: 'Стоп-слова',
-    back: `#/chat/${cid}/s/words`,
+    title: prof ? 'Слова для профилей' : 'Стоп-слова',
+    back: `#/chat/${cid}/s/${prof ? 'prof' : 'words'}`,
     html: `<div class="card">
-      <div class="intro">Слово со звёздочкой ловит любые окончания.</div>
+      <div class="intro">${prof
+        ? `Ищутся в «о себе», названии канала и его описании. Сюда идут рекламные
+           метки — «в лс», «онлифанс», «18+», — а не темы разговора: в описании
+           они ловят и тех, кто тему осуждает.`
+        : 'Слово со звёздочкой ловит любые окончания.'}</div>
       <div style="margin-top:10px">
         ${d.items.map((r) => `<div class="item">
           <div class="body mono">${esc(r.label)}</div>
           <button class="x" data-act="word-del" data-id="${r.id}">✕</button></div>`).join('')
           || '<div class="empty">Пусто.</div>'}
       </div>
-      <button class="btn wide" style="margin-top:10px" data-act="words-add">➕ Добавить слова</button>
-      ${d.items.length ? '<button class="btn wide danger" style="margin-top:8px" data-act="words-clear">🗑 Очистить список</button>' : ''}
+      <button class="btn wide" style="margin-top:10px" data-act="words-add"
+        data-kind="${prof ? 'prof' : ''}">➕ Добавить слова</button>
+      ${d.items.length ? `<button class="btn wide danger" style="margin-top:8px"
+        data-act="words-clear" data-kind="${prof ? 'prof' : ''}">🗑 Очистить список</button>` : ''}
     </div>`,
   };
 }
@@ -715,6 +791,7 @@ const ANS_BACK = {
   cmd: (cid, oid) => `#/chat/${cid}/cmd/${oid}`,
   welcome: (cid) => `#/chat/${cid}/s/welcome`,
   rules: (cid) => `#/chat/${cid}/s/rules`,
+  sub: (cid) => `#/chat/${cid}/s/sub`,
 };
 
 async function answersView(cid, owner, oid) {
@@ -767,7 +844,7 @@ async function activeView(cid) {
       <h2>📋 Активные (${d.items.length})</h2>
       <div>
         ${d.items.map((p) => `<div class="item">
-            <div class="body">${esc(p.who)}<small>${esc(p.kind_label)} · ${esc(p.until)} · ${esc(p.reason)}</small></div>
+            <div class="body"><a href="${esc(p.link)}" target="_blank" rel="noopener">${esc(p.who)}</a><small>${esc(p.kind_label)} · ${esc(p.until)}${p.since ? ` · выдан ${esc(p.since)}` : ''} · ${esc(p.reason)}</small></div>
             <button class="btn small ghost" data-act="lift" data-id="${p.id}">🔓 Снять</button>
           </div>`).join('') || '<div class="empty">Все чисты.</div>'}
       </div>
@@ -806,6 +883,12 @@ async function gamesView(cid) {
         <button class="chip" data-act="game-kind" data-bit="${g.bit}">🔨 ${esc(g.kind === 'ban' ? 'бан' : 'мут')}</button>
         ${g.kind === 'mute' ? `<button class="chip" data-act="game-min" data-bit="${g.bit}">⏰ ${esc(g.prize.replace('мут на ', ''))}</button>` : ''}
       </div>` : ''}
+      ${g.paste ? `<div class="wrap" style="margin-top:10px">
+        <button class="chip" data-act="paste-min">📏 от ${g.min} знаков</button>
+        <button class="chip" data-act="paste-cd">⏰ ${esc(g.cd_label)}</button>
+      </div>
+      ${g.on && !g.answers ? '<div class="intro">⚠️ Заготовок нет — отвечать нечем.</div>' : ''}
+      ${linkRow(`#/chat/${cid}/answers/paste/${cid}`, '🎲 Заготовки ответов', g.answers)}` : ''}
     </div>`).join('')}`,
   };
 }
@@ -956,37 +1039,45 @@ async function accessView() {
 // Стартовый набор общий на весь бот: удалили пример — он пропал у всех
 // чатов сразу. Чужая «норма» из чата про Linux в чате про рыбалку только
 // мешает, поэтому смысл страницы — быстро найти лишнее и выкинуть.
-const SEED = { label: '', q: '', page: 0 };
+const SEED = { label: '', q: '', page: 0, kind: 'msg' };
 
 async function seedView() {
-  const p = new URLSearchParams({ label: SEED.label, q: SEED.q, page: SEED.page });
+  const p = new URLSearchParams({ label: SEED.label, q: SEED.q,
+                                  page: SEED.page, kind: SEED.kind });
   const d = await api(`/seed?${p}`);
   CACHE.seed = d;
+  const prof = SEED.kind === 'prof';
   const tab = (key, name) => `<button class="btn ${SEED.label === key ? '' : 'ghost'}"
     data-act="seed-label" data-label="${key}">${name}</button>`;
+  const kindTab = (key, name) => `<button class="btn ${SEED.kind === key ? '' : 'ghost'}"
+    data-act="seed-kind" data-kind="${key}">${name}</button>`;
   return {
     title: 'Стартовый набор',
     back: '#/',
     html: `<div class="card">
-      <div class="intro">Чужие примеры спама и обычных сообщений. Ими пользуется
-        чат, пока не накопит своих ${d.until}; дальше набор отключается сам —
-        своя норма всегда точнее чужой.<br><br>
+      <div class="intro">Чужие примеры, с которых начинает молодой чат. Два вида,
+        и они не смешиваются: сообщение сравнивается с сообщениями, профиль
+        с профилями.<br><br>
         Набор общий: удалили пример здесь — он пропал у всех чатов сразу.</div>
-      <div class="row"><div class="label">⛔ Спам</div>
-        <div class="value">${d.stats.spam}</div></div>
-      <div class="row"><div class="label">🕊 Норма</div>
-        <div class="value">${d.stats.ok}</div></div>
-      <div class="row"><div class="label">📦 Всего</div>
-        <div class="value">${d.stats.total}</div></div>
-      <div class="row"><div class="label">🧮 Посчитано векторов
-        <small>в работе ${Math.min(d.in_work, d.stats.total)}, поровну того и другого</small></div>
+      <div class="row"><div class="label">📨 Сообщения
+        <small>в работе ${Math.min(d.in_work, d.msg_stats.total)}, поровну того и
+        другого, и только пока чат не набрал своих ${d.until}</small></div>
+        <div class="value">⛔ ${d.msg_stats.spam} · 🕊 ${d.msg_stats.ok}</div></div>
+      <div class="row"><div class="label">🪪 Профили
+        <small>в работе ${Math.min(d.face_seed, d.prof_stats.spam)}, не отключаются:
+        рекламный профиль одинаков в любом чате</small></div>
+        <div class="value">⛔ ${d.prof_stats.spam}</div></div>
+      <div class="row"><div class="label">🧮 Посчитано векторов</div>
         <div class="value">${d.vecs}</div></div>
     </div>
 
     <div class="card">
       <div class="row" style="gap:6px">
-        ${tab('', 'Все')}${tab('spam', '⛔ Спам')}${tab('ok', '🕊 Норма')}
+        ${kindTab('msg', '📨 Сообщения')}${kindTab('prof', '🪪 Профили')}
       </div>
+      ${prof ? '' : `<div class="row" style="gap:6px;margin-top:8px">
+        ${tab('', 'Все')}${tab('spam', '⛔ Спам')}${tab('ok', '🕊 Норма')}
+      </div>`}
       <button class="btn ghost wide" style="margin-top:10px" data-act="seed-search">
         🔎 ${SEED.q ? 'Поиск: ' + esc(SEED.q) : 'Найти по слову'}</button>
       ${SEED.q ? `<button class="btn ghost danger wide" style="margin-top:6px"
@@ -1015,9 +1106,10 @@ async function seedView() {
 
     <div class="card">
       <button class="btn ghost danger wide" data-act="seed-clear">
-        🧹 Очистить набор целиком</button>
-      <div class="intro" style="margin-top:8px">Загрузить заново можно только
-        с машины: <span class="mono">python tools/import_dataset.py файл</span></div>
+        🧹 Очистить: ${prof ? 'профили' : 'сообщения'}</button>
+      <div class="intro" style="margin-top:8px">Второй вид останется как был.
+        ${prof ? 'Профили можно только собрать заново сборщиком.'
+               : 'Сообщения грузятся с машины: <span class="mono">python tools/import_dataset.py файл</span>'}</div>
     </div>`,
   };
 }
@@ -1108,6 +1200,7 @@ const ROUTES = [
   [/^chat\/(-?\d+)$/, chatView],
   [/^chat\/(-?\d+)\/s\/(\w+)$/, sectionView],
   [/^chat\/(-?\d+)\/words$/, wordsView],
+  [/^chat\/(-?\d+)\/profwords$/, profWordsView],
   [/^chat\/(-?\d+)\/wl\/(\d+)$/, wlEntryView],
   [/^chat\/(-?\d+)\/linkwl$/, linkwlView],
   [/^chat\/(-?\d+)\/trigs$/, trigsView],
@@ -1211,11 +1304,12 @@ const ACT = {
   },
 
   /* --- списки --- */
-  async 'words-add'() {
-    const v = await ask({ title: 'Стоп-слова', multiline: true,
+  async 'words-add'(el) {
+    const kind = el.dataset.kind || '';
+    const v = await ask({ title: kind ? 'Слова для профилей' : 'Стоп-слова', multiline: true,
       hint: 'Через запятую или с новой строки. <code>слово</code> — точно, <code>слово*</code> — с окончаниями.' });
     if (!v) return;
-    const r = await api(`/chat/${curChat()}/words`, { json: { text: v } });
+    const r = await api(`/chat/${curChat()}/words`, { json: { text: v, kind } });
     toast(`Добавлено: ${r.added}${r.dupes ? ', уже были: ' + r.dupes : ''}`);
     render();
   },
@@ -1225,9 +1319,11 @@ const ACT = {
     render();
   },
 
-  async 'words-clear'() {
-    if (!await confirmAsk('Удалить все стоп-слова?')) return;
-    const r = await api(`/chat/${curChat()}/words/clear`, { json: {} });
+  async 'words-clear'(el) {
+    const kind = el.dataset.kind || '';
+    if (!await confirmAsk(kind ? 'Удалить все слова для профилей?'
+                               : 'Удалить все стоп-слова?')) return;
+    const r = await api(`/chat/${curChat()}/words/clear?kind=${kind}`, { json: {} });
     toast(`Удалено: ${r.removed}`);
     render();
   },
@@ -1473,6 +1569,23 @@ const ACT = {
     render();
   },
 
+  async 'paste-min'() {
+    const d = await api(`/chat/${curChat()}/games`);
+    const v = await pick({ title: 'С какой длины считать пастой',
+      options: d.paste_mins.map((n) => ({ value: n, label: `${n} знаков` })) });
+    if (v === null) return;
+    await api(`/chat/${curChat()}/games/paste`, { json: { min: +v } });
+    render();
+  },
+
+  async 'paste-cd'() {
+    const d = await api(`/chat/${curChat()}/games`);
+    const v = await pick({ title: 'Пауза между ответами', options: d.paste_cds });
+    if (v === null) return;
+    await api(`/chat/${curChat()}/games/paste`, { json: { cd: +v } });
+    render();
+  },
+
   /* --- перенос настроек --- */
   'copy-src'(el) {
     CACHE.copy.src = el.dataset.src;
@@ -1559,6 +1672,41 @@ const ACT = {
     render();
   },
 
+  async 'fold'(el) {
+    const key = el.dataset.key;
+    if (FOLDED.has(key)) FOLDED.delete(key);
+    else FOLDED.add(key);
+    saveFolded();
+    await render();
+  },
+
+  async 'fold-all'() {
+    const groups = groupByOwner(INIT.chats);
+    // свёрнуты все — разворачиваем; иначе сворачиваем всё
+    if (groups.every((g) => FOLDED.has(g.key))) FOLDED.clear();
+    else groups.forEach((g) => FOLDED.add(g.key));
+    saveFolded();
+    await render();
+  },
+
+  async 'sub-chan'() {
+    const v = await ask({ title: 'Канал для подписки',
+                          hint: '@юзернейм или id канала. «-» — вернуть привязанный к чату.' });
+    if (v === null) return;
+    await api(`/chat/${curChat()}/sub-chat`, { json: { target: v.trim() } });
+    toast('Сохранено');
+    await render();
+  },
+
+  async 'seed-kind'(el) {
+    SEED.kind = el.dataset.kind === 'prof' ? 'prof' : 'msg';
+    // у профилей «нормы» не бывает — фильтр по метке сбрасываем,
+    // иначе список окажется пустым без видимой причины
+    if (SEED.kind === 'prof') SEED.label = '';
+    SEED.page = 0;
+    await render();
+  },
+
   async 'seed-label'(el) {
     SEED.label = el.dataset.label;
     SEED.page = 0;
@@ -1586,7 +1734,7 @@ const ACT = {
   },
 
   async 'seed-del'(el) {
-    const r = await api('/seed/delete', { json: { ids: [Number(el.dataset.id)] } });
+    const r = await api('/seed/delete', { json: { ids: [Number(el.dataset.id)], kind: SEED.kind } });
     toast(`Удалено: ${r.gone}`);
     await render();
   },
@@ -1595,7 +1743,8 @@ const ACT = {
     const n = (CACHE.seed && CACHE.seed.total) || 0;
     if (!await confirmAsk(`Удалить ${n} ${num(n, 'пример', 'примера', 'примеров')} `
                        + `по «${SEED.q}»? Они пропадут у всех чатов.`)) return;
-    const r = await api('/seed/delete', { json: { label: SEED.label, q: SEED.q } });
+    const r = await api('/seed/delete',
+                        { json: { label: SEED.label, q: SEED.q, kind: SEED.kind } });
     toast(`Удалено: ${r.gone}`);
     SEED.q = '';
     SEED.page = 0;
@@ -1604,9 +1753,9 @@ const ACT = {
 
   async 'seed-clear'() {
     const n = (CACHE.seed && CACHE.seed.stats.total) || 0;
-    if (!await confirmAsk(`Удалить весь набор — все ${n}? Молодые чаты снова `
-                       + 'останутся без образцов.')) return;
-    const r = await api('/seed/delete', { json: { all: true } });
+    const what = SEED.kind === 'prof' ? 'профилей' : 'сообщений';
+    if (!await confirmAsk(`Удалить все ${n} ${what}? Второй вид останется.`)) return;
+    const r = await api('/seed/delete', { json: { all: true, kind: SEED.kind } });
     toast(`Удалено: ${r.gone}`);
     SEED.q = '';
     SEED.page = 0;

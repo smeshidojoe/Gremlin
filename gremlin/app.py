@@ -1,6 +1,7 @@
 """Сборка и запуск бота."""
 import asyncio
 import logging
+import time
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -9,9 +10,10 @@ from aiogram.types import (ErrorEvent, MenuButtonCommands, MenuButtonWebApp,
                            WebAppInfo)
 
 from . import config, db, runtime, userbot
-from .handlers import admin_menu, cards, events, fun, games, group, user_menu
+from .handlers import (admin_menu, cards, events, fun, games, group,
+                       spam_bot, user_menu)
 from .middlewares import TrackingMiddleware
-from .services import backup, cas, digest, errorlog, moderation, nn
+from .services import backup, cas, digest, errorlog, moderation, nn, triggers
 
 logger = logging.getLogger("gremlin")
 
@@ -57,6 +59,44 @@ async def _menu_button(bot: Bot, url: str | None) -> None:
         logger.warning("не выставить кнопку меню", exc_info=True)
 
 
+async def _fix_net_terms(bot: Bot) -> None:
+    """Вернуть срок копиям наказаний, уехавшим по сетке вечным баном.
+
+    Правим не только базу, но и сам Telegram: там человек забанен навсегда,
+    и без повторного banChatMember с until_date он таким и останется. У кого
+    срок уже вышел — снимаем бан: именно это и должно было произойти само.
+    """
+    if await db.kv_get(db.NET_TERMS_KEY):
+        return
+    rows = await db.net_terms_to_fix()
+    now = int(time.time())
+    fixed = lifted = 0
+    for r in rows:
+        pid, cid, uid, until = r["id"], r["chat_id"], r["user_id"], r["until_ts"]
+        try:
+            if until > now + 60:
+                await bot.ban_chat_member(cid, uid, until_date=until)
+                await db.set_until(pid, until)
+                fixed += 1
+            else:
+                # срок вышел ещё до починки — держать человека забаненным не за что
+                await bot.unban_chat_member(cid, uid, only_if_banned=True)
+                await db.deactivate_punishment(pid)
+                lifted += 1
+        except Exception:
+            logger.warning("срок наказания %s в %s не поправить", pid, cid,
+                           exc_info=True)
+            continue
+        await db.add_event(cid, "manual",
+                           f"починка сетки: {r['name']} ({uid}) — "
+                           + ("срок восстановлен" if until > now + 60
+                              else "срок вышел, бан снят"))
+    await db.kv_set(db.NET_TERMS_KEY, "1")
+    if fixed or lifted:
+        logger.info("сроки копий по сетке: восстановлено %d, снято %d",
+                    fixed, lifted)
+
+
 async def main() -> None:
     _setup_logging()
     if not config.BOT_TOKEN:
@@ -68,6 +108,7 @@ async def main() -> None:
         # превью ссылок не нужно нигде: ни в меню, ни в карточках, ни в ответах
         link_preview_is_disabled=True,
     ))
+    runtime.set_bot(bot)      # меню спрашивает Telegram без bot в руках
     dp = Dispatcher()
 
     dp.message.middleware(TrackingMiddleware())
@@ -156,8 +197,51 @@ async def main() -> None:
     titles_task = asyncio.create_task(games.titles_scheduler(bot))
     backup_task = asyncio.create_task(backup.scheduler())
     sweeper_task = asyncio.create_task(moderation.card_sweeper(bot))
+    # разовые правки данных: улики профилей вернуть в свой список и
+    # завести списки слов для профилей — до того, как что-то проверится
+    try:
+        fixed = await db.fix_profile_samples()
+        if fixed:
+            logger.info("улик профиля вернулось в свой список: %d", fixed)
+        words = await db.seed_words_to_profiles()
+        if words:
+            logger.info("слов перенесено в списки профилей: %d", words)
+    except Exception:
+        logger.warning("разовые правки профилей не прошли", exc_info=True)
+    # разовая починка сроков у копий по сетке
+    try:
+        await _fix_net_terms(bot)
+    except Exception:
+        logger.warning("сроки у копий по сетке не починились", exc_info=True)
+    # разовый переезд медиа в папки по чатам: до первой отправки заготовки
+    try:
+        await triggers.migrate_layout()
+    except Exception:
+        logger.warning("медиа не разложилось по папкам", exc_info=True)
     nn_task = asyncio.create_task(nn.keeper())
     cas_task = asyncio.create_task(cas.keeper())
+    # Сборщик спама — второй бот в том же процессе. Диспетчер у него свой:
+    # у основного есть сквозной обработчик всех сообщений для модерации, и на
+    # общем диспетчере он бы взялся разбирать переписку в личке со сборщиком.
+    spam = spam_dp = None
+    spam_task = None
+    if config.SPAM_BOT_TOKEN:
+        try:
+            spam = Bot(config.SPAM_BOT_TOKEN, default=DefaultBotProperties(
+                parse_mode=ParseMode.HTML, link_preview_is_disabled=True))
+            spam_dp = Dispatcher()
+            spam_dp.include_router(spam_bot.router)
+            spam_dp.errors.register(_on_error)
+            spam_bot.set_main_bot(bot)
+            me = await spam.me()
+            logger.info("сборщик спама запущен: @%s", me.username)
+            spam_task = asyncio.create_task(spam_dp.start_polling(
+                spam, allowed_updates=spam_dp.resolve_used_update_types(),
+                drop_pending_updates=True, handle_signals=False))
+        except Exception:
+            spam = spam_task = None
+            logger.warning("сборщик спама не поднялся", exc_info=True)
+
     try:
         ub = await userbot.start(bot)
     except Exception:
@@ -185,6 +269,10 @@ async def main() -> None:
         if web_runner is not None:
             from .web import server as web_server
             await web_server.stop(web_runner)
+        if spam_task is not None:
+            spam_task.cancel()
+        if spam is not None:
+            await spam.session.close()
         if ub is not None:
             await ub.disconnect()
         await cas.close()

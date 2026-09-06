@@ -20,13 +20,22 @@ _db: aiosqlite.Connection | None = None
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS chats(
-    chat_id   INTEGER PRIMARY KEY,
-    title     TEXT,
-    username  TEXT,
-    owner_id  INTEGER,
-    added_at  INTEGER,
-    active    INTEGER NOT NULL DEFAULT 1,
-    net_id    INTEGER                     -- сетка, в которой состоит чат
+    chat_id      INTEGER PRIMARY KEY,
+    title        TEXT,
+    username     TEXT,
+    owner_id     INTEGER,
+    added_at     INTEGER,
+    active       INTEGER NOT NULL DEFAULT 1,
+    net_id       INTEGER,                 -- сетка, в которой состоит чат
+    -- канал, к которому прицеплено обсуждение. Держим здесь, а не спрашиваем
+    -- у Telegram: список чатов иначе стоил бы двух запросов на каждый чат,
+    -- и открытие панели росло бы вместе с их числом
+    linked_id    INTEGER,
+    linked_title TEXT,
+    -- 'channel' | 'supergroup' | 'group'. Нужен, чтобы отличить канал от
+    -- прицепленного к нему обсуждения: привязка в Telegram взаимная, и по
+    -- одному linked_id понять, кто из двоих канал, невозможно
+    kind         TEXT
 );
 CREATE TABLE IF NOT EXISTS nets(
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,6 +129,8 @@ CREATE TABLE IF NOT EXISTS settings(
     battle_min      INTEGER NOT NULL DEFAULT 5,
     court_punish    TEXT    NOT NULL DEFAULT 'mute',
     court_min       INTEGER NOT NULL DEFAULT 15,
+    paste_min       INTEGER NOT NULL DEFAULT 1000,
+    paste_cd        INTEGER NOT NULL DEFAULT 15,
     nn_mode         INTEGER NOT NULL DEFAULT 1,
     nn_threshold    INTEGER NOT NULL DEFAULT 85,
     sem_on          INTEGER NOT NULL DEFAULT 0,
@@ -142,6 +153,14 @@ CREATE TABLE IF NOT EXISTS settings(
     prof_score      INTEGER NOT NULL DEFAULT 80,
     prof_photo      INTEGER NOT NULL DEFAULT 1,
     prof_photo_min  INTEGER NOT NULL DEFAULT 85,
+    prof_photo_score INTEGER NOT NULL DEFAULT 60,
+    prof_words      INTEGER NOT NULL DEFAULT 1,
+    prof_members    INTEGER NOT NULL DEFAULT 1,
+    sub_on          INTEGER NOT NULL DEFAULT 0,
+    sub_chat_id     INTEGER NOT NULL DEFAULT 0,
+    sub_action      TEXT    NOT NULL DEFAULT 'decline',
+    sub_pass        TEXT    NOT NULL DEFAULT 'approve',
+    sub_dm          INTEGER NOT NULL DEFAULT 1,
     cas_on          INTEGER NOT NULL DEFAULT 0,
     cas_join        INTEGER NOT NULL DEFAULT 1,
     cas_suspect     INTEGER NOT NULL DEFAULT 1,
@@ -152,7 +171,7 @@ CREATE TABLE IF NOT EXISTS settings(
     asr_on          INTEGER NOT NULL DEFAULT 0,
     asr_max_sec     INTEGER NOT NULL DEFAULT 120,
     cards_on        INTEGER NOT NULL DEFAULT 1,
-    card_mask       INTEGER NOT NULL DEFAULT 4095,
+    card_mask       INTEGER NOT NULL DEFAULT 8191,
     log_chat_id     INTEGER
 );
 CREATE TABLE IF NOT EXISTS triggers(
@@ -232,7 +251,10 @@ CREATE TABLE IF NOT EXISTS words(
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER NOT NULL,
     word    TEXT NOT NULL,
-    mode    TEXT NOT NULL DEFAULT 'strict'
+    mode    TEXT NOT NULL DEFAULT 'strict',
+    -- 'msg' — запрещено в сообщениях, 'prof' — ищем в описании профиля.
+    -- Списки разные: в сообщениях запрещают темы, в профиле ищут рекламу
+    kind    TEXT NOT NULL DEFAULT 'msg'
 );
 CREATE TABLE IF NOT EXISTS phrases(
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -401,6 +423,8 @@ class Settings:
     battle_min: int = 5
     court_punish: str = "mute"
     court_min: int = 15
+    paste_min: int = 1000
+    paste_cd: int = 15
     nn_mode: int = 1
     nn_threshold: int = 85
     sem_on: int = 0
@@ -423,6 +447,14 @@ class Settings:
     prof_score: int = 80
     prof_photo: int = 1
     prof_photo_min: int = 85
+    prof_photo_score: int = 60
+    prof_words: int = 1
+    prof_members: int = 1
+    sub_on: int = 0
+    sub_chat_id: int = 0
+    sub_action: str = "decline"
+    sub_pass: str = "approve"
+    sub_dm: int = 1
     cas_on: int = 0
     cas_join: int = 1
     cas_suspect: int = 1
@@ -433,7 +465,7 @@ class Settings:
     asr_on: int = 0
     asr_max_sec: int = 120
     cards_on: int = 1
-    card_mask: int = 4095
+    card_mask: int = 8191
     log_chat_id: int | None = None
 
 
@@ -494,6 +526,14 @@ _SETTINGS_MIGRATIONS = {
     "prof_score": "INTEGER NOT NULL DEFAULT 80",
     "prof_photo": "INTEGER NOT NULL DEFAULT 1",
     "prof_photo_min": "INTEGER NOT NULL DEFAULT 85",
+    "prof_photo_score": "INTEGER NOT NULL DEFAULT 60",
+    "prof_words": "INTEGER NOT NULL DEFAULT 1",
+    "prof_members": "INTEGER NOT NULL DEFAULT 1",
+    "sub_on": "INTEGER NOT NULL DEFAULT 0",
+    "sub_chat_id": "INTEGER NOT NULL DEFAULT 0",
+    "sub_action": "TEXT NOT NULL DEFAULT 'decline'",
+    "sub_pass": "TEXT NOT NULL DEFAULT 'approve'",
+    "sub_dm": "INTEGER NOT NULL DEFAULT 1",
     "cas_on": "INTEGER NOT NULL DEFAULT 0",
     "cas_join": "INTEGER NOT NULL DEFAULT 1",
     "cas_suspect": "INTEGER NOT NULL DEFAULT 1",
@@ -513,6 +553,8 @@ _SETTINGS_MIGRATIONS = {
     "battle_min": "INTEGER NOT NULL DEFAULT 5",
     "court_punish": "TEXT NOT NULL DEFAULT 'mute'",
     "court_min": "INTEGER NOT NULL DEFAULT 15",
+    "paste_min": "INTEGER NOT NULL DEFAULT 1000",
+    "paste_cd": "INTEGER NOT NULL DEFAULT 15",
     "links_guest_punish": "TEXT NOT NULL DEFAULT 'delete'",
     "links_guest_mute_min": "INTEGER NOT NULL DEFAULT 60",
     "lp_tg": "TEXT NOT NULL DEFAULT 'delete'",
@@ -542,7 +584,8 @@ _SETTINGS_MIGRATIONS = {
 }
 
 # разовые включения новых card-битов в существующих card_mask: kv-флаг -> бит
-_MASK_MIGRATIONS = {"mig_watch_bit": 1024, "mig_report_bit": 2048}
+_MASK_MIGRATIONS = {"mig_watch_bit": 1024, "mig_report_bit": 2048,
+                    "mig_sub_bit": 4096}
 
 
 # колонки других таблиц, появившиеся позже: таблица -> {колонка: DDL}
@@ -552,7 +595,9 @@ _TABLE_MIGRATIONS = {
     "whitelist": {"title": "TEXT"},
     "punishments": {"was_member": "INTEGER NOT NULL DEFAULT 1"},
     "answers": {"last_used": "INTEGER NOT NULL DEFAULT 0"},
-    "chats": {"net_id": "INTEGER"},
+    "chats": {"net_id": "INTEGER", "linked_id": "INTEGER",
+              "linked_title": "TEXT", "kind": "TEXT"},
+    "words": {"kind": "TEXT NOT NULL DEFAULT 'msg'"},
     "watch_profiles": {"score": "INTEGER NOT NULL DEFAULT 0",
                        "score_ts": "INTEGER NOT NULL DEFAULT 0",
                        "card_score": "INTEGER NOT NULL DEFAULT 0"},
@@ -762,21 +807,49 @@ def _now() -> int:
 # ---------- чаты ----------
 
 async def upsert_chat(chat_id: int, title: str | None, username: str | None,
-                      owner_id: int | None) -> None:
+                      owner_id: int | None, kind: str | None = None) -> None:
     await _db.execute(
-        """INSERT INTO chats (chat_id, title, username, owner_id, added_at, active)
-           VALUES (?, ?, ?, ?, ?, 1)
+        """INSERT INTO chats (chat_id, title, username, owner_id, added_at,
+                              active, kind)
+           VALUES (?, ?, ?, ?, ?, 1, ?)
            ON CONFLICT(chat_id) DO UPDATE SET
              title = excluded.title,
              username = excluded.username,
              owner_id = COALESCE(chats.owner_id, excluded.owner_id),
+             kind = COALESCE(excluded.kind, chats.kind),
              active = 1""",
-        (chat_id, title, username, owner_id, _now()),
+        (chat_id, title, username, owner_id, _now(), kind),
     )
     await _db.execute(
         "INSERT OR IGNORE INTO settings (chat_id) VALUES (?)", (chat_id,)
     )
     await _db.commit()
+
+
+async def set_kind(chat_id: int, kind: str | None) -> None:
+    """Запомнить тип чата. Известен он не всегда, поэтому пустое не затираем."""
+    if not kind:
+        return
+    await _db.execute("UPDATE chats SET kind = ? WHERE chat_id = ?",
+                      (kind, chat_id))
+    await _db.commit()
+
+
+async def set_linked(chat_id: int, linked_id: int | None,
+                     linked_title: str | None) -> bool:
+    """Запомнить привязанный канал. False — ничего не изменилось."""
+    cur = await _db.execute(
+        "SELECT linked_id, linked_title FROM chats WHERE chat_id = ?", (chat_id,))
+    row = await cur.fetchone()
+    if row is None:
+        return False
+    if row["linked_id"] == linked_id and row["linked_title"] == linked_title:
+        return False
+    await _db.execute(
+        "UPDATE chats SET linked_id = ?, linked_title = ? WHERE chat_id = ?",
+        (linked_id, linked_title, chat_id))
+    await _db.commit()
+    return True
 
 
 async def update_chat_title(chat_id: int, title: str | None, username: str | None) -> None:
@@ -924,12 +997,30 @@ async def log_chat_still_needed(log_id: int, leaving: int) -> str | None:
 
 
 async def moderated_chats() -> list[aiosqlite.Row]:
-    """Рабочие чаты для меню: без тех, что служат лог-чатом для другого чата."""
+    """Рабочие чаты для меню.
+
+    Прячем то, что чату служит, а не модерируется само: лог-чат, канал для
+    проверки подписки и канал, к которому прицеплено обсуждение. Бота в них
+    добавляют по делу, и он их запоминает — но модерировать там нечего, а в
+    списке они выглядели бы как полноценные чаты с двумя десятками настроек.
+
+    Привязку канала к обсуждению Telegram хранит с обеих сторон: канал знает
+    про группу, группа про канал. Поэтому «спрятать всё, на что кто-то
+    ссылается» убирало и само обсуждение — рабочий чат исчезал из панели.
+    Прячем только то, что каналом и является.
+    """
     cur = await _db.execute(
-        """SELECT * FROM chats WHERE active = 1 AND chat_id NOT IN (
+        """SELECT * FROM chats WHERE active = 1
+             AND chat_id NOT IN (
                SELECT log_chat_id FROM settings
-               WHERE log_chat_id IS NOT NULL AND log_chat_id != chat_id
-           ) ORDER BY added_at"""
+               WHERE log_chat_id IS NOT NULL AND log_chat_id != chat_id)
+             AND chat_id NOT IN (
+               SELECT sub_chat_id FROM settings WHERE sub_chat_id != 0)
+             AND NOT (COALESCE(kind, '') = 'channel'
+                      AND chat_id IN (
+                        SELECT linked_id FROM chats
+                        WHERE linked_id IS NOT NULL AND linked_id != chat_id))
+           ORDER BY added_at"""
     )
     rows = await cur.fetchall()
     gl = await global_log()          # общий лог тоже не рабочий чат
@@ -1155,14 +1246,16 @@ async def inline_wl_allowed(chat_id: int, username: str | None, bot_id: int | No
 
 # ---------- стоп-слова ----------
 
-async def words_add(chat_id: int, word: str, mode: str) -> bool:
+async def words_add(chat_id: int, word: str, mode: str,
+                    kind: str = "msg") -> bool:
     """Добавить слово. False — такое уже есть (режим при этом обновляем).
 
     Дубли раньше просто копились и занимали место в списке.
     """
     w = word.lower()
     cur = await _db.execute(
-        "SELECT id, mode FROM words WHERE chat_id = ? AND word = ?", (chat_id, w)
+        "SELECT id, mode FROM words WHERE chat_id = ? AND word = ? AND kind = ?",
+        (chat_id, w, kind),
     )
     row = await cur.fetchone()
     if row is not None:
@@ -1171,15 +1264,17 @@ async def words_add(chat_id: int, word: str, mode: str) -> bool:
             await _db.commit()
         return False
     await _db.execute(
-        "INSERT INTO words (chat_id, word, mode) VALUES (?, ?, ?)", (chat_id, w, mode)
+        "INSERT INTO words (chat_id, word, mode, kind) VALUES (?, ?, ?, ?)",
+        (chat_id, w, mode, kind),
     )
     await _db.commit()
     return True
 
 
-async def words_clear(chat_id: int) -> int:
+async def words_clear(chat_id: int, kind: str = "msg") -> int:
     """Стереть весь список. Возвращает, сколько удалено."""
-    cur = await _db.execute("DELETE FROM words WHERE chat_id = ?", (chat_id,))
+    cur = await _db.execute("DELETE FROM words WHERE chat_id = ? AND kind = ?",
+                            (chat_id, kind))
     await _db.commit()
     return cur.rowcount or 0
 
@@ -1189,12 +1284,30 @@ async def words_remove(row_id: int) -> None:
     await _db.commit()
 
 
-async def words_list(chat_id: int) -> list[aiosqlite.Row]:
+async def words_list(chat_id: int, kind: str = "msg") -> list[aiosqlite.Row]:
     """Список стоп-слов по алфавиту — так его проще просматривать глазами."""
     cur = await _db.execute(
-        "SELECT * FROM words WHERE chat_id = ? ORDER BY word", (chat_id,)
+        "SELECT * FROM words WHERE chat_id = ? AND kind = ? ORDER BY word",
+        (chat_id, kind),
     )
     return await cur.fetchall()
+
+
+async def words_copy_to_profile(chat_id: int) -> tuple[int, list[str]]:
+    """Перенести подходящие стоп-слова в список для профилей.
+
+    Возвращает (сколько перенесено, что пропустили). Пропускаем слова про
+    темы разговора: в описании профиля они читаются наоборот — человек,
+    который тему осуждает, ловится наравне с тем, кто её продаёт.
+    """
+    added, skipped = 0, []
+    for row in await words_list(chat_id, "msg"):
+        if not config.profile_word_ok(row["word"]):
+            skipped.append(row["word"])
+            continue
+        if await words_add(chat_id, row["word"], row["mode"], "prof"):
+            added += 1
+    return added, skipped
 
 
 def id_variants(cid: int) -> tuple[int, ...]:
@@ -1235,6 +1348,52 @@ async def add_punishment(chat_id: int, user_id: int, username: str | None, name:
 async def get_punishment(pid: int) -> aiosqlite.Row | None:
     cur = await _db.execute("SELECT * FROM punishments WHERE id = ?", (pid,))
     return await cur.fetchone()
+
+
+NET_TERMS_KEY = "mig_net_terms"
+
+
+async def net_terms_to_fix() -> list[dict]:
+    """Копии по сетке, потерявшие срок: (id, чат, человек, до какого времени).
+
+    Мут не-участнику подменялся баном на тот же срок, но в сетку уходило уже
+    подменённое наказание, а явному бану срок не ставится — соседние чаты
+    получали «навсегда». Ищем такие копии и берём срок у источника.
+
+    Сверяем строго: причина копии должна быть ровно «сетка · <чат>: <причина
+    источника>», а сам источник — активным наказанием того же человека с тем
+    же текстом. Гадать тут нельзя: на кону чужие баны.
+    """
+    cur = await _db.execute(
+        """SELECT id, chat_id, user_id, name, reason FROM punishments
+             WHERE active = 1 AND kind = 'ban' AND until_ts IS NULL
+               AND reason LIKE 'сетка · %' AND reason LIKE '%на тот же срок'""")
+    out: list[dict] = []
+    for r in await cur.fetchall():
+        head, sep, tail = r["reason"].partition(": ")
+        if not sep or not head.startswith("сетка · "):
+            continue
+        src_title = head[len("сетка · "):]
+        cur2 = await _db.execute(
+            """SELECT p.until_ts FROM punishments p
+                 JOIN chats c ON c.chat_id = p.chat_id
+                 WHERE p.user_id = ? AND p.reason = ? AND c.title = ?
+                   AND p.until_ts IS NOT NULL AND p.chat_id != ?
+                 ORDER BY p.id DESC LIMIT 1""",
+            (r["user_id"], tail, src_title, r["chat_id"]))
+        src = await cur2.fetchone()
+        if src is None:
+            continue
+        out.append({"id": r["id"], "chat_id": r["chat_id"],
+                    "user_id": r["user_id"], "name": r["name"],
+                    "until_ts": src["until_ts"]})
+    return out
+
+
+async def set_until(pid: int, until_ts: int | None) -> None:
+    await _db.execute("UPDATE punishments SET until_ts = ? WHERE id = ?",
+                      (until_ts, pid))
+    await _db.commit()
 
 
 async def deactivate_punishment(pid: int) -> None:
@@ -1373,9 +1532,17 @@ async def sample_relabel(sample_id: int, label: str, origin: str | None = None) 
 
 
 async def sample_relabel_by_pid(pid: int, label: str) -> int:
-    """То же по id наказания — им помечены улики автомода."""
+    """То же по id наказания — им помечены улики автомода.
+
+    Улики профилей остаются в своём списке: origin='profile' у них не метка
+    происхождения, а адрес — по нему их находит сравнение профилей. Перенеси
+    такую в 'card', и она пропадёт из сравнения профилей, зато окажется в
+    обучении текстовой модели, где строке из имени и био делать нечего.
+    """
     cur = await _db.execute(
-        "UPDATE samples SET label = ?, origin = 'card', vec = NULL WHERE pid = ?",
+        """UPDATE samples SET label = ?, vec = NULL,
+               origin = CASE WHEN origin = 'profile' THEN 'profile' ELSE 'card' END
+           WHERE pid = ?""",
         (label, pid))
     await _db.commit()
     return cur.rowcount or 0
@@ -1500,19 +1667,27 @@ async def samples_profile_net(chat_id: int, limit: int = 4000) -> list[aiosqlite
     return await cur.fetchall()
 
 
-async def seed_add(text: str, label: str) -> bool:
+# Стартовый набор бывает двух видов: примеры сообщений и примеры профилей.
+# Сравниваются они порознь — сообщение с сообщениями, профиль с профилями,
+# — поэтому и лежат под разным origin, хотя и в одной таблице.
+SEED_ORIGINS = {"msg": "seed", "prof": "seedprof"}
+
+
+async def seed_add(text: str, label: str, kind: str = "msg") -> bool:
     """Добавить пример в стартовый набор. False — такой уже есть."""
+    origin = SEED_ORIGINS.get(kind, "seed")
     text = " ".join((text or "").split())[:config.SAMPLE_TEXT_LIMIT]
     if len(text) < 10:
         return False
     cur = await _db.execute(
-        "SELECT 1 FROM samples WHERE chat_id = ? AND text = ?", (SEED_CHAT, text))
+        "SELECT 1 FROM samples WHERE chat_id = ? AND origin = ? AND text = ?",
+        (SEED_CHAT, origin, text))
     if await cur.fetchone():
         return False
     await _db.execute(
         """INSERT INTO samples (chat_id, user_id, ts, origin, feature, label, text)
-           VALUES (?, NULL, ?, 'seed', 'набор', ?, ?)""",
-        (SEED_CHAT, _now(), label, text))
+           VALUES (?, NULL, ?, ?, 'набор', ?, ?)""",
+        (SEED_CHAT, _now(), origin, label, text))
     return True
 
 
@@ -1520,10 +1695,14 @@ async def seed_commit() -> None:
     await _db.commit()
 
 
-async def seed_stats() -> dict:
-    cur = await _db.execute(
-        "SELECT label, COUNT(*) AS n FROM samples WHERE chat_id = ? GROUP BY label",
-        (SEED_CHAT,))
+async def seed_stats(kind: str | None = None) -> dict:
+    """Сколько чего в наборе. kind='msg' | 'prof' | None (оба вида)."""
+    q = ("SELECT label, COUNT(*) AS n FROM samples WHERE chat_id = ? "
+         "AND origin IN (%s) GROUP BY label")
+    origins = ([SEED_ORIGINS[kind]] if kind in SEED_ORIGINS
+               else list(SEED_ORIGINS.values()))
+    cur = await _db.execute(q % ",".join("?" * len(origins)),
+                            (SEED_CHAT, *origins))
     out = {"spam": 0, "ok": 0}
     for r in await cur.fetchall():
         out[r["label"]] = r["n"]
@@ -1535,6 +1714,20 @@ async def seed_clear() -> int:
     cur = await _db.execute("DELETE FROM samples WHERE chat_id = ?", (SEED_CHAT,))
     await _db.commit()
     return cur.rowcount or 0
+
+
+async def samples_seed_faces(limit: int) -> list[aiosqlite.Row]:
+    """Чужие примеры спам-профилей: подмешиваются к своим при сравнении.
+
+    В отличие от текстового набора не отключаются никогда: рекламные профили
+    похожи между собой в любом чате, и своя норма тут ничего не уточняет.
+    Берём только спам — «нормальных профилей» никто не собирает.
+    """
+    cur = await _db.execute(
+        """SELECT * FROM samples WHERE chat_id = ? AND origin = ?
+             AND label = 'spam' ORDER BY id LIMIT ?""",
+        (SEED_CHAT, SEED_ORIGINS["prof"], limit))
+    return await cur.fetchall()
 
 
 async def samples_seed(limit: int) -> list[aiosqlite.Row]:
@@ -1551,8 +1744,9 @@ async def samples_seed(limit: int) -> list[aiosqlite.Row]:
     rows: list[aiosqlite.Row] = []
     for label in ("spam", "ok"):
         cur = await _db.execute(
-            """SELECT * FROM samples WHERE chat_id = ? AND label = ?
-               ORDER BY id LIMIT ?""", (SEED_CHAT, label, half))
+            """SELECT * FROM samples WHERE chat_id = ? AND origin = ? AND label = ?
+               ORDER BY id LIMIT ?""",
+            (SEED_CHAT, SEED_ORIGINS["msg"], label, half))
         rows.extend(await cur.fetchall())
     return rows
 
@@ -2224,6 +2418,34 @@ async def _log_chat_ids() -> list[aiosqlite.Row]:
 GLOBAL_LOG_KEY = "global_log"
 
 
+async def serves_chat(chat_id: int) -> tuple[bool, int | None]:
+    """Служит ли этот чат какому-то из наших: (да/нет, чей владелец).
+
+    Канал для проверки подписки, лог-чат и канал, к которому прицеплено
+    обсуждение, добавляют руками и часто не из меню бота. Автора добавления
+    Telegram при этом показывает ботом (в канале пишут от имени канала), а
+    список админов канала боту недоступен, пока его не сделали админом — обе
+    проверки «свой ли чат» промахиваются, и бот объявлял служебный канал
+    чужим и пытался из него выйти.
+    """
+    cur = await _db.execute(
+        """SELECT c.owner_id FROM chats c
+             WHERE c.active = 1
+               AND (c.linked_id = ?
+                    OR c.chat_id IN (SELECT chat_id FROM settings
+                                       WHERE sub_chat_id = ?)
+                    OR c.chat_id IN (SELECT chat_id FROM settings
+                                       WHERE log_chat_id = ?))
+             ORDER BY c.owner_id IS NULL
+             LIMIT 1""",
+        (chat_id, chat_id, chat_id),
+    )
+    row = await cur.fetchone()
+    if row is not None:
+        return True, row["owner_id"]
+    return chat_id == await global_log(), None
+
+
 async def global_log() -> int | None:
     """Общий лог-чат владельца бота: копия всех карточек со всех чатов."""
     raw = await kv_get(GLOBAL_LOG_KEY)
@@ -2330,9 +2552,12 @@ def _like_escape(q: str) -> str:
     return q
 
 
-def _seed_where(label: str | None, q: str | None) -> tuple[str, list]:
-    cond = ["chat_id = ?"]
-    args: list = [SEED_CHAT]
+def _seed_where(label: str | None, q: str | None,
+                kind: str | None = None) -> tuple[str, list]:
+    origins = ([SEED_ORIGINS[kind]] if kind in SEED_ORIGINS
+               else list(SEED_ORIGINS.values()))
+    cond = ["chat_id = ?", f"origin IN ({','.join('?' * len(origins))})"]
+    args: list = [SEED_CHAT, *origins]
     if label in ("spam", "ok"):
         cond.append("label = ?")
         args.append(label)
@@ -2342,18 +2567,21 @@ def _seed_where(label: str | None, q: str | None) -> tuple[str, list]:
     return " AND ".join(cond), args
 
 
-async def seed_count(label: str | None = None, q: str | None = None) -> int:
-    where, args = _seed_where(label, q)
+async def seed_count(label: str | None = None, q: str | None = None,
+                     kind: str | None = None) -> int:
+    where, args = _seed_where(label, q, kind)
     cur = await _db.execute(f"SELECT COUNT(*) FROM samples WHERE {where}", args)
     return (await cur.fetchone())[0] or 0
 
 
 async def seed_page(label: str | None = None, q: str | None = None,
-                    offset: int = 0, limit: int = 5) -> list[aiosqlite.Row]:
-    where, args = _seed_where(label, q)
+                    offset: int = 0, limit: int = 5,
+                    kind: str | None = None) -> list[aiosqlite.Row]:
+    where, args = _seed_where(label, q, kind)
     cur = await _db.execute(
-        f"""SELECT id, label, text, vec IS NOT NULL AS has_vec FROM samples
-            WHERE {where} ORDER BY id LIMIT ? OFFSET ?""", (*args, limit, offset))
+        f"""SELECT id, label, text, origin, vec IS NOT NULL AS has_vec
+            FROM samples WHERE {where} ORDER BY id LIMIT ? OFFSET ?""",
+        (*args, limit, offset))
     return await cur.fetchall()
 
 
@@ -2368,12 +2596,13 @@ async def seed_delete(ids: list[int]) -> int:
     return cur.rowcount or 0
 
 
-async def seed_delete_where(label: str | None = None, q: str | None = None) -> int:
+async def seed_delete_where(label: str | None = None, q: str | None = None,
+                            kind: str | None = None) -> int:
     """Удалить всё, что нашлось по фильтру. Пустой фильтр не чистит набор
     целиком: для этого есть отдельная кнопка со своим подтверждением."""
-    if not label and not q:
+    if not label and not q and not kind:
         return 0
-    where, args = _seed_where(label, q)
+    where, args = _seed_where(label, q, kind)
     cur = await _db.execute(f"DELETE FROM samples WHERE {where}", args)
     await _db.commit()
     return cur.rowcount or 0
@@ -2384,3 +2613,82 @@ async def seed_vec_count() -> int:
         "SELECT COUNT(*) FROM samples WHERE chat_id = ? AND vec IS NOT NULL",
         (SEED_CHAT,))
     return (await cur.fetchone())[0] or 0
+
+
+# ---------- переезд медиа в папки по чатам ----------
+
+async def media_rows() -> list[tuple[str, int, int, str]]:
+    """Все файлы заготовок: (назначение, чат, id строки, путь).
+
+    Нужно ровно для переезда из общей папки: чтобы разложить файл, надо знать,
+    чей он и подо что. У приветствия, правил и подписки владелец — сам чат,
+    у триггера — сам триггер, поэтому чат берём из него.
+    """
+    out: list[tuple[str, int, int, str]] = []
+    cur = await _db.execute(
+        """SELECT a.id, a.owner, a.owner_id, a.file_path, t.chat_id AS trig_chat
+           FROM answers a LEFT JOIN triggers t ON a.owner = 'trig' AND t.id = a.owner_id
+           WHERE a.file_path IS NOT NULL AND a.file_path != ''""")
+    for r in await cur.fetchall():
+        chat = r["trig_chat"] if r["owner"] == "trig" else r["owner_id"]
+        if chat is not None:
+            out.append(("answers", int(chat), r["id"], r["file_path"]))
+    cur = await _db.execute(
+        "SELECT id, chat_id, file_path FROM triggers "
+        "WHERE file_path IS NOT NULL AND file_path != ''")
+    for r in await cur.fetchall():
+        out.append(("triggers", int(r["chat_id"]), r["id"], r["file_path"]))
+    return out
+
+
+async def media_purpose(row_id: int) -> str:
+    cur = await _db.execute("SELECT owner FROM answers WHERE id = ?", (row_id,))
+    row = await cur.fetchone()
+    return row["owner"] if row else "trig"
+
+
+async def media_set_path(table: str, row_id: int, path: str) -> None:
+    if table not in ("answers", "triggers"):
+        raise ValueError(table)
+    await _db.execute(f"UPDATE {table} SET file_path = ? WHERE id = ?", (path, row_id))
+    await _db.commit()
+
+
+async def fix_profile_samples() -> int:
+    """Вернуть улики профилей в свой список. Разово.
+
+    Разбан переносил их в 'card': там улику ищет обучение текстовой модели, а
+    строке из имени, био и названия канала в нём делать нечего — и заодно она
+    пропадала из сравнения профилей. Узнаём такие по feature='профиль'.
+    """
+    if await kv_get("mig_profile_samples"):
+        return 0
+    cur = await _db.execute(
+        "UPDATE samples SET origin = 'profile', vec = NULL "
+        "WHERE feature = 'профиль' AND origin = 'card'")
+    await kv_set("mig_profile_samples", "1")
+    await _db.commit()
+    return cur.rowcount or 0
+
+
+async def seed_words_to_profiles() -> int:
+    """Разово завести списки слов для профилей из стоп-слов чатов.
+
+    Проверка профиля до этого пользовалась списком сообщений, и на нём уже
+    случился ложный бан: «изнасилования» в описании канала, где человек тему
+    осуждает. Слова про темы разговора при переносе пропускаем.
+    """
+    if await kv_get("mig_prof_words"):
+        return 0
+    total = 0
+    for row in await all_chats(active_only=False):
+        cid = row["chat_id"]
+        if await words_list(cid, "prof"):
+            continue                     # список уже завели руками
+        added, skipped = await words_copy_to_profile(cid)
+        if added or skipped:
+            logger.info("слова профиля для %s: перенесено %d, пропущено %d (%s)",
+                        cid, added, len(skipped), ", ".join(skipped[:10]))
+        total += added
+    await kv_set("mig_prof_words", "1")
+    return total

@@ -31,6 +31,9 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
                                 "words_guests")),
     "flood": ("🌊 Антифлуд", ("flood_on", "flood_msgs", "flood_window", "flood_mute_min")),
     "captcha": ("🤖 Капча", ("captcha_on", "captcha_timeout")),
+    # канал не переносим: он свой у каждого чата, как и лог-чат
+    "sub": ("📣 Вход только по подписке", ("sub_on", "sub_action", "sub_pass",
+                                           "sub_dm")),
     "watch": ("👁 Наблюдение", ("watch_on", "watch_bots", "watch_suspect",
                              "watch_ban", "watch_nn", "watch_react")),
     "welcome": ("👋 Приветствие", ("welcome_on", "welcome_text")),
@@ -50,10 +53,11 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
                                         "cas_score")),
     "prof": ("🪪 Проверка профиля", ("prof_on", "prof_mode", "prof_punish",
                                      "prof_mute_min", "prof_score",
-                                     "prof_photo", "prof_photo_min")),
+                                     "prof_words", "prof_members", "prof_photo",
+                                     "prof_photo_min", "prof_photo_score")),
     "games": ("🎪 Приколы", ("games_on", "games_adm", "rus_punish", "rus_min",
                "duel_punish", "duel_min", "battle_punish", "battle_min",
-               "court_punish", "court_min")),
+               "court_punish", "court_min", "paste_min", "paste_cd")),
     "service": ("🧹 Системные", ("service_join", "service_leave", "service_other")),
     "read": ("🔍 Распознавание", ("ocr_on", "ocr_langs", "asr_on", "asr_max_sec")),
     "sem": ("🧠 Смысловые стоп-слова", ("sem_on", "sem_threshold", "sem_punish",
@@ -71,17 +75,24 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
 ALL_GROUPS = tuple(GROUPS)
 
 
-def _copy_media(path: str, dst_chat: int) -> str | None:
-    """Скопировать файл триггера под новым именем. None — исходник пропал."""
+def _copy_media(path: str, dst_chat: int, purpose: str = "trig") -> str | None:
+    """Скопировать файл в папку чата-получателя. None — исходник пропал.
+
+    Путь в базе абсолютный и снят на другой машине (в контейнере он свой),
+    поэтому доверяем только имени файла и ищем его сначала на месте, потом
+    в старой общей папке — оттуда файлы переезжают не мгновенно.
+    """
+    from . import triggers
     name = path.replace("\\", "/").rsplit("/", 1)[-1]
-    src = os.path.join(config.TRIG_DIR, name)
+    src = path if os.path.exists(path) else os.path.join(config.TRIG_DIR, name)
     if not os.path.exists(src):
-        logger.warning("файл триггера пропал: %s", src)
+        logger.warning("файл заготовки пропал: %s", path)
         return None
     ext = os.path.splitext(name)[1]
-    new_name = f"{dst_chat}_{uuid.uuid4().hex[:12]}{ext}"
-    shutil.copy2(src, os.path.join(config.TRIG_DIR, new_name))
-    return os.path.join(config.TRIG_DIR, new_name)
+    dst = os.path.join(triggers.media_dir(dst_chat, purpose),
+                       f"{uuid.uuid4().hex[:12]}{ext}")
+    shutil.copy2(src, dst)
+    return dst
 
 
 async def copy_chat(src: int, dst: int, groups: set[str] | None = None) -> dict[str, int]:
@@ -134,7 +145,8 @@ async def copy_chat(src: int, dst: int, groups: set[str] | None = None) -> dict[
             await db.trig_set(new_id, "cooldown", t["cooldown"])
             await db.ans_clear("trig", new_id)   # trig_add кладёт пустую заготовку
             for a in await db.ans_list("trig", t["id"]):
-                path = _copy_media(a["file_path"], dst) if a["file_path"] else None
+                path = (_copy_media(a["file_path"], dst, "trig")
+                        if a["file_path"] else None)
                 if a["file_path"] and path is None:
                     continue                     # файл потерян — вариант пропускаем
                 await db.ans_add("trig", new_id, a["text"], path, a["media_type"])
@@ -143,7 +155,8 @@ async def copy_chat(src: int, dst: int, groups: set[str] | None = None) -> dict[
     if "welcome" in picked:
         await db.ans_clear("welcome", dst)
         for a in await db.ans_list("welcome", src):
-            path = _copy_media(a["file_path"], dst) if a["file_path"] else None
+            path = (_copy_media(a["file_path"], dst, "welcome")
+                    if a["file_path"] else None)
             if a["file_path"] and path is None:
                 continue
             await db.ans_add("welcome", dst, a["text"], path, a["media_type"])
@@ -153,11 +166,24 @@ async def copy_chat(src: int, dst: int, groups: set[str] | None = None) -> dict[
         # заготовки правил живут в answers, как варианты ответов триггеров
         await db.ans_clear("rules", dst)
         for a in await db.ans_list("rules", src):
-            path = _copy_media(a["file_path"], dst) if a["file_path"] else None
+            path = (_copy_media(a["file_path"], dst, "rules")
+                    if a["file_path"] else None)
             if a["file_path"] and path is None:
                 continue
             await db.ans_add("rules", dst, a["text"], path, a["media_type"])
             stats["заготовок правил"] =                 stats.get("заготовок правил", 0) + 1
+
+    if "games" in picked:
+        # заготовки ответов на пасты живут в answers, как варианты триггеров
+        await db.ans_clear("paste", dst)
+        for a in await db.ans_list("paste", src):
+            path = (_copy_media(a["file_path"], dst, "paste")
+                    if a["file_path"] else None)
+            if a["file_path"] and path is None:
+                continue
+            await db.ans_add("paste", dst, a["text"], path, a["media_type"])
+            stats["заготовок на пасты"] = \
+                stats.get("заготовок на пасты", 0) + 1
 
     if "cmds" in picked:
         for c in await db.cmd_list(src):

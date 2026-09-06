@@ -34,6 +34,9 @@ def invalidate_admins(chat_id: int) -> None:
 
 # chat_id -> (expires, (linked_chat_id | None, linked_username | None))
 _linked: dict[int, tuple[float, tuple]] = {}
+# что за чат: 'channel', 'supergroup', 'group'. Заполняется попутно, когда мы
+# и так ходим в getChat — отдельных запросов ради этого не делаем
+_kind: dict[int, str] = {}
 
 
 async def linked_chat(bot: Bot, chat_id: int) -> tuple[int | None, str | None, str | None]:
@@ -49,12 +52,16 @@ async def linked_chat(bot: Bot, chat_id: int) -> tuple[int | None, str | None, s
     result: tuple[int | None, str | None, str | None] = (None, None, None)
     try:
         chat = await bot.get_chat(chat_id)
+        if chat.type:
+            _kind[chat_id] = chat.type
         linked_id = getattr(chat, "linked_chat_id", None)
         if linked_id:
             uname, title = None, None
             try:
                 linked = await bot.get_chat(linked_id)
                 uname, title = linked.username, linked.title
+                if linked.type:
+                    _kind[linked_id] = linked.type
             except Exception:
                 pass
             result = (linked_id, uname, title)
@@ -81,6 +88,24 @@ async def username_chat_type(bot: Bot, username: str) -> str | None:
         _mentions.clear()
     _mentions[key] = (now + config.MENTION_CACHE_TTL, ctype)
     return ctype
+
+
+async def refresh_linked(bot, chat_id: int) -> str | None:
+    """Спросить у Telegram привязанный канал и записать его в базу.
+
+    Зовём редко: при регистрации чата и разовой сверкой на старте. Списки
+    после этого читают название прямо из базы и не ходят в Telegram вовсе.
+    """
+    from .. import db
+    _linked.pop(chat_id, None)
+    linked_id, _uname, title = await linked_chat(bot, chat_id)
+    await db.set_linked(chat_id, linked_id, title)
+    # тип чата пишем заодно: сверка на старте проходит по всем чатам, так что
+    # старые записи без типа заполняются сами, без отдельного похода в Telegram
+    await db.set_kind(chat_id, _kind.get(chat_id))
+    if linked_id:
+        await db.set_kind(linked_id, _kind.get(linked_id))
+    return title
 
 
 async def reconcile_chats(bot) -> list[tuple[int, str]]:
@@ -113,6 +138,13 @@ async def reconcile_chats(bot) -> list[tuple[int, str]]:
             inside = False
         if not inside:
             gone.append((cid, row["title"] or str(cid)))
+            continue
+        try:
+            # заодно освежаем привязанный канал: он меняется редко, а списку
+            # нужен готовым — иначе панель снова пошла бы спрашивать по кругу
+            await refresh_linked(bot, cid)
+        except Exception:
+            logger.debug("канал чата %s не освежить", cid, exc_info=True)
 
     # Предохранитель: если «пропали» почти все чаты разом, дело не в чатах,
     # а в Telegram или в сети. Вычёркивать список целиком по такому поводу

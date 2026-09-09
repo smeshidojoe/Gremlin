@@ -21,6 +21,7 @@ CURRENCIES = (
     ("USD", "$", "доллар"),
     ("EUR", "€", "евро"),
     ("CNY", "¥", "юань"),
+    ("KZT", "₸", "тенге"),
 )
 RUB = "₽"
 
@@ -148,11 +149,13 @@ async def board() -> str:
     rates, date, fresh = await fetch()
     if not rates:
         return "💱 Курс сейчас не получить — источник не отвечает."
-    lines = ["💱 <b>Курс валют</b>"]
+    # пустые строки вокруг списка: заголовок и подпись про ЦБ иначе слипаются
+    # с курсами в один комок, и глазами его не разобрать
+    lines = ["💱 <b>Курс валют</b>", ""]
     for code, sym, _name in CURRENCIES:
         if code in rates:
             lines.append(f"{sym}1 = {_money(rates[code])} {RUB}")
-    lines.append(_footer(date, fresh))
+    lines += ["", _footer(date, fresh)]
     return "\n".join(lines)
 
 
@@ -162,7 +165,7 @@ async def convert(amount: float, code: str) -> str:
     if not rates:
         return "💱 Курс сейчас не получить — источник не отвечает."
     sym = dict((c, s) for c, s, _n in CURRENCIES).get(code, RUB)
-    lines = [f"💱 <b>{_money(amount)} {sym}</b>"]
+    lines = [f"💱 <b>{_money(amount)} {sym}</b>", ""]
     if code == "RUB":
         for cur, csym, _name in CURRENCIES:
             if cur in rates:
@@ -172,7 +175,7 @@ async def convert(amount: float, code: str) -> str:
         for cur, csym, _name in CURRENCIES:
             if cur != code and cur in rates:
                 lines.append(f"{csym}{_money(amount * rates[code] / rates[cur])}")
-    lines.append(_footer(date, fresh))
+    lines += ["", _footer(date, fresh)]
     return "\n".join(lines)
 
 

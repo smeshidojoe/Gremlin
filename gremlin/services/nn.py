@@ -71,6 +71,9 @@ def _load_sync() -> str:
     opts.intra_op_num_threads = 1
     opts.inter_op_num_threads = 1
     opts.log_severity_level = 3
+    # без своей арены: она только растёт и памяти не отдаёт, а у нас
+    # прогоны редкие и разного размера — RSS от этого полз вверх
+    opts.enable_cpu_mem_arena = False
     sess = onnxruntime.InferenceSession(onnx, opts, providers=["CPUExecutionProvider"])
     tok = Tokenizer.from_file(tokenizer)
     tok.enable_truncation(max_length=MAX_TOKENS)
@@ -344,16 +347,26 @@ def _append(chat_id: int, line: str) -> None:
 
 
 async def log_verdict(chat_id: int, title: str | None, user_id, text: str,
-                      verdict: dict, threshold: int) -> None:
+                      verdict: dict, threshold: int,
+                      caught_by: str | None = None) -> None:
     """Строка в файл теневых решений.
 
     Пишем и то, что порога не добрало: по таким строкам как раз и видно,
     куда порог двигать. Помечаем, сработало бы или нет.
+
+    caught_by — сообщение уже убрало другое правило, и мы записываем только
+    «что сказал бы фильтр». Такие строки — единственный способ увидеть, ловит
+    ли он настоящий спам: до обычного теневого прогона рекламу не доносит,
+    её раньше снимают стоп-слова и ссылки.
     """
     near = await db.sample_by_id(verdict["nearest_id"])
     hit = verdict["score"] >= threshold
     stamp = time.strftime("%d.%m %H:%M:%S")
-    mark = f"СРАБОТАЛО {verdict['score']}%" if hit else f"мимо {verdict['score']}%"
+    if caught_by:
+        mark = (f"{'УЗНАЛ БЫ' if hit else 'ПРОПУСТИЛ БЫ'} {verdict['score']}%"
+                f" · уже убрано правилом «{caught_by}»")
+    else:
+        mark = f"СРАБОТАЛО {verdict['score']}%" if hit else f"мимо {verdict['score']}%"
     lines = [
         f"[{stamp}] {mark} · порог {threshold} · "
         f"{title or chat_id} ({chat_id}) · автор {user_id}",
@@ -367,6 +380,35 @@ async def log_verdict(chat_id: int, title: str | None, user_id, text: str,
     if near is not None:
         lines.append(f"    ~ {_one_line(near['text'], 120)}")
     await asyncio.to_thread(_append, chat_id, "\n".join(lines) + "\n\n")
+
+
+async def shadow_caught(chat_id: int, message, s, extra: str,
+                        feature: str) -> None:
+    """То же, но для сообщения, которое уже сняло другое правило.
+
+    Ничего не решает и ничего не возвращает: наказание уже выдано, и второй
+    раз оно не нужно. Смысл один — увидеть в теневом логе ту половину
+    картины, которой там не было: узнал бы фильтр настоящий спам или нет.
+    """
+    if s.nn_mode < 2:
+        return
+    text = " ".join(filter(None, [message.text or message.caption or "", extra]))
+    if len(text.strip()) < 10:
+        return                       # на «ок» сравнивать нечего
+    try:
+        verdict = await check(chat_id, text)
+    except Exception:
+        logger.warning("нейрофильтр упал на снятом сообщении в %s", chat_id,
+                       exc_info=True)
+        return
+    if verdict is None:
+        return
+    # порог тут не отсекаем: пропущенный спам как раз и интересен низкой
+    # оценкой, а именно её обычный теневой прогон никогда не покажет
+    who = getattr(getattr(message, "from_user", None), "id", None)
+    title = getattr(getattr(message, "chat", None), "title", None)
+    await log_verdict(chat_id, title, who, text, verdict, s.nn_threshold,
+                      caught_by=feature)
 
 
 async def shadow(chat_id: int, message, s, extra: str = "") -> bool:

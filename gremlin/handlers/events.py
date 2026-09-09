@@ -191,7 +191,7 @@ async def reaction_put(update: MessageReactionUpdated, bot: Bot) -> None:
         return
     if user.id in config.ADMIN_IDS:
         return
-    if "all" in await db.wl_scopes_for(update.chat.id, user.id, user.username):
+    if "all" in await db.free_scopes(update.chat.id, user.id, user.username):
         return
 
     key = (update.chat.id, user.id)
@@ -518,13 +518,38 @@ async def _sub_join_request(update: ChatJoinRequest, bot: Bot) -> None:
     sub.clear_problem(chat.id)
 
     if state:
+        if s.sub_pass == "decline":
+            # Вход закрыт всем: проверка подписки при этом не выключена и
+            # продолжает работать — вернут «впустить», и чат откроется тем же
+            # движением. Отказ тихий, как и у неподписанных.
+            tries = sub.note_request(chat.id, user.id)
+            try:
+                await bot.decline_chat_join_request(chat.id, user.id)
+            except Exception as e:
+                logger.warning("заявку %s в %s не отклонить: %s",
+                               user.id, chat.id, e)
+                return
+            sub.forget_wait(chat.id, user.id)
+            await sub.note_event(chat.id, "отклонён", user, "— вход закрыт")
+            if sub.card_due(tries):
+                again = ("" if tries < 2 else
+                         f"\n🔁 Заявка подряд {tries}-я, о промежуточных "
+                         "не сообщал")
+                await _sub_card(bot, chat, user, "🚫 <b>Заявка отклонена</b>",
+                                "подписан, но вход сейчас закрыт" + again)
+            return
         if s.sub_pass != "approve":
-            # чистое сито: бот отсекает неподписанных, а решение по остальным
-            # оставляет админам. Карточку не шлём — заявка и так висит на виду.
-            # «только по кнопке» ведёт себя тут так же: сам бот не впускает,
-            # но оставляет ход человеку, который подписался по нашей просьбе
-            sub.forget(chat.id, user.id)
+            # Чистое сито: бот отсекает неподписанных, а решение по остальным
+            # оставляет админам. «Только по кнопке» ведёт себя тут так же:
+            # сам бот не впускает, но оставляет ход человеку.
+            # Карточка с кнопками — чтобы решать прямо из лог-чата, не идя в
+            # список заявок: там не видно ни профиля, ни того, что подписка есть
+            sub.forget_wait(chat.id, user.id)
             await sub.note_event(chat.id, "подписан", user, "— оставлен админам")
+            # карточку на каждую повторную заявку не шлём: кнопки у прошлой
+            # никуда не делись, а лог-чат от одного человека забивался
+            if sub.card_due(sub.note_request(chat.id, user.id)):
+                await _sub_ask_card(bot, chat, user, s)
             return
         try:
             await bot.approve_chat_join_request(chat.id, user.id)
@@ -627,6 +652,108 @@ async def _sub_dm(bot: Bot, chat, user, user_chat_id: int | None,
         # человек мог закрыть личку — это обычное дело, не ошибка
         logger.info("не написать в личку %s: %s", user.id, e)
         return False
+
+
+async def _sub_ask_card(bot: Bot, chat, user, s) -> None:
+    """Карточка «решайте сами»: кто просится и три кнопки.
+
+    Шлём только там, где бот сознательно не решает за админа. Профиль
+    подтягиваем, если проверка профилей включена: решать по одному имени
+    неудобно, а лишний запрос тут не в тягость — заявки редки.
+    """
+    from ..services import moderation
+    who = utils.mention(user.id, user.full_name, user.username)
+    lines = [f"🙋 <b>Заявка на вступление</b> · {utils.esc(chat.title or chat.id)}",
+             f"👤 {who} (<code>{user.id}</code>)",
+             "📎 Подписан на канал — решение за вами"]
+    if s.prof_on:
+        try:
+            from ..services import profile as prof_svc
+            about = prof_svc.describe(await prof_svc.fetch(bot, user.id))
+        except Exception:
+            about = ""
+            logger.debug("профиль %s для карточки заявки не узнали", user.id,
+                         exc_info=True)
+        if about:
+            lines.append(utils.esc(about))
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="✅ Принять",
+                               callback_data=f"sub:ok:{chat.id}:{user.id}"),
+          InlineKeyboardButton(text="🚫 Отказать",
+                               callback_data=f"sub:no:{chat.id}:{user.id}"))
+    b.row(InlineKeyboardButton(text="⛔ Забанить",
+                               callback_data=f"sub:ban:{chat.id}:{user.id}"))
+    await moderation.send_card(bot, chat.id, config.BIT_SUB, "\n".join(lines),
+                               markup=b.as_markup())
+
+
+@router.callback_query(F.data.startswith("sub:ok:"))
+async def sub_take(cb: CallbackQuery, bot: Bot) -> None:
+    """Кнопка «Принять» на карточке заявки."""
+    _, _, cid, uid = cb.data.split(":")
+    cid, uid = int(cid), int(uid)
+    try:
+        await bot.approve_chat_join_request(cid, uid)
+    except Exception as e:
+        await cb.answer(f"Не вышло: {e}", show_alert=True)
+        return
+    adm_cache.invalidate_member(cid, uid)
+    await db.add_event(cid, "sub", f"впущен админом из карточки: {uid}")
+    await _sub_done(cb, "✅ <b>Впущен</b>")
+
+
+@router.callback_query(F.data.startswith("sub:no:"))
+async def sub_drop(cb: CallbackQuery, bot: Bot) -> None:
+    """Кнопка «Отказать»: заявку отклоняем, человека не трогаем."""
+    _, _, cid, uid = cb.data.split(":")
+    cid, uid = int(cid), int(uid)
+    try:
+        await bot.decline_chat_join_request(cid, uid)
+    except Exception as e:
+        await cb.answer(f"Не вышло: {e}", show_alert=True)
+        return
+    await db.add_event(cid, "sub", f"заявка отклонена админом: {uid}")
+    await _sub_done(cb, "🚫 <b>Отказано</b>")
+
+
+@router.callback_query(F.data.startswith("sub:ban:"))
+async def sub_ban(cb: CallbackQuery, bot: Bot) -> None:
+    """Кнопка «Забанить»: и заявку долой, и дорогу закрыть.
+
+    Через общий punish_ex, а не голым banChatMember: тогда бан попадает в
+    список активных наказаний и снимается оттуда же, как любой другой.
+    """
+    from ..services import moderation
+    _, _, cid, uid = cb.data.split(":")
+    cid, uid = int(cid), int(uid)
+    try:
+        await bot.decline_chat_join_request(cid, uid)
+    except Exception:
+        logger.info("заявка %s в %s уже не висит", uid, cid, exc_info=True)
+    stub = await _user_stub(uid)
+    pid, err = await moderation.punish_ex(bot, cid, stub, "ban", 0,
+                                          "заявка на вступление", cb.from_user.id,
+                                          wipe=False)
+    if pid is None:
+        await cb.answer(f"Не вышло: {err or 'Telegram отказал'}", show_alert=True)
+        return
+    await db.add_event(cid, "sub", f"забанен из карточки заявки: {uid}")
+    await _sub_done(cb, "⛔ <b>Забанен</b>")
+
+
+async def _user_stub(uid: int):
+    from ..services import net
+    return await net.user_stub(uid)
+
+
+async def _sub_done(cb: CallbackQuery, note: str) -> None:
+    """Дописать итог в карточку и убрать кнопки."""
+    try:
+        await cb.message.edit_text(cb.message.html_text + "\n\n" + note,
+                                   reply_markup=None)
+    except Exception:
+        logger.debug("карточку заявки не поправить", exc_info=True)
+    await cb.answer()
 
 
 async def _sub_card(bot: Bot, chat, user, head: str, note: str) -> None:

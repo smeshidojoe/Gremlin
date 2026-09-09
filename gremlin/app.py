@@ -208,6 +208,15 @@ async def main() -> None:
             logger.info("слов перенесено в списки профилей: %d", words)
     except Exception:
         logger.warning("разовые правки профилей не прошли", exc_info=True)
+    # разовый пересчёт векторов: КАПС ломал сравнение, правило поменялось
+    try:
+        if not await db.kv_get(db.VEC_LOWER_KEY):
+            dropped = await db.drop_vectors()
+            nn.invalidate()
+            await db.kv_set(db.VEC_LOWER_KEY, "1")
+            logger.info("векторы улик пересчитаются заново: %d", dropped)
+    except Exception:
+        logger.warning("векторы не сбросились", exc_info=True)
     # разовая починка сроков у копий по сетке
     try:
         await _fix_net_terms(bot)

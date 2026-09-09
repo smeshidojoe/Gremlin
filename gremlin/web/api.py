@@ -1051,6 +1051,38 @@ async def api_active(request: web.Request) -> web.Response:
     return js({"items": items})
 
 
+@routes.get("/api/chat/{cid}/forgiven")
+async def api_forgiven(request: web.Request) -> web.Response:
+    cid = await cid_of(request)
+    items = []
+    for r in await db.forgiven_list(cid):
+        why, swapped = utils.short_reason(r["reason"])
+        items.append({
+            "id": r["id"], "user_id": r["user_id"],
+            "who": r["name"] or (f"@{r['username']}" if r["username"]
+                                 else str(r["user_id"])),
+            "link": (f"https://t.me/{r['username']}" if r["username"]
+                     else f"tg://user?id={r['user_id']}"),
+            "scope": r["scope"],
+            "scope_label": config.WL_SCOPE_LABELS.get(r["scope"], r["scope"]),
+            "since": utils.fmt_ts(r["created"]),
+            "reason": why + (" · мут→бан" if swapped else ""),
+        })
+    return js({"items": items})
+
+
+@routes.delete("/api/chat/{cid}/forgiven/{rid}")
+async def api_forgiven_del(request: web.Request) -> web.Response:
+    cid = await cid_of(request)
+    rid = int(request.match_info["rid"])
+    row = await db.forgiven_get(rid)
+    if row is None or row["chat_id"] != cid:
+        raise web.HTTPNotFound(text="нет такой записи")
+    await db.forgiven_remove(rid)
+    await db.add_event(cid, "card", f"прощение снято: {row['user_id']} (панель)")
+    return js({"ok": True})
+
+
 @routes.post("/api/chat/{cid}/active/{pid}/lift")
 async def api_lift(request: web.Request) -> web.Response:
     cid = await cid_of(request)

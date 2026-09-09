@@ -837,6 +837,19 @@ async function warnedView(cid) {
 
 async function activeView(cid) {
   const d = await api(`/chat/${cid}/active`);
+  const f = await api(`/chat/${cid}/forgiven`);
+  const forgiven = !f.items.length ? '' : `<div class="card">
+      <h2>🕊 Прощённые (${f.items.length})</h2>
+      <div class="intro">Этих людей правило наказало зря — вы сняли наказание и выключили
+        для них именно его. Остальные проверки работают. Список растёт — значит правило
+        настроено криво.</div>
+      <div>
+        ${f.items.map((p) => `<div class="item">
+            <div class="body"><a href="${esc(p.link)}" target="_blank" rel="noopener">${esc(p.who)}</a><small>${esc(p.scope_label)} · ${esc(p.since)} · ${esc(p.reason)}</small></div>
+            <button class="btn small ghost" data-act="unforgive" data-id="${p.id}">↩️ Вернуть</button>
+          </div>`).join('')}
+      </div>
+    </div>`;
   return {
     title: 'Наказания',
     back: `#/chat/${cid}`,
@@ -858,7 +871,8 @@ async function activeView(cid) {
         <button class="btn danger" data-act="mass" data-kind="ban">⛔ Бан</button>
       </div>
       <div style="margin-top:10px">${linkRow(`#/chat/${cid}/s/punish_cfg`, '⚙️ Настройки наказаний', '')}</div>
-    </div>`,
+    </div>
+    ${forgiven}`,
   };
 }
 
@@ -1544,6 +1558,12 @@ const ACT = {
     if (r.skip.length) parts.push(`➖ ${r.skip.length}`);
     if (r.fail.length) parts.push(`⚠️ ${r.fail.length}`);
     toast(parts.join(' · ') || 'Ничего не изменилось');
+    render();
+  },
+
+  async unforgive(el) {
+    await api(`/chat/${curChat()}/forgiven/${el.dataset.id}`, { method: 'DELETE' });
+    toast('Правило снова работает');
     render();
   },
 

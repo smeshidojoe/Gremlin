@@ -85,9 +85,9 @@ def profile_word_ok(word: str) -> bool:
 SUB_ACTIONS = ("decline", "hold")
 # Что делать с тем, кто подписан. «Не трогать» превращает функцию в чистое
 # сито: неподписанных отсекаем, остальных решает админ руками.
-SUB_PASS_VALUES = ("approve", "skip", "button")
+SUB_PASS_VALUES = ("approve", "skip", "button", "decline")
 SUB_PASS_LABELS = {"approve": "впустить", "skip": "не трогать",
-                   "button": "только по кнопке"}
+                   "button": "только по кнопке", "decline": "отклонить"}
 SUB_ACTION_LABELS = {"decline": "отклонить заявку",
                      "hold": "держать и ждать подписки"}
 # сколько держим заявку в памяти для кнопки «я подписался»

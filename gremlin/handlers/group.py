@@ -275,7 +275,7 @@ async def _misuse(message: Message, bot: Bot, s) -> None:
     Вайтлист не трогаем — там свои люди, которым просто нечего тут делать.
     """
     user = message.from_user
-    scopes = await db.wl_scopes_for(message.chat.id, user.id, user.username)
+    scopes = await db.free_scopes(message.chat.id, user.id, user.username)
     try:
         await message.delete()
     except Exception:
@@ -875,7 +875,7 @@ async def on_join(message: Message, bot: Bot) -> None:
                 continue
             # профиль новичка-человека
             if not user.is_bot and user.id not in admins and user.id not in config.ADMIN_IDS:
-                scopes = await db.wl_scopes_for(message.chat.id, user.id, user.username)
+                scopes = await db.free_scopes(message.chat.id, user.id, user.username)
                 if not scopes & {"all", "watch"}:
                     await watch.check_user(bot, message.chat, user, s,
                                            event="join")
@@ -884,7 +884,7 @@ async def on_join(message: Message, bot: Bot) -> None:
         for user in message.new_chat_members or []:
             if user.is_bot or user.id in admins or user.id in config.ADMIN_IDS:
                 continue
-            scopes = await db.wl_scopes_for(message.chat.id, user.id, user.username)
+            scopes = await db.free_scopes(message.chat.id, user.id, user.username)
             if "all" in scopes:
                 continue
             try:
@@ -1053,7 +1053,9 @@ async def moderate(message: Message, bot: Bot) -> None:
         await fire_paste(bot, message, s)
         await fire_counter(bot, message, s)
         return
-    scopes = await db.wl_scopes_for(chat.id, user.id, user.username)
+    # вайтлист плюс прощённые: для правила разницы нет, оба означают
+    # «этого человека этим правилом не трогаем»
+    scopes = await db.free_scopes(chat.id, user.id, user.username)
     if "all" in scopes:
         if await fire_games(bot, message):
             return

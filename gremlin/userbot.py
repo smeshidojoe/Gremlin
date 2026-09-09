@@ -24,6 +24,14 @@ logger = logging.getLogger("gremlin.userbot")
 _recent_calls: dict[tuple[int, str], tuple] = {}
 _CALL_TTL = 300
 
+
+def _prune_calls(now: float) -> None:
+    """Кто кого звал — нужно пять минут, а лежало вечно."""
+    if len(_recent_calls) <= 2000:
+        return
+    for key in [k for k, v in _recent_calls.items() if now - v[3] > _CALL_TTL]:
+        del _recent_calls[key]
+
 _BOT_MENTION = re.compile(r"@(\w{3,32}bot)\b", re.IGNORECASE)
 
 # живой Telethon-клиент — через него меню дёргает обновление состава чата
@@ -82,6 +90,7 @@ def _button_urls(message) -> list[str]:
 def remember_call(chat_id: int, text: str, user) -> None:
     """Запомнить, что юзер упомянул @какого-то_бота — вдруг тот сейчас ответит спамом."""
     now = asyncio.get_event_loop().time()
+    _prune_calls(now)
     for uname in _BOT_MENTION.findall(text or ""):
         _recent_calls[(chat_id, uname.lower())] = (
             user.id,

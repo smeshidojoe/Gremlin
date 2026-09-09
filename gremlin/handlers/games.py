@@ -27,6 +27,15 @@ router.message.filter(F.chat.type.in_({"group", "supergroup"}))
 
 # кулдаун рулетки: (chat_id, user_id) -> когда крутил
 _rus_fired: dict[tuple[int, int], float] = {}
+
+
+def _prune_rus(now: float) -> None:
+    """Кулдаун живёт 6 часов, а запись о нём лежала вечно: в чате на тысячу
+    человек это тысяча мёртвых строк, которые никто никогда не убирал."""
+    if len(_rus_fired) <= 5000:
+        return
+    for key in [k for k, ts in _rus_fired.items() if now - ts > config.RUS_CD]:
+        del _rus_fired[key]
 # открытые дуэли и суды: (chat_id, message_id) -> состояние
 _duels: dict[tuple[int, int], dict] = {}
 _courts: dict[tuple[int, int], dict] = {}
@@ -131,6 +140,7 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
             f"{utils.fmt_minutes(int(left // 60) or 1)}.")
         _later(bot, message.chat.id, sent.message_id)
         return
+    _prune_rus(now)
     _rus_fired[key] = now
 
     s = await db.get_settings(message.chat.id)

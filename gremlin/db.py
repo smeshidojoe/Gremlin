@@ -37,6 +37,24 @@ CREATE TABLE IF NOT EXISTS chats(
     -- одному linked_id понять, кто из двоих канал, невозможно
     kind         TEXT
 );
+-- Прощённые: кого фильтр наказал зря, и админ это отменил.
+-- Отдельно от вайтлиста сознательно: вайтлист заводят заранее и руками — это
+-- «свои, проверок не надо». Здесь же след от ошибки бота, запись рождается
+-- сама при снятии наказания, и смотреть на неё надо другими глазами: если
+-- список пухнет, значит правило настроено криво.
+CREATE TABLE IF NOT EXISTS forgiven(
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id  INTEGER NOT NULL,
+    user_id  INTEGER NOT NULL,
+    username TEXT,
+    name     TEXT,
+    scope    TEXT NOT NULL,          -- какое правило больше не применяем
+    reason   TEXT,                   -- за что наказывали
+    by_id    INTEGER,
+    created  INTEGER NOT NULL,
+    UNIQUE(chat_id, user_id, scope)
+);
+CREATE INDEX IF NOT EXISTS idx_forgiven_chat ON forgiven(chat_id);
 CREATE TABLE IF NOT EXISTS nets(
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     owner_id  INTEGER NOT NULL,         -- сетки принадлежат владельцу чатов
@@ -1147,6 +1165,67 @@ async def wl_set_scopes(chat_id: int, user_id: int | None, username: str | None,
     await _db.commit()
 
 
+async def forgive_add(chat_id: int, user_id: int, username: str | None,
+                      name: str | None, scope: str, reason: str | None,
+                      by_id: int | None) -> bool:
+    """Простить человека по одному правилу. False — уже был прощён."""
+    cur = await _db.execute(
+        """INSERT OR IGNORE INTO forgiven
+             (chat_id, user_id, username, name, scope, reason, by_id, created)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (chat_id, user_id, (username or None) and username.lower().lstrip("@"),
+         name, scope, reason, by_id, _now()))
+    await _db.commit()
+    return cur.rowcount > 0
+
+
+async def forgiven_scopes(chat_id: int, user_id: int) -> set[str]:
+    """Какие правила к этому человеку в этом чате больше не применяем."""
+    cur = await _db.execute(
+        "SELECT scope FROM forgiven WHERE chat_id = ? AND user_id = ?",
+        (chat_id, user_id))
+    return {r["scope"] for r in await cur.fetchall()}
+
+
+async def free_scopes(chat_id: int, user_id: int,
+                      username: str | None) -> set[str]:
+    """Всё, за что человека не трогаем: вайтлист плюс прощённое.
+
+    Списка два, потому что заводят их по-разному, а проверкам нужен один
+    ответ — «можно ли применять это правило к этому человеку».
+    """
+    return (await wl_scopes_for(chat_id, user_id, username)
+            | await forgiven_scopes(chat_id, user_id))
+
+
+async def forgiven_list(chat_id: int) -> list[aiosqlite.Row]:
+    cur = await _db.execute(
+        "SELECT * FROM forgiven WHERE chat_id = ? ORDER BY created DESC",
+        (chat_id,))
+    return await cur.fetchall()
+
+
+async def forgiven_count(chat_id: int) -> int:
+    cur = await _db.execute(
+        "SELECT COUNT(*) AS c FROM forgiven WHERE chat_id = ?", (chat_id,))
+    return (await cur.fetchone())["c"]
+
+
+async def forgiven_get(row_id: int) -> aiosqlite.Row | None:
+    cur = await _db.execute("SELECT * FROM forgiven WHERE id = ?", (row_id,))
+    return await cur.fetchone()
+
+
+async def forgiven_remove(row_id: int) -> None:
+    await _db.execute("DELETE FROM forgiven WHERE id = ?", (row_id,))
+    await _db.commit()
+
+
+async def forgiven_clear(chat_id: int) -> None:
+    await _db.execute("DELETE FROM forgiven WHERE chat_id = ?", (chat_id,))
+    await _db.commit()
+
+
 async def wl_scopes_for(chat_id: int, user_id: int, username: str | None) -> set[str]:
     """Все scope, под которые попадает юзер (или канал) в этом чате."""
     uname = (username or "").lower()
@@ -1351,6 +1430,21 @@ async def get_punishment(pid: int) -> aiosqlite.Row | None:
 
 
 NET_TERMS_KEY = "mig_net_terms"
+VEC_LOWER_KEY = "mig_vec_lower"
+
+
+async def drop_vectors() -> int:
+    """Забыть посчитанные векторы: правило подготовки текста изменилось.
+
+    Векторы лежат в базе, чтобы не пересчитывать копилку на каждый запуск.
+    Но считались они по старой нормализации, и сравнивать их с новыми нельзя —
+    получилась бы каша из двух разных представлений. Стираем; заново их
+    посчитает первый же прогон, это секунды.
+    """
+    cur = await _db.execute(
+        "UPDATE samples SET vec = NULL WHERE vec IS NOT NULL")
+    await _db.commit()
+    return cur.rowcount
 
 
 async def net_terms_to_fix() -> list[dict]:

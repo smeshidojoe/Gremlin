@@ -3,7 +3,8 @@ import asyncio
 import logging
 
 from aiogram import Bot, F, Router
-from aiogram.types import CallbackQuery
+from aiogram.types import CallbackQuery, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .. import db
 
@@ -12,23 +13,27 @@ logger = logging.getLogger("gremlin.cards")
 router = Router()
 
 
-async def _mark(cb: CallbackQuery, note: str) -> bool:
+async def _mark(cb: CallbackQuery, note: str, markup=None) -> bool:
     """Дописать итог в карточку. False — Telegram не дал её править.
 
     Кнопки живут вечно, а вот править своё сообщение бот может лишь 48 часов.
     Действие к этому моменту уже выполнено, поэтому молчать нельзя — итог
     покажем всплывашкой.
+
+    markup — что оставить под карточкой вместо кнопок. Обычно ничего, но у
+    снятого авто-наказания там появляется «больше не трогать за это».
     """
     from ..services import moderation
     text = cb.message.html_text + note
     try:
-        await cb.message.edit_text(text, reply_markup=None,
+        await cb.message.edit_text(text, reply_markup=markup,
                                    disable_web_page_preview=True)
     except Exception:
         logger.warning("card edit failed (старше 48 часов?)", exc_info=True)
         return False
     # кнопок на карточке больше нет — пусть и приписка сетки об этом знает
-    moderation.remember_card(cb.message.chat.id, cb.message.message_id, text, None)
+    moderation.remember_card(cb.message.chat.id, cb.message.message_id, text,
+                             markup)
     # та же карточка лежит копией в другом логе — там кнопки тоже надо убрать
     await moderation.update_twins(cb.bot, cb.message.chat.id, cb.message.message_id, text)
     return True
@@ -45,7 +50,13 @@ async def card_lift(cb: CallbackQuery, bot: Bot) -> None:
         return
     # ссылку дописываем в саму карточку — отдельный пост только замусорил бы лог
     clean = cb.message.html_text + "\n\n✅ <b>Наказание снято</b>"
-    marked = await _mark(cb, "\n\n✅ <b>Наказание снято</b>" + moderation.unban_note(link))
+    # Наказание выдало правило, а человек оказался нормальным — предлагаем
+    # выключить это правило лично для него. Только для авто: у ручных причины
+    # свои, и прощать там нечего
+    scope = moderation.forgive_scope(p["reason"]) if p is not None else None
+    kb = _forgive_kb(pid, scope) if scope else None
+    marked = await _mark(cb, "\n\n✅ <b>Наказание снято</b>"
+                         + moderation.unban_note(link), kb)
     if marked and link and p is not None:
         # запомним карточку: ссылку из неё надо будет убрать при возврате человека
         # или перед тем, как Telegram перестанет давать править сообщение
@@ -79,6 +90,41 @@ async def card_lift(cb: CallbackQuery, bot: Bot) -> None:
         f"снято наказание #{pid} юзером {cb.from_user.id}",
     )
     await cb.answer("Разбанен")
+
+
+def _forgive_kb(pid: int, scope: str):
+    """Кнопка под снятым авто-наказанием: не применять к нему это правило."""
+    from .. import config
+    label = config.WL_SCOPE_LABELS.get(scope, scope)
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text=f"🕊 Больше не трогать: {label}",
+                               callback_data=f"k:fg:{pid}"))
+    return b.as_markup()
+
+
+@router.callback_query(F.data.startswith("k:fg:"))
+async def card_forgive(cb: CallbackQuery) -> None:
+    """«Фильтр ошибся» — больше не применять к этому человеку это правило."""
+    from ..services import moderation
+    pid = int(cb.data.split(":")[2])
+    p = await db.get_punishment(pid)
+    if p is None:
+        await cb.answer("Наказание не найдено.", show_alert=True)
+        return
+    scope = moderation.forgive_scope(p["reason"])
+    if scope is None:
+        await cb.answer("Это наказание выдали руками — прощать нечего.",
+                        show_alert=True)
+        return
+    from .. import config
+    label = config.WL_SCOPE_LABELS.get(scope, scope)
+    added = await db.forgive_add(p["chat_id"], p["user_id"], p["username"],
+                                 p["name"], scope, p["reason"], cb.from_user.id)
+    await db.add_event(p["chat_id"], "card",
+                       f"прощён по правилу «{label}»: {p['user_id']} "
+                       f"by {cb.from_user.id}")
+    await _mark(cb, f"\n🕊 <b>Больше не трогаем: {label}</b>")
+    await cb.answer("Прощён" if added else "Уже был прощён")
 
 
 @router.callback_query(F.data.startswith("k:ban:"))

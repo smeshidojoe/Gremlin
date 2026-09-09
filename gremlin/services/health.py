@@ -43,6 +43,31 @@ def _rss() -> str:
             return "—"
 
 
+def _caches() -> str:
+    """Сколько записей в кэшах, которые живут в памяти между сообщениями.
+
+    Нужно не из любопытства: рост RSS без роста этих чисел означает, что
+    память утекает не у нас, а в модели или в аллокаторе — и искать надо
+    там. С числами это видно сразу, без гадания.
+    """
+    from ..handlers import events, games, group
+    from . import adm_cache, filters, moderation, nn, profile, subscribe, trust
+    parts = [
+        ("участники", len(adm_cache._members)),
+        ("профили", len(profile._cache)),
+        ("доверие", len(trust._cache)),
+        ("сообщения", len(moderation._seen_msgs)),
+        ("флуд", len(filters._flood)),
+        ("реакции", len(events._reacted)),
+        ("рулетка", len(games._rus_fired)),
+        ("заявки", len(subscribe._pending) + len(subscribe._tries)),
+        ("кулдауны", len(group._cmd_fired) + len(group._guest_cmd_fired)),
+        ("нейрофильтр", len(nn._profile) + len(nn._faces) + len(nn._clusters)),
+    ]
+    big = [f"{name} {n}" for name, n in parts if n]
+    return f"\n<i>в памяти: {', '.join(big)}</i>" if big else ""
+
+
 def _uptime() -> str:
     up = runtime.uptime_seconds()
     d, rem = divmod(up, 86400)
@@ -85,7 +110,7 @@ async def report() -> str:
         "<b>⚙️ Состояние</b>\n",
         f"⏱ Аптайм: <b>{_uptime()}</b>",
         f"🕒 Местное время: <b>{utils.local_now():%d.%m %H:%M}</b> (UTC+{config.TZ_OFFSET})",
-        f"🧠 Память: <b>{_rss()}</b>",
+        f"🧠 Память: <b>{_rss()}</b>{_caches()}",
         f"🐍 Python <b>{platform.python_version()}</b> · aiogram <b>{aiogram.__version__}</b>",
         "",
         f"💬 Чатов: <b>{len(chats)}</b>" + (f" (+{logs} лог-чата)" if logs else "")

@@ -1763,12 +1763,87 @@ async def view_punishments(cid: int, page: int = 0) -> tuple[str, InlineKeyboard
 
     b = InlineKeyboardBuilder()
     b.row(_btn(f"📋 Активные: {len(rows)}", f"u:pa:{cid}:0"))
+    forgiven = await db.forgiven_count(cid)
+    if forgiven:
+        b.row(_btn(f"🕊 Прощённые: {forgiven}", f"u:fg:{cid}:0"))
     b.row(_btn("🔓 Массовый разбан", f"u:mub:{cid}"),
           _btn("👢 Массовый кик", f"u:mkick:{cid}"))
     b.row(_btn("⛔ Массовый бан", f"u:mban:{cid}"))
     b.row(_btn("⚙️ Настройки", f"u:s:{cid}:punish_cfg"))
     b.row(_btn("⬅️ Назад", f"u:c:{cid}"))
     return "\n".join(lines), b.as_markup()
+
+
+async def view_forgiven(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """Кого фильтр наказал зря и кому за это выдали освобождение.
+
+    Список рождается сам — кнопкой на карточке снятого наказания. Смотреть на
+    него стоит не как на вайтлист, а как на список ошибок: если тут десяток
+    человек по одному правилу, дело не в людях, а в настройке правила.
+    """
+    rows = await db.forgiven_list(cid)
+    chunk, page, pages = _page_slice(rows, page)
+    lines = [
+        "<b>🕊 Прощённые</b>\n",
+        "Эти люди попали под правило зря — вы сняли наказание и решили больше "
+        "их этим правилом не трогать. Остальные проверки для них работают.",
+        f"\nВсего: <b>{len(rows)}</b>"
+        + (f" · страница {page + 1} из {pages}" if pages > 1 else ""),
+        "",
+    ]
+    if not rows:
+        lines.append("Пусто — фильтр пока никого зря не тронул.")
+    start = page * LIST_PER_PAGE
+    for i, r in enumerate(chunk, start + 1):
+        who = r["name"] or (f"@{r['username']}" if r["username"] else str(r["user_id"]))
+        label = config.WL_SCOPE_LABELS.get(r["scope"], r["scope"])
+        why, _swapped = utils.short_reason(r["reason"])
+        lines.append(
+            f"{i}. <b>{utils.name_link(r['user_id'], utils.chunk(who, 40), r['username'])}</b>"
+            f" — {label} · {utils.fmt_ts(r['created'])}\n"
+            f"    <i>{utils.esc(utils.chunk(why, 70))}</i>")
+
+    b = InlineKeyboardBuilder()
+    row = []
+    for i, r in enumerate(chunk, start + 1):
+        row.append(_btn(f"❌ {i}", f"u:fgd:{cid}:{r['id']}:{page}"))
+        if len(row) == 4:
+            b.row(*row)
+            row = []
+    if row:
+        b.row(*row)
+    _pager(b, cid, "u:fg", page, pages)
+    b.row(_btn("⬅️ Назад", f"u:p:{cid}:0"))
+    return "\n".join(lines), b.as_markup()
+
+
+@router.callback_query(F.data.startswith("u:fg:"))
+async def cb_forgiven(cb: CallbackQuery) -> None:
+    _, _, cid, page = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    text, kb = await view_forgiven(cid, int(page))
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:fgd:"))
+async def cb_forgiven_del(cb: CallbackQuery) -> None:
+    """Вернуть человека под правило: ошибку признали зря или он изменился."""
+    _, _, cid, rid, page = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    row = await db.forgiven_get(int(rid))
+    await db.forgiven_remove(int(rid))
+    if row is not None:
+        await db.add_event(cid, "card",
+                           f"прощение снято: {row['user_id']} "
+                           f"({row['scope']}) by {cb.from_user.id}")
+    text, kb = await view_forgiven(cid, int(page))
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer("Правило снова работает")
 
 
 async def view_active(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
@@ -4361,7 +4436,11 @@ async def _sub_state(cid: int, s) -> str:
     else:
         lines.append("\n📄 Отказ молчаливый: человек ничего не получит, "
                      "вам придёт карточка в лог-чат.")
-    if s.sub_pass == "skip":
+    if s.sub_pass == "decline":
+        lines.append("\n🔒 Вход закрыт всем: заявки отклоняются, даже если "
+                     "человек подписан. Чтобы открыть, поставьте «Подписан: "
+                     "впустить».")
+    elif s.sub_pass == "skip":
         lines.append("\n🙅 Подписанных бот не впускает сам — их заявки висят "
                      "и ждут вас. Карточку по ним не шлём: заявка и так на виду.")
     elif s.sub_pass == "button":

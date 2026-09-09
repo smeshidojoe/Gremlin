@@ -67,6 +67,9 @@ def _load_sync() -> str:
     opts.intra_op_num_threads = 1
     opts.inter_op_num_threads = 1
     opts.log_severity_level = 3
+    # без своей арены: она только растёт и памяти не отдаёт, а у нас
+    # прогоны редкие и разного размера — RSS от этого полз вверх
+    opts.enable_cpu_mem_arena = False
     sess = onnxruntime.InferenceSession(onnx, opts, providers=["CPUExecutionProvider"])
     _sess, _np, _Image = sess, numpy, Image
     _size = size

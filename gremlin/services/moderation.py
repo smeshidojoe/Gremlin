@@ -672,6 +672,45 @@ async def leave_chat(bot: Bot, chat_id: int) -> tuple[bool, str]:
     return True, note
 
 
+# Причина наказания -> уровень вайтлиста, который это правило больше не
+# применит. Порядок важен: ищем по началу причины, а «ссылка на сторонний чат»
+# начинается не так, как «ссылка».
+FORGIVE_SCOPES = (
+    ("инлайн-бот", "inline"),
+    ("стоп-слово", "words"),
+    ("смысловое совпадение", "words"),
+    ("внешняя ссылка", "links"),
+    ("ссылка на сторонний чат", "links"),
+    ("упоминание стороннего чата", "links"),
+    ("пересылка", "links"),
+    ("флуд", "flood"),
+    ("рассылка", "watch"),
+    ("профиль", "watch"),
+    ("наблюдение", "watch"),
+    ("общий список спамеров", "watch"),
+)
+
+
+def forgive_scope(reason: str | None) -> str | None:
+    """За что прощать человека, если это наказание сняли. None — не за что.
+
+    Прощаем узко: сработало наблюдение — выключаем ему наблюдение, а ссылки и
+    стоп-слова продолжают работать. Полный игнор из-за одной ошибки фильтра
+    выдавать нельзя: аккаунты перепродают, и «прощён навсегда» однажды
+    обернётся рекламой, которую никто не остановит.
+
+    Ручные наказания сюда не попадают: причины у людей свои, к правилам они
+    отношения не имеют, и прощать там нечего.
+    """
+    from .. import utils
+    why, _swapped = utils.short_reason(reason)
+    low = why.lower()
+    for prefix, scope in FORGIVE_SCOPES:
+        if low.startswith(prefix):
+            return scope
+    return None
+
+
 async def send_card(bot: Bot, chat_id: int, bit: int, text: str,
                     pid: int | None = None, kind: str = "delete",
                     user_id: int | None = None,
@@ -860,8 +899,21 @@ async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
         chat.id, feature_label,
         f"{applied}: {user.full_name} ({user.id}) — {reason}",
     )
-    # улика для нейрофильтра: сработало правило — значит это пример спама
     s = await db.get_settings(chat.id)
+    # Теневой прогон по уже снятому: обычный до такого сообщения не доходит —
+    # правило сработало раньше и вышло из обработки. Без этих строк в логе
+    # одна болтовня, и понять, ловит ли фильтр настоящий спам, нечем.
+    # Строго до того, как сообщение ляжет уликой: иначе фильтр нашёл бы
+    # ближайшим совпадением его же самого и отчитался о 100%.
+    if s.nn_mode >= 2:
+        from . import nn as nn_svc
+        try:
+            await nn_svc.shadow_caught(
+                chat.id, message, s, media.cached(message), feature_label)
+        except Exception:
+            logger.debug("теневой прогон по снятому не вышел", exc_info=True)
+
+    # улика для нейрофильтра: сработало правило — значит это пример спама
     if s.nn_mode:
         await db.sample_add(
             chat.id, user.id, "auto", "spam",

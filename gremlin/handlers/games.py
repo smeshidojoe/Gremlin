@@ -128,15 +128,41 @@ _RUS_HIT = (
 )
 
 
+async def _rus_target(message: Message, bot: Bot):
+    """За кого крутим барабан: (игрок, отправил ли его админ).
+
+    Обычно за того, кто позвал. Но админ может ответить командой на чужое
+    сообщение — тогда крутим за автора этого сообщения: чат нередко просит
+    «прогони его через рулетку», и админу не приходится объяснять, что
+    вызвать может только сам человек.
+
+    Обычному участнику так нельзя: иначе рулетка стала бы способом мутить
+    кого хочешь чужими руками с шансом один к шести.
+    """
+    reply = message.reply_to_message
+    author = getattr(reply, "from_user", None) if reply else None
+    if author is None or author.id == message.from_user.id or author.is_bot:
+        return message.from_user, False
+    if message.from_user.id not in await adm_cache.chat_admin_ids(
+            bot, message.chat.id):
+        return message.from_user, False
+    return author, True
+
+
 async def cmd_roulette(message: Message, bot: Bot) -> None:
     if not await _allowed(bot, message, config.GAME_RUS):
         return
-    key = (message.chat.id, message.from_user.id)
+    player, by_admin = await _rus_target(message, bot)
+    # Кулдаун считаем на игрока, а не на того, кто позвал: иначе админ гонял
+    # бы одного человека по кругу без остановки.
+    key = (message.chat.id, player.id)
     now = time.time()
     left = config.RUS_CD - (now - _rus_fired.get(key, 0))
     if left > 0:
+        waiting = ("Барабан ещё горячий" if not by_admin
+                   else f"{utils.esc(player.full_name)} крутил недавно")
         sent = await message.reply(
-            f"🔫 Барабан ещё горячий. Возвращайся через "
+            f"🔫 {waiting}. Возвращайся через "
             f"{utils.fmt_minutes(int(left // 60) or 1)}.")
         _later(bot, message.chat.id, sent.message_id)
         return
@@ -146,20 +172,20 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
     s = await db.get_settings(message.chat.id)
     kind, minutes = await prize(s, config.GAME_RUS)
     hit = random.randrange(config.RUS_CHANCE) == 0
-    who = utils.mention(message.from_user.id, message.from_user.full_name,
-                        message.from_user.username)
-    sent = await message.reply("🔫 Крутим барабан…")
+    who = utils.mention(player.id, player.full_name, player.username)
+    sent = await message.reply("🔫 Крутим барабан…" if not by_admin
+                               else f"🔫 Барабан крутят за {who}…")
     await asyncio.sleep(2)
     # итог выстрела оставляем в чате: он короткий, и по нему видно, кто
     # когда крутил. Самоуничтожается только служебная воркотня про кулдаун
     if not hit:
         await sent.edit_text(f"🔫 {who}: {random.choice(_RUS_SAFE)}")
         return
-    if not await _can_target(bot, message.chat.id, message.from_user.id):
+    if not await _can_target(bot, message.chat.id, player.id):
         await sent.edit_text(f"🔫 {who}: {random.choice(_RUS_HIT)}\n"
                              f"<i>…но админов пуля не берёт.</i>")
         return
-    ok = await _punish(bot, message.chat.id, message.from_user.id, kind, minutes,
+    ok = await _punish(bot, message.chat.id, player.id, kind, minutes,
                        "проиграл в русскую рулетку")
     tail = (f"{prize_label(kind, minutes).capitalize()}." if ok
             else "…но пистолет заклинило: у бота нет прав.")

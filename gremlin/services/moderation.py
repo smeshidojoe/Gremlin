@@ -841,6 +841,49 @@ def _album_sweep(now: float) -> None:
         _ALBUMS.pop(key, None)
 
 
+# Какое правило к какой семье относится. Модули, оставленные отдельно
+# (ссылки, инлайн-боты, антифлуд, анонимы), семьи не имеют: они ловят
+# конкретное нарушение, а не «похоже на спам». По ним единая оценка считает
+# только то, что видит сама, — так и видно, справилась бы она без них.
+_UNI_FAMILY = {
+    "стоп-слово": "stopword",
+    "смысловое совпадение": "phrase",
+    "рассылка": "burst",
+}
+
+
+async def _uni_shadow(bot: Bot, chat, user, s, message, feature_label: str,
+                      applied: str, detail: str = "", seen_text: str = "") -> None:
+    """Посчитать вердикт по сообщению, которое уже снято правилом."""
+    from . import adm_cache, trust, verdict as vd
+    from . import watch as watch_svc
+
+    text = " ".join(filter(None, [message.text or message.caption or "",
+                                  seen_text]))
+    kind = _UNI_FAMILY.get(feature_label)
+    hard, cosmetic, why = watch_svc.message_parts(text)
+    buttons = button_urls(message)
+    outward = vd.has_outward(text, buttons)
+    signals = vd.content_signals(
+        stopword=(detail or "совпадение") if kind == "stopword" else None,
+        phrase=(detail or "да") if kind == "phrase" else None,
+        text_hard=hard, text_cosmetic=cosmetic, text_why=why, outward=outward)
+    signals += vd.behavior_signals(burst=kind == "burst")
+    p_hard, _p_cos, p_why = watch_svc.profile_parts(
+        user.first_name, user.last_name, user.username)
+    signals += vd.profile_signals(name_hard=p_hard, name_why=p_why)
+
+    lvl = await trust.level(bot, chat.id, user.id, s) if s.trust_on else None
+    # только то, что уже знаем: лишний getChatMember ради теневой
+    # записи не оправдан
+    known = adm_cache.member_cached(chat.id, user.id)
+    guest = known is False
+    ctx = await vd.context(chat.id, user, message, lvl=lvl, guest=guest,
+                           text=text, buttons=buttons)
+    await vd.shadow(chat, user, s, signals=signals, ctx=ctx, text=text,
+                    was=f"{feature_label}/{applied}")
+
+
 async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
                     punish_kind: str, mute_min: int, detail: str) -> None:
     """Полный цикл нарушения: удалить сообщение, наказать, карточка, логи."""
@@ -912,6 +955,16 @@ async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
                 chat.id, message, s, media.cached(message), feature_label)
         except Exception:
             logger.debug("теневой прогон по снятому не вышел", exc_info=True)
+
+    # Единая оценка по тому же сообщению: что сказала бы она, если бы решала
+    # сама. Сравнение с тем, что сделало правило, и есть смысл теневого режима.
+    if s.uni_mode:
+        try:
+            await _uni_shadow(bot, chat, user, s, message, feature_label,
+                              applied, detail=detail,
+                              seen_text=media.cached(message))
+        except Exception:
+            logger.debug("единая оценка по снятому не посчиталась", exc_info=True)
 
     # улика для нейрофильтра: сработало правило — значит это пример спама
     if s.nn_mode:

@@ -434,6 +434,80 @@ async def _profile_punish(bot, chat, user, settings, message, data, why) -> bool
     return True
 
 
+_PERCENT = re.compile(r"\((\d{1,3})%\)")
+
+
+def _percent(reason: str, default: int = 100) -> int:
+    """Вытащить процент из причины вида «откровенная аватарка (97%)»."""
+    m = _PERCENT.search(reason or "")
+    return int(m.group(1)) if m else default
+
+
+def _clean_find(reason: str) -> str:
+    """«стоп-слово в профиле: «18+»» -> «18+»: в логе хватает самого слова."""
+    head, sep, tail = (reason or "").partition(": ")
+    return (tail if sep else head).strip("«»") or reason
+
+
+async def _uni_shadow(bot, chat, user, settings, message, text, *,
+                      p_hard, p_reasons, hard, cosmetic, m_reasons,
+                      prof_pts, prof_reasons, cas_pts, nn_hit, lvl,
+                      face_sim, total, suspect, ban_at, event) -> None:
+    """Перевести улики наблюдения на общую шкалу и записать вердикт.
+
+    Заново ничего не считаем и в Telegram не ходим: берём то, что наблюдение
+    уже собрало. Иначе теневой прогон удвоил бы работу на каждом сообщении.
+    """
+    from . import adm_cache, moderation, verdict as vd
+
+    buttons = moderation.button_urls(message) if message is not None else []
+    outward = vd.has_outward(text, buttons)
+    signals = vd.content_signals(
+        # наблюдение знает только «сработал или нет», поэтому берём порог
+        # чата: врать точным процентом в логе, по которому будем калиброваться,
+        # нельзя
+        nn_score=settings.nn_threshold if nn_hit else None,
+        text_hard=hard, text_cosmetic=cosmetic, text_why=m_reasons,
+        outward=outward)
+    # Находка в профиле приходит уже очками и текстом причины — переводим
+    # обратно в признаки. Проценты вытаскиваем настоящие: по этому логу потом
+    # подбираются веса, и выдуманные числа в нём хуже, чем их отсутствие.
+    word = photo = None
+    face = face_sim
+    for reason in prof_reasons if prof_pts else []:
+        if "аватарка" in reason:
+            photo = _percent(reason)
+        elif "как у забаненных" in reason:
+            # сравнение с копилкой спам-профилей (туда же подмешан стартовый
+            # набор) — это догадка модели, и записывать её проверяемым фактом
+            # нельзя: на одних догадках наказание не складывается
+            face = max(face or 0, _percent(reason))
+        elif word is None:
+            word = _clean_find(reason)
+    signals += vd.profile_signals(word=word, face=face, name_hard=p_hard,
+                                  name_why=p_reasons, photo=photo)
+    signals += vd.behavior_signals(reaction_only=event == "reaction",
+                                   first_message=event == "join")
+
+    # только то, что уже знаем: лишний getChatMember ради теневой
+    # записи не оправдан
+    known = adm_cache.member_cached(chat.id, user.id)
+    guest = known is False
+    ctx = await vd.context(chat.id, user, message, lvl=lvl, guest=guest,
+                           text=text, buttons=buttons)
+    # факты о человеке лежат в ctx: спрашивать их второй раз — три лишних
+    # запроса к базе на каждое подозрительное сообщение
+    signals += vd.reputation_signals(cas=bool(cas_pts),
+                                     punished=ctx["facts"]["pun"])
+    was = "ничего"
+    if ban_at and total >= ban_at:
+        was = "наблюдение/ban"
+    elif total >= suspect:
+        was = "наблюдение/карточка"
+    await vd.shadow(chat, user, settings, signals=signals, ctx=ctx, text=text,
+                    was=was)
+
+
 async def check_user(bot, chat, user, settings, message=None, lvl=None,
                      event: str = "message", nn_hit: bool = False) -> None:
     """Полный цикл наблюдения: скоринг профиля (+сообщения), бан или карточка.
@@ -539,12 +613,14 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None,
     # Имя и ник — тоже текст. «Анна | 18+ ЛС» и «Кристина ❤️ пиши в лс» для
     # эвристик разные, для модели — одно и то же, поэтому сравниваем профиль
     # с теми, за кого в этом чате уже банили.
+    face_sim = None
     if settings.watch_nn and total:
         from . import nn
         face = (f"{user.full_name} @{user.username}" if user.username
                 else user.full_name)
         sim = await nn.face_score(chat.id, face)
         if sim is not None and sim >= config.PROFILE_SIM:
+            face_sim = sim
             total += config.PROFILE_POINTS
             reasons.append(f"имя как у забаненных профилей ({sim}%)")
     # CAS при подозрении: спрашиваем, только когда что-то уже набежало или
@@ -575,6 +651,21 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None,
             reasons.append("автор не состоит в чате")
     if lvl is not None:
         reasons.append(f"доверие: {trust_svc.label(lvl)}")
+    # Единая оценка по тем же уликам, что собрало наблюдение. Считаем до
+    # решения и ничего по ней не делаем: сейчас она только записывается.
+    if settings.uni_mode:
+        try:
+            await _uni_shadow(bot, chat, user, settings, message, text,
+                              p_hard=p_hard, p_reasons=p_reasons,
+                              hard=hard, cosmetic=cosmetic, m_reasons=m_reasons,
+                              prof_pts=prof_pts, prof_reasons=prof_reasons,
+                              cas_pts=cas_pts, nn_hit=nn_hit, lvl=lvl,
+                              face_sim=face_sim,
+                              total=total, suspect=suspect, ban_at=ban_at,
+                              event=event)
+        except Exception:
+            logger.debug("единая оценка не посчиталась", exc_info=True)
+
     # текст сообщения — только если человек что-то писал: на входе в чат его нет.
     # Ссылку даём: при подозрении сообщение остаётся в чате, его можно открыть.
     body = moderation.message_body(message, with_link=True)

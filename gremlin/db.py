@@ -55,6 +55,23 @@ CREATE TABLE IF NOT EXISTS forgiven(
     UNIQUE(chat_id, user_id, scope)
 );
 CREATE INDEX IF NOT EXISTS idx_forgiven_chat ON forgiven(chat_id);
+-- Разбор решений единой оценки. Нужен не для показа, а для калибровки:
+-- через месяц по этим строкам вместе с кнопками на карточках («снять» или
+-- «подтвердить») можно подобрать веса по настоящим исходам, а не на глаз.
+CREATE TABLE IF NOT EXISTS verdicts(
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id  INTEGER NOT NULL,
+    user_id  INTEGER NOT NULL,
+    ts       INTEGER NOT NULL,
+    total    INTEGER NOT NULL,
+    raw      INTEGER NOT NULL,
+    action   TEXT NOT NULL,          -- что предложила единая оценка
+    was      TEXT,                   -- что на самом деле сделали старые правила
+    families TEXT,                   -- json: семья -> очки
+    signals  TEXT,                   -- json: список улик
+    text     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_verdicts_chat ON verdicts(chat_id, ts);
 CREATE TABLE IF NOT EXISTS nets(
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     owner_id  INTEGER NOT NULL,         -- сетки принадлежат владельцу чатов
@@ -170,10 +187,13 @@ CREATE TABLE IF NOT EXISTS settings(
     prof_mute_min   INTEGER NOT NULL DEFAULT 60,
     prof_score      INTEGER NOT NULL DEFAULT 80,
     prof_photo      INTEGER NOT NULL DEFAULT 1,
-    prof_photo_min  INTEGER NOT NULL DEFAULT 85,
+    prof_photo_min  INTEGER NOT NULL DEFAULT 97,
     prof_photo_score INTEGER NOT NULL DEFAULT 60,
     prof_words      INTEGER NOT NULL DEFAULT 1,
     prof_members    INTEGER NOT NULL DEFAULT 1,
+    uni_mode        INTEGER NOT NULL DEFAULT 1,
+    uni_suspect     INTEGER NOT NULL DEFAULT 45,
+    uni_ban         INTEGER NOT NULL DEFAULT 75,
     sub_on          INTEGER NOT NULL DEFAULT 0,
     sub_chat_id     INTEGER NOT NULL DEFAULT 0,
     sub_action      TEXT    NOT NULL DEFAULT 'decline',
@@ -464,10 +484,13 @@ class Settings:
     prof_mute_min: int = 60
     prof_score: int = 80
     prof_photo: int = 1
-    prof_photo_min: int = 85
+    prof_photo_min: int = 97
     prof_photo_score: int = 60
     prof_words: int = 1
     prof_members: int = 1
+    uni_mode: int = 1
+    uni_suspect: int = 45
+    uni_ban: int = 75
     sub_on: int = 0
     sub_chat_id: int = 0
     sub_action: str = "decline"
@@ -543,10 +566,13 @@ _SETTINGS_MIGRATIONS = {
     "prof_mute_min": "INTEGER NOT NULL DEFAULT 60",
     "prof_score": "INTEGER NOT NULL DEFAULT 80",
     "prof_photo": "INTEGER NOT NULL DEFAULT 1",
-    "prof_photo_min": "INTEGER NOT NULL DEFAULT 85",
+    "prof_photo_min": "INTEGER NOT NULL DEFAULT 97",
     "prof_photo_score": "INTEGER NOT NULL DEFAULT 60",
     "prof_words": "INTEGER NOT NULL DEFAULT 1",
     "prof_members": "INTEGER NOT NULL DEFAULT 1",
+    "uni_mode": "INTEGER NOT NULL DEFAULT 1",
+    "uni_suspect": "INTEGER NOT NULL DEFAULT 45",
+    "uni_ban": "INTEGER NOT NULL DEFAULT 75",
     "sub_on": "INTEGER NOT NULL DEFAULT 0",
     "sub_chat_id": "INTEGER NOT NULL DEFAULT 0",
     "sub_action": "TEXT NOT NULL DEFAULT 'decline'",
@@ -1165,6 +1191,37 @@ async def wl_set_scopes(chat_id: int, user_id: int | None, username: str | None,
     await _db.commit()
 
 
+async def verdict_add(chat_id: int, user_id: int, total: int, raw: int,
+                      action: str, was: str | None, families: str,
+                      signals: str, text: str | None) -> None:
+    await _db.execute(
+        """INSERT INTO verdicts (chat_id, user_id, ts, total, raw, action,
+                                 was, families, signals, text)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (chat_id, user_id, _now(), total, raw, action, was, families, signals,
+         (text or "")[:500]))
+    await _db.commit()
+
+
+async def verdict_stats(chat_id: int) -> dict:
+    """Сводка теневых вердиктов: сколько чего предложено против сделанного."""
+    cur = await _db.execute(
+        """SELECT action, was, COUNT(*) AS c FROM verdicts
+             WHERE chat_id = ? GROUP BY action, was""", (chat_id,))
+    out: dict[str, int] = {}
+    for r in await cur.fetchall():
+        out[f"{r['action']}<-{r['was'] or 'ничего'}"] = r["c"]
+    return out
+
+
+async def verdicts_prune(keep_days: int = 60) -> int:
+    """Журнал нужен для калибровки, а не навсегда."""
+    cur = await _db.execute("DELETE FROM verdicts WHERE ts < ?",
+                            (_now() - keep_days * 86400,))
+    await _db.commit()
+    return cur.rowcount
+
+
 async def forgive_add(chat_id: int, user_id: int, username: str | None,
                       name: str | None, scope: str, reason: str | None,
                       by_id: int | None) -> bool:
@@ -1431,6 +1488,21 @@ async def get_punishment(pid: int) -> aiosqlite.Row | None:
 
 NET_TERMS_KEY = "mig_net_terms"
 VEC_LOWER_KEY = "mig_vec_lower"
+NSFW_RAISE_KEY = "mig_nsfw_97"
+
+
+async def raise_photo_min(floor: int = 97) -> int:
+    """Поднять порог откровенности там, где стоит ниже нового минимума.
+
+    Старое значение 85 — то самое, на котором обычный портрет в платье
+    получил 92% и стоил живому человеку бана. Оставлять его в чатах,
+    где его никто осознанно не выбирал, смысла нет.
+    """
+    cur = await _db.execute(
+        "UPDATE settings SET prof_photo_min = ? WHERE prof_photo_min < ?",
+        (floor, floor))
+    await _db.commit()
+    return cur.rowcount
 
 
 async def drop_vectors() -> int:

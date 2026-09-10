@@ -166,6 +166,16 @@ _members: dict[tuple[int, int], tuple[float, bool]] = {}
 MEMBER_TTL = 900
 
 
+def member_cached(chat_id: int, user_id: int) -> bool | None:
+    """Что мы уже знаем о членстве, не спрашивая Telegram. None — не знаем.
+
+    Нужно там, где ответ приятен, но не обязателен: теневые прогоны и записи
+    в лог не стоят живого запроса к API на каждое сообщение.
+    """
+    hit = _members.get((chat_id, user_id))
+    return hit[1] if hit and hit[0] > time.monotonic() else None
+
+
 async def is_member(bot: Bot, chat_id: int, user_id: int) -> bool:
     """Состоит ли человек в чате.
 

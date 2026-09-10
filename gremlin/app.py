@@ -217,6 +217,15 @@ async def main() -> None:
             logger.info("векторы улик пересчитаются заново: %d", dropped)
     except Exception:
         logger.warning("векторы не сбросились", exc_info=True)
+    # разовый подъём порога аватарки: 85 давал ложные баны на портретах
+    try:
+        if not await db.kv_get(db.NSFW_RAISE_KEY):
+            raised = await db.raise_photo_min()
+            await db.kv_set(db.NSFW_RAISE_KEY, "1")
+            if raised:
+                logger.info("порог откровенности поднят в %d чатах", raised)
+    except Exception:
+        logger.warning("порог аватарки не поднялся", exc_info=True)
     # разовая починка сроков у копий по сетке
     try:
         await _fix_net_terms(bot)

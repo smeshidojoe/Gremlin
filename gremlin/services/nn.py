@@ -762,6 +762,11 @@ async def keeper() -> None:
             gone = await db.samples_trim(config.SAMPLE_KEEP)
             if gone:
                 logger.info("копилка улик подрезана: удалено %d", gone)
+            # журнал единой оценки нужен для калибровки, а не навсегда:
+            # строка на каждое подозрительное сообщение накапливается быстро
+            old_verdicts = await db.verdicts_prune(config.UNI_KEEP_DAYS)
+            if old_verdicts:
+                logger.info("журнал вердиктов подрезан: удалено %d", old_verdicts)
             if await ensure():
                 # стартовый набор считаем отдельно: он общий, в samples_without_vec
                 # не попадает (там только свои улики чатов), а без готовых векторов

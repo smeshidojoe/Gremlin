@@ -50,6 +50,7 @@ def forget(chat_id: int, user_id: int) -> None:
     """Человек вошёл — забываем о нём всё, включая счёт заявок."""
     _pending.pop((chat_id, user_id), None)
     _tries.pop((chat_id, user_id), None)
+    _dm_sent.pop((chat_id, user_id), None)
 
 
 def forget_wait(chat_id: int, user_id: int) -> None:
@@ -89,6 +90,38 @@ def note_request(chat_id: int, user_id: int) -> int:
 def card_due(count: int) -> bool:
     """Показывать ли карточку на эту по счёту заявку."""
     return count == 1 or count == config.SUB_REPEAT_ALERT
+
+
+# кому и когда мы уже писали в личку: (чат, человек) -> когда
+_dm_sent: dict[tuple[int, int], float] = {}
+
+
+def dm_due(chat_id: int, user_id: int) -> bool:
+    """Можно ли писать человеку в личку — только проверка, без отметки.
+
+    Считается отдельно от карточек: у них разные адресаты. Карточки молчат,
+    чтобы не заваливать лог-чат одним и тем же человеком, а письмо — чтобы не
+    заваливать самого человека. Когда это было одним счётчиком, смена режима
+    с отказа на ожидание оставляла людей без объяснения: счёт заявок уже
+    набежал, и первое же письмо считалось повторным.
+    """
+    last = _dm_sent.get((chat_id, user_id), 0)
+    return time.time() - last >= config.SUB_REPEAT_WINDOW
+
+
+def dm_noted(chat_id: int, user_id: int) -> None:
+    """Отметить, что письмо действительно ушло.
+
+    Отдельно от проверки нарочно: в режиме отказа письма нет вовсе, и если
+    отмечать заранее, человек считался бы «уже предупреждённым», ни разу
+    ничего не получив.
+    """
+    now = time.time()
+    if len(_dm_sent) > 10000:
+        for key in [k for k, ts in _dm_sent.items()
+                    if now - ts > config.SUB_REPEAT_WINDOW]:
+            del _dm_sent[key]
+    _dm_sent[(chat_id, user_id)] = now
 
 
 async def target_channel(bot, chat_id: int, s) -> int | None:

@@ -573,8 +573,11 @@ async def _sub_join_request(update: ChatJoinRequest, bot: Bot) -> None:
 
     # не подписан: сперва пишем в личку, потом решаем судьбу заявки —
     # после отклонения окно на сообщение Telegram закрывает.
-    # В режиме отказа _sub_dm сам ничего не отправит: письмо там ни к чему
-    sent = await _sub_dm(bot, chat, user, update.user_chat_id, target, s) if loud else False
+    # В режиме отказа _sub_dm сам ничего не отправит: письмо там ни к чему.
+    # Право написать спрашиваем отдельно от карточки: карточка бережёт лог-чат,
+    # письмо — самого человека, и счёт у них общим быть не должен
+    sent = (await _sub_dm(bot, chat, user, update.user_chat_id, target, s)
+            if sub.dm_due(chat.id, user.id) else False)
     if s.sub_action == "hold":
         sub.remember(chat.id, user.id)
         note = "заявка ждёт подписки" + ("" if sent else ", но написать в личку не вышло")
@@ -647,6 +650,9 @@ async def _sub_dm(bot: Bot, chat, user, user_chat_id: int | None,
     try:
         await triggers.send_answer_to(bot, user_chat_id, ans, subs,
                                       b.as_markup() if b.buttons else None)
+        # отмечаем только по факту отправки: иначе «уже писали» стояло бы и
+        # там, где письма не было вовсе
+        sub.dm_noted(chat.id, user.id)
         return True
     except Exception as e:
         # человек мог закрыть личку — это обычное дело, не ошибка

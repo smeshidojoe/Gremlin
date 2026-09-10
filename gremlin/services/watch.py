@@ -499,11 +499,14 @@ async def _uni_shadow(bot, chat, user, settings, message, text, *,
     # запроса к базе на каждое подозрительное сообщение
     signals += vd.reputation_signals(cas=bool(cas_pts),
                                      punished=ctx["facts"]["pun"])
+    # Пишем состояние, а не отправку: карточку наблюдение при повторе
+    # придерживает (RECARD_STEP), и метка «карточка» врала бы — сравнивали
+    # бы вердикт с тем, чего не было.
     was = "ничего"
     if ban_at and total >= ban_at:
         was = "наблюдение/ban"
     elif total >= suspect:
-        was = "наблюдение/карточка"
+        was = "наблюдение/подозрение"
     await vd.shadow(chat, user, settings, signals=signals, ctx=ctx, text=text,
                     was=was)
 

@@ -292,7 +292,10 @@ CREATE TABLE IF NOT EXISTS words(
     mode    TEXT NOT NULL DEFAULT 'strict',
     -- 'msg' — запрещено в сообщениях, 'prof' — ищем в описании профиля.
     -- Списки разные: в сообщениях запрещают темы, в профиле ищут рекламу
-    kind    TEXT NOT NULL DEFAULT 'msg'
+    kind    TEXT NOT NULL DEFAULT 'msg',
+    -- Сколько слово значит для единой оценки. Старую систему не касается:
+    -- там совпало — наказали, весить нечего.
+    weight  INTEGER NOT NULL DEFAULT 45
 );
 CREATE TABLE IF NOT EXISTS phrases(
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -641,7 +644,8 @@ _TABLE_MIGRATIONS = {
     "answers": {"last_used": "INTEGER NOT NULL DEFAULT 0"},
     "chats": {"net_id": "INTEGER", "linked_id": "INTEGER",
               "linked_title": "TEXT", "kind": "TEXT"},
-    "words": {"kind": "TEXT NOT NULL DEFAULT 'msg'"},
+    "words": {"kind": "TEXT NOT NULL DEFAULT 'msg'",
+              "weight": "INTEGER NOT NULL DEFAULT 45"},
     "watch_profiles": {"score": "INTEGER NOT NULL DEFAULT 0",
                        "score_ts": "INTEGER NOT NULL DEFAULT 0",
                        "card_score": "INTEGER NOT NULL DEFAULT 0"},
@@ -1413,6 +1417,21 @@ async def words_clear(chat_id: int, kind: str = "msg") -> int:
                             (chat_id, kind))
     await _db.commit()
     return cur.rowcount or 0
+
+
+async def words_set_weight(row_id: int, weight: int) -> None:
+    """Поменять вес слова. Значение сверяем со списком: в базу не должно
+    попасть ничего, чего меню не умеет показать."""
+    if weight not in config.WORD_WEIGHTS:
+        raise ValueError(weight)
+    await _db.execute("UPDATE words SET weight = ? WHERE id = ?",
+                      (weight, row_id))
+    await _db.commit()
+
+
+async def words_get(row_id: int) -> aiosqlite.Row | None:
+    cur = await _db.execute("SELECT * FROM words WHERE id = ?", (row_id,))
+    return await cur.fetchone()
 
 
 async def words_remove(row_id: int) -> None:

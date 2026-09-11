@@ -856,6 +856,7 @@ async def _uni_shadow(bot: Bot, chat, user, s, message, feature_label: str,
                       applied: str, detail: str = "", seen_text: str = "") -> None:
     """Посчитать вердикт по сообщению, которое уже снято правилом."""
     from . import adm_cache, trust, verdict as vd
+    from . import filters as flt
     from . import watch as watch_svc
 
     text = " ".join(filter(None, [message.text or message.caption or "",
@@ -864,8 +865,11 @@ async def _uni_shadow(bot: Bot, chat, user, s, message, feature_label: str,
     hard, cosmetic, why = watch_svc.message_parts(text)
     buttons = button_urls(message)
     outward = vd.has_outward(text, buttons)
+    weight = (await flt.stopword_weight(chat.id, detail, "msg")
+              if kind == "stopword" else None)
     signals = vd.content_signals(
         stopword=(detail or "совпадение") if kind == "stopword" else None,
+        stopword_weight=weight,
         phrase=(detail or "да") if kind == "phrase" else None,
         text_hard=hard, text_cosmetic=cosmetic, text_why=why, outward=outward)
     signals += vd.behavior_signals(burst=kind == "burst")

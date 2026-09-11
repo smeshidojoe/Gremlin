@@ -484,8 +484,12 @@ async def _uni_shadow(bot, chat, user, settings, message, text, *,
             face = max(face or 0, _percent(reason))
         elif word is None:
             word = _clean_find(reason)
-    signals += vd.profile_signals(word=word, face=face, name_hard=p_hard,
-                                  name_why=p_reasons, photo=photo)
+    from . import filters as flt
+    word_weight = (await flt.stopword_weight(chat.id, word, "prof")
+                   if word else None)
+    signals += vd.profile_signals(word=word, word_weight=word_weight, face=face,
+                                  name_hard=p_hard, name_why=p_reasons,
+                                  photo=photo)
     signals += vd.behavior_signals(reaction_only=event == "reaction",
                                    first_message=event == "join")
 

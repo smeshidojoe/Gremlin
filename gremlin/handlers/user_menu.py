@@ -1008,6 +1008,59 @@ def _word_label(word: str, mode: str) -> str:
     return f"{word}{'*' if mode == 'stem' else ''}"
 
 
+def _weight_of(row) -> int:
+    """Вес слова. Записи, добавленные до появления колонки, считаем сильными."""
+    try:
+        return int(row["weight"])
+    except (IndexError, KeyError, TypeError, ValueError):
+        return config.UNI_W_STOPWORD
+
+
+def _weight_mark(row) -> str:
+    """Коротко для кнопки: чем слово весит меньше, тем бледнее значок."""
+    return {15: "▁", 30: "▄", 45: "█"}.get(_weight_of(row), "█")
+
+
+WEIGHT_HELP = (
+    "\n\n⚖️ Вес — сколько слово значит для будущей единой оценки. "
+    "На нынешние наказания он не влияет: там совпало — сработало.\n"
+    "█ сильная — в живой речи не встречается («онлифанс», «п0драб0ткa»)\n"
+    "▄ средняя — чаще у спама, но бывает и у людей\n"
+    "▁ слабая — обычное слово («оплата», «пиши»): одной не хватит даже "
+    "на подозрение"
+)
+
+
+async def _cycle_weight(cb: CallbackQuery, kind: str) -> None:
+    """Перебрать вес слова по кругу и перерисовать список."""
+    _, _, cid, page, rid = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    row = await db.words_get(int(rid))
+    if row is None:
+        await cb.answer("Слово уже удалили.", show_alert=True)
+        return
+    order = list(config.WORD_WEIGHTS)
+    now = _weight_of(row)
+    nxt = order[(order.index(now) + 1) % len(order)] if now in order else order[-1]
+    await db.words_set_weight(int(rid), nxt)
+    view = view_prof_words if kind == "prof" else view_words
+    text, kb = await view(cid, int(page))
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer(f"«{row['word']}»: {config.WORD_WEIGHT_LABELS[nxt]} улика")
+
+
+@router.callback_query(F.data.startswith("u:wdw:"))
+async def cb_word_weight(cb: CallbackQuery) -> None:
+    await _cycle_weight(cb, "msg")
+
+
+@router.callback_query(F.data.startswith("u:pww:"))
+async def cb_prof_word_weight(cb: CallbackQuery) -> None:
+    await _cycle_weight(cb, "prof")
+
+
 async def view_prof_words(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     """Слова, которые ищем в описании профиля.
 
@@ -1025,7 +1078,7 @@ async def view_prof_words(cid: int, page: int = 0) -> tuple[str, InlineKeyboardM
         "<b>📝 Слова для профилей</b>\n",
         "Ищутся в «о себе», названии канала и его описании. Сюда идут "
         "рекламные метки — «в лс», «онлифанс», «18+», — а не темы разговора: "
-        "в описании они ловят и тех, кто тему осуждает.",
+        "в описании они ловят и тех, кто тему осуждает." + WEIGHT_HELP,
         f"\nВсего: <b>{len(rows)}</b>"
         + (f" · страница {page + 1} из {pages}" if pages > 1 else ""),
         "",
@@ -1034,17 +1087,14 @@ async def view_prof_words(cid: int, page: int = 0) -> tuple[str, InlineKeyboardM
     if not rows:
         lines.append("Пусто — по словам профиль не проверяется.")
     for i, r in enumerate(chunk, start + 1):
-        lines.append(f"{i}. <code>{utils.esc(_word_label(r['word'], r['mode']))}</code>")
+        lines.append(f"{i}. {_weight_mark(r)} "
+                     f"<code>{utils.esc(_word_label(r['word'], r['mode']))}</code>")
 
-    row = []
     for i, r in enumerate(chunk, start + 1):
         label = _word_label(r["word"], r["mode"])
-        row.append(_btn(f"❌ {i}. {label[:18]}", f"u:pwd:{cid}:{page}:{r['id']}"))
-        if len(row) == 2:
-            b.row(*row)
-            row = []
-    if row:
-        b.row(*row)
+        b.row(_btn(f"{_weight_mark(r)} {config.WORD_WEIGHT_LABELS[_weight_of(r)]}",
+                   f"u:pww:{cid}:{page}:{r['id']}"),
+              _btn(f"❌ {i}. {label[:16]}", f"u:pwd:{cid}:{page}:{r['id']}"))
     if pages > 1:
         b.row(
             _btn("⬅️", f"u:pw:{cid}:{page - 1 if page else pages - 1}"),
@@ -1070,7 +1120,8 @@ async def view_words(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup
 
     lines = [
         "<b>🧨 Список стоп-слов</b>\n",
-        "Слово со звёздочкой ловит любые окончания. Кнопка с номером удаляет слово.",
+        "Слово со звёздочкой ловит любые окончания. Кнопка с номером удаляет "
+        "слово, кнопка со значком меняет его вес." + WEIGHT_HELP,
         f"\nВсего: <b>{len(rows)}</b>" + (f" · страница {page + 1} из {pages}" if pages > 1 else ""),
         "",
     ]
@@ -1078,17 +1129,14 @@ async def view_words(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup
     if not rows:
         lines.append("Пусто — ни одного слова.")
     for i, r in enumerate(chunk, start + 1):
-        lines.append(f"{i}. <code>{utils.esc(_word_label(r['word'], r['mode']))}</code>")
+        lines.append(f"{i}. {_weight_mark(r)} "
+                     f"<code>{utils.esc(_word_label(r['word'], r['mode']))}</code>")
 
-    row = []
     for i, r in enumerate(chunk, start + 1):
         label = _word_label(r["word"], r["mode"])
-        row.append(_btn(f"❌ {i}. {label[:18]}", f"u:wdd:{cid}:{page}:{r['id']}"))
-        if len(row) == 2:
-            b.row(*row)
-            row = []
-    if row:
-        b.row(*row)
+        b.row(_btn(f"{_weight_mark(r)} {config.WORD_WEIGHT_LABELS[_weight_of(r)]}",
+                   f"u:wdw:{cid}:{page}:{r['id']}"),
+              _btn(f"❌ {i}. {label[:16]}", f"u:wdd:{cid}:{page}:{r['id']}"))
 
     if pages > 1:
         nav = [

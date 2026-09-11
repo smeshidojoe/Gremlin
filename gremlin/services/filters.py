@@ -3,7 +3,7 @@ import re
 import time
 from collections import deque
 
-from .. import db
+from .. import config, db
 
 # t.me/xxx, telegram.me/xxx, telegram.dog/xxx, tg://join, tg://resolve, t.me/+invite
 _TG_LINK_RE = re.compile(
@@ -100,11 +100,35 @@ def link_allowed(link: str, usernames: set[str], chat_ids: set[int]) -> bool:
 # chat_id -> compiled regex | None; сбрасывается при изменении списка
 # (чат, вид списка) -> готовая регулярка
 _word_cache: dict[tuple[int, str], re.Pattern | None] = {}
+# та же пара -> [(своя регулярка слова, вес)]. Нужен, чтобы по найденному
+# куску текста понять, какое именно слово сработало: «изнасилования» поймано
+# основой «изнасилован*», и по самому тексту слово в списке не найти.
+_word_weights: dict[tuple[int, str], list] = {}
 
 
 def invalidate_words(chat_id: int) -> None:
     for kind in ("msg", "prof"):
         _word_cache.pop((chat_id, kind), None)
+        _word_weights.pop((chat_id, kind), None)
+
+
+def _weight_of(row) -> int:
+    """Вес слова из строки списка. Старые записи без колонки — сильные."""
+    try:
+        return int(row["weight"])
+    except (IndexError, KeyError, TypeError, ValueError):
+        return config.UNI_W_STOPWORD
+
+
+async def stopword_weight(chat_id: int, matched: str,
+                          kind: str = "msg") -> int:
+    """Сколько весит найденное слово. Спрашиваем только на срабатывании,
+    поэтому перебор по списку тут ничего не стоит."""
+    await match_stopword(chat_id, "", kind)      # прогреть кэш
+    for rx, weight in _word_weights.get((chat_id, kind), ()):
+        if rx.match(matched or ""):
+            return weight
+    return config.UNI_W_STOPWORD
 
 
 async def match_stopword(chat_id: int, text: str,
@@ -121,13 +145,17 @@ async def match_stopword(chat_id: int, text: str,
         if not rows:
             _word_cache[key] = None
         else:
-            parts = []
+            parts, weights = [], []
             for r in rows:
                 w = re.escape(r["word"])
                 if r["mode"] == "stem":
-                    parts.append(rf"{w}\w*")  # слово + любые окончания
+                    part = rf"{w}\w*"       # слово + любые окончания
                 else:
-                    parts.append(w)
+                    part = w
+                parts.append(part)
+                weights.append((re.compile(rf"^{part}$", re.IGNORECASE),
+                                _weight_of(r)))
+            _word_weights[key] = weights
             _word_cache[key] = re.compile(
                 r"(?<!\w)(" + "|".join(parts) + r")(?!\w)", re.IGNORECASE | re.UNICODE
             )

@@ -524,9 +524,16 @@ def _word_kind(request) -> str:
 async def api_words(request: web.Request) -> web.Response:
     cid = await cid_of(request)
     kind = _word_kind(request)
-    return js({"items": [{"id": r["id"], "word": r["word"], "mode": r["mode"],
-                          "label": um._word_label(r["word"], r["mode"])}
-                         for r in await db.words_list(cid, kind)]})
+    return js({
+        "items": [{"id": r["id"], "word": r["word"], "mode": r["mode"],
+                   "label": um._word_label(r["word"], r["mode"]),
+                   "weight": um._weight_of(r),
+                   "weight_label": config.WORD_WEIGHT_LABELS[um._weight_of(r)]}
+                  for r in await db.words_list(cid, kind)],
+        # вес идёт списком: панель показывает его выбором, а не догадкой
+        "weights": [{"value": w, "label": config.WORD_WEIGHT_LABELS[w],
+                     "hint": config.WORD_WEIGHT_HINT[w]}
+                    for w in config.WORD_WEIGHTS]})
 
 
 @routes.post("/api/chat/{cid}/words")
@@ -551,6 +558,22 @@ async def api_words_add(request: web.Request) -> web.Response:
             dupes += 1
     flt.invalidate_words(cid)
     return js({"added": added, "dupes": dupes})
+
+
+@routes.post("/api/chat/{cid}/words/{rid}/weight")
+async def api_word_weight(request: web.Request) -> web.Response:
+    """Вес слова для будущей единой оценки. Нынешних наказаний не касается."""
+    cid = await cid_of(request)
+    rid = int(request.match_info["rid"])
+    row = await db.words_get(rid)
+    if row is None or row["chat_id"] != cid:
+        raise web.HTTPNotFound(text="нет такого слова")
+    weight = int((await body(request)).get("weight") or 0)
+    if weight not in config.WORD_WEIGHTS:
+        raise web.HTTPBadRequest(text="bad weight")
+    await db.words_set_weight(rid, weight)
+    flt.invalidate_words(cid)
+    return js({"ok": True})
 
 
 @routes.delete("/api/chat/{cid}/words/{rid}")

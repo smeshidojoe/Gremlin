@@ -645,9 +645,15 @@ async function wordsView(cid, kind) {
            метки — «в лс», «онлифанс», «18+», — а не темы разговора: в описании
            они ловят и тех, кто тему осуждает.`
         : 'Слово со звёздочкой ловит любые окончания.'}</div>
+      <div class="intro" style="margin-top:8px">⚖️ Вес — сколько слово значит для будущей
+        единой оценки. На нынешние наказания он не влияет.
+        <b>Сильная</b> — в живой речи не встречается. <b>Слабая</b> — обычное слово
+        («оплата», «пиши»), одной не хватит даже на подозрение.</div>
       <div style="margin-top:10px">
         ${d.items.map((r) => `<div class="item">
-          <div class="body mono">${esc(r.label)}</div>
+          <div class="body mono">${esc(r.label)}<small>вес: ${esc(r.weight_label)}</small></div>
+          <button class="chip" data-act="word-weight" data-id="${r.id}"
+                  data-weight="${r.weight}">⚖️ ${esc(r.weight_label)}</button>
           <button class="x" data-act="word-del" data-id="${r.id}">✕</button></div>`).join('')
           || '<div class="empty">Пусто.</div>'}
       </div>
@@ -1325,6 +1331,16 @@ const ACT = {
     if (!v) return;
     const r = await api(`/chat/${curChat()}/words`, { json: { text: v, kind } });
     toast(`Добавлено: ${r.added}${r.dupes ? ', уже были: ' + r.dupes : ''}`);
+    render();
+  },
+
+  async 'word-weight'(el) {
+    const kind = location.hash.includes('/profwords') ? 'prof' : '';
+    const d = await api(`/chat/${curChat()}/words${kind ? '?kind=prof' : ''}`);
+    const v = await pick({ title: 'Вес слова',
+      options: d.weights.map((w) => ({ value: w.value, label: `${w.label} — ${w.hint}` })) });
+    if (v === null) return;
+    await api(`/chat/${curChat()}/words/${el.dataset.id}/weight`, { json: { weight: +v } });
     render();
   },
 

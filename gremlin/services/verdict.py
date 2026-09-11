@@ -206,15 +206,24 @@ def _cap(value: int, top: int) -> int:
     return max(0, min(int(value), top))
 
 
-def content_signals(*, stopword: str | None = None, phrase: str | None = None,
+def content_signals(*, stopword: str | None = None,
+                    stopword_weight: int | None = None,
+                    phrase: str | None = None,
                     nn_score: int | None = None, text_hard: int = 0,
                     text_cosmetic: int = 0, text_why: list | None = None,
                     outward: bool = False) -> list[Signal]:
-    """Семья «содержание»: всё, что сказано в самом сообщении."""
+    """Семья «содержание»: всё, что сказано в самом сообщении.
+
+    stopword_weight — сколько это слово значит. У списка слов три сорта:
+    «онлифанс» в живой речи не встречается, а «оплата» и «пиши» встречаются
+    каждый день, и одинаковый вес делал из вторых мины.
+    """
     out = []
     if stopword:
         out.append(Signal("content", f"стоп-слово: «{stopword}»",
-                          config.UNI_W_STOPWORD))
+                          _cap(stopword_weight if stopword_weight
+                               else config.UNI_W_STOPWORD,
+                               config.UNI_W_STOPWORD)))
     if phrase:
         out.append(Signal("content", "смысловое совпадение",
                           config.UNI_W_PHRASE, guess=True))
@@ -234,13 +243,17 @@ def content_signals(*, stopword: str | None = None, phrase: str | None = None,
     return out
 
 
-def profile_signals(*, word: str | None = None, face: int | None = None,
+def profile_signals(*, word: str | None = None, word_weight: int | None = None,
+                    face: int | None = None,
                     name_hard: int = 0, name_why: list | None = None,
                     photo: int | None = None) -> list[Signal]:
     """Семья «профиль»: кто это по описанию, а не по сообщению."""
     out = []
     if word:
-        out.append(Signal("profile", f"в профиле: «{word}»", config.UNI_W_PROF_WORD))
+        out.append(Signal("profile", f"в профиле: «{word}»",
+                          _cap(word_weight if word_weight
+                               else config.UNI_W_PROF_WORD,
+                               config.UNI_W_PROF_WORD)))
     if face:
         out.append(Signal("profile", f"похож на забаненных ({face}%)",
                           _cap(face * config.UNI_W_PROF_FACE // 100,

@@ -516,6 +516,11 @@ class Settings:
 
 
 _SETTINGS_FIELDS = {f.name for f in fields(Settings)} - {"chat_id"}
+# значения по умолчанию из кода: ими заводим строку настроек нового чата
+_SETTINGS_DEFAULTS = {f.name: f.default for f in fields(Settings)
+                      if f.name != "chat_id"}
+# какие из них реально есть колонками в этой базе — считается при старте
+_settings_cols: tuple[str, ...] = ()
 
 
 # колонки settings, которые могли отсутствовать в старых базах (имя -> DDL-хвост)
@@ -721,6 +726,10 @@ async def _migrate() -> None:
         for name, ddl in add.items():
             if name not in have:
                 await _db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+    global _settings_cols
+    cur = await _db.execute("PRAGMA table_info(settings)")
+    have = {r[1] for r in await cur.fetchall()}
+    _settings_cols = tuple(k for k in _SETTINGS_DEFAULTS if k in have)
     for flag, bit in _MASK_MIGRATIONS.items():
         cur = await _db.execute("SELECT v FROM kv WHERE k = ?", (flag,))
         if await cur.fetchone() is None:
@@ -871,9 +880,7 @@ async def upsert_chat(chat_id: int, title: str | None, username: str | None,
              active = 1""",
         (chat_id, title, username, owner_id, _now(), kind),
     )
-    await _db.execute(
-        "INSERT OR IGNORE INTO settings (chat_id) VALUES (?)", (chat_id,)
-    )
+    await ensure_settings(chat_id)
     await _db.commit()
 
 
@@ -1080,11 +1087,27 @@ async def moderated_chats() -> list[aiosqlite.Row]:
 
 # ---------- настройки ----------
 
+async def ensure_settings(chat_id: int) -> None:
+    """Завести строку настроек со значениями из кода.
+
+    Раньше строка заводилась одним chat_id, а остальное подставляла SQLite
+    из схемы таблицы. В базе, живущей с первых версий, схема помнит старые
+    значения: маску карточек 255 (карточки капчи, варнов и заявок выключены)
+    и порог откровенной аватарки 85. Новые чаты молча получали их вместо
+    того, что написано в коде."""
+    cols = _settings_cols or tuple(_SETTINGS_DEFAULTS)
+    names = ", ".join(cols)
+    marks = ", ".join("?" * len(cols))
+    await _db.execute(
+        f"INSERT OR IGNORE INTO settings (chat_id, {names}) VALUES (?, {marks})",
+        (chat_id, *(_SETTINGS_DEFAULTS[k] for k in cols)))
+
+
 async def get_settings(chat_id: int) -> Settings:
     cur = await _db.execute("SELECT * FROM settings WHERE chat_id = ?", (chat_id,))
     row = await cur.fetchone()
     if row is None:
-        await _db.execute("INSERT OR IGNORE INTO settings (chat_id) VALUES (?)", (chat_id,))
+        await ensure_settings(chat_id)
         await _db.commit()
         return Settings(chat_id=chat_id)
     # берём только известные поля: в старых базах остаются осиротевшие колонки
@@ -1099,7 +1122,7 @@ async def set_setting(chat_id: int, field: str, value) -> None:
     # сперва читают, а чтение строку и создаёт.
     if field not in _SETTINGS_FIELDS:
         raise ValueError(f"unknown settings field: {field}")
-    await _db.execute("INSERT OR IGNORE INTO settings (chat_id) VALUES (?)", (chat_id,))
+    await ensure_settings(chat_id)
     await _db.execute(f"UPDATE settings SET {field} = ? WHERE chat_id = ?", (value, chat_id))
     await _db.commit()
 
@@ -1521,6 +1544,9 @@ async def get_punishment(pid: int) -> aiosqlite.Row | None:
 NET_TERMS_KEY = "mig_net_terms"
 VEC_LOWER_KEY = "mig_vec_lower"
 NSFW_RAISE_KEY = "mig_nsfw_97"
+# чаты, заведённые после первой правки, снова получали старые значения из
+# схемы таблицы — чиним их ещё раз, теперь уже вместе с причиной
+STALE_DEFAULTS_KEY = "mig_stale_defaults"
 
 
 async def raise_photo_min(floor: int = 97) -> int:
@@ -1533,6 +1559,18 @@ async def raise_photo_min(floor: int = 97) -> int:
     cur = await _db.execute(
         "UPDATE settings SET prof_photo_min = ? WHERE prof_photo_min < ?",
         (floor, floor))
+    await _db.commit()
+    return cur.rowcount
+
+
+async def fix_warns_punish() -> int:
+    """Вернуть наказание за лимит варнов к задуманному муту.
+
+    В схеме таблицы по умолчанию остался бан от первых версий, в коде давно
+    мут: человек перебрал предупреждения — молчит час, а не вылетает из чата
+    навсегда. Правим только то, что равно старому умолчанию."""
+    cur = await _db.execute(
+        "UPDATE settings SET warns_punish = 'mute' WHERE warns_punish = 'ban'")
     await _db.commit()
     return cur.rowcount
 

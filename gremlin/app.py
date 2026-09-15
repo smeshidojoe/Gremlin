@@ -234,6 +234,17 @@ async def main() -> None:
                 logger.info("порог откровенности поднят в %d чатах", raised)
     except Exception:
         logger.warning("порог аватарки не поднялся", exc_info=True)
+    # разовая починка значений, которые чаты получили из старой схемы
+    # таблицы вместо значений из кода
+    try:
+        if not await db.kv_get(db.STALE_DEFAULTS_KEY):
+            photo = await db.raise_photo_min()
+            warns = await db.fix_warns_punish()
+            await db.kv_set(db.STALE_DEFAULTS_KEY, "1")
+            if photo or warns:
+                logger.info("значения из старой схемы поправлены: порог аватарки в %d чатах, наказание за варны в %d", photo, warns)
+    except Exception:
+        logger.warning("значения из старой схемы не поправились", exc_info=True)
     # разовая починка сроков у копий по сетке
     try:
         await _fix_net_terms(bot)

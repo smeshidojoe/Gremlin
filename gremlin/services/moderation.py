@@ -748,11 +748,14 @@ async def send_card(bot: Bot, chat_id: int, bit: int, text: str,
     s = await db.get_settings(chat_id)
     kb = markup if markup is not None else card_kb(pid, kind, chat_id, user_id)
     no_preview = LinkPreviewOptions(is_disabled=True)
+    # Оба лога слушают одни и те же переключатели чата. Раньше глобальный
+    # получал всё подряд, и в нём висели типы, выключенные в самом чате
+    wanted = bool(s.cards_on and (s.card_mask & bit))
     targets = []
-    if s.cards_on and s.log_chat_id and (s.card_mask & bit):
+    if wanted and s.log_chat_id:
         targets.append(s.log_chat_id)
     global_log = await db.global_log()
-    if global_log and global_log not in targets and global_log != chat_id:
+    if wanted and global_log and global_log not in targets and global_log != chat_id:
         targets.append(global_log)
     sent = []
     for target in targets:

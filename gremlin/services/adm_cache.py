@@ -238,3 +238,54 @@ async def is_member(bot: Bot, chat_id: int, user_id: int) -> bool:
 
 def invalidate_member(chat_id: int, user_id: int) -> None:
     _members.pop((chat_id, user_id), None)
+
+
+# Права, без которых модерация ломается молча: (поле, что сказать человеку).
+# Закреп бот просит при добавлении, но нигде не пользуется — его не требуем.
+BOT_NEEDS = (
+    ("can_delete_messages", "удалять сообщения"),
+    ("can_restrict_members", "банить и ограничивать"),
+    ("can_invite_users", "приглашать (ссылки и заявки)"),
+)
+# chat_id -> (expires, статус бота)
+_bot_status: dict[int, tuple[float, dict]] = {}
+BOT_STATUS_TTL = 30
+
+
+async def bot_status(bot: Bot, chat_id: int) -> dict:
+    """Кто бот в чате и хватает ли ему прав.
+
+    {"state": ok | missing | not_admin | gone | unknown, "missing": [...],
+     "text": готовая строка}. Карточка чата перерисовывается на каждый
+    переключатель, поэтому ответ держим полминуты; сбой не запоминаем.
+    """
+    now = time.monotonic()
+    hit = _bot_status.get(chat_id)
+    if hit and hit[0] > now:
+        return hit[1]
+    try:
+        me = await bot.me()
+        m = await bot.get_chat_member(chat_id, me.id)
+    except Exception:
+        logger.debug("статус бота в %s не узнать", chat_id, exc_info=True)
+        return {"state": "unknown", "missing": [],
+                "text": "❓ не проверить — Telegram не ответил"}
+    missing: list[str] = []
+    if m.status in ("left", "kicked"):
+        state, text = "gone", "⛔ бота нет в чате"
+    elif m.status == "creator":
+        state, text = "ok", "✅ владелец чата"
+    elif m.status != "administrator":
+        state, text = "not_admin", "⚠️ не администратор — модерация не работает"
+    else:
+        missing = [label for key, label in BOT_NEEDS if not getattr(m, key, False)]
+        state = "missing" if missing else "ok"
+        text = ("⚠️ не хватает прав: " + ", ".join(missing) if missing
+                else "✅ администратор, права в порядке")
+    out = {"state": state, "missing": missing, "text": text}
+    _bot_status[chat_id] = (now + BOT_STATUS_TTL, out)
+    return out
+
+
+def invalidate_bot_status(chat_id: int) -> None:
+    _bot_status.pop(chat_id, None)

@@ -19,9 +19,9 @@ from aiohttp import web
 
 from .. import config, db, schema, utils
 from ..handlers import fun as fun_h, user_menu as um
-from ..services import (cas, digest as digest_svc, filters as flt,
+from ..services import (adm_cache, cas, digest as digest_svc, filters as flt,
                         media, moderation, net as net_svc, nn, resolve,
-                        transfer, triggers)
+                        status as status_svc, transfer, triggers)
 from . import auth
 
 logger = logging.getLogger("gremlin.web.api")
@@ -42,6 +42,11 @@ def _dumps(obj) -> str:
 
 def js(payload, status: int = 200) -> web.Response:
     return web.json_response(payload, status=status, dumps=_dumps)
+
+
+def _cd_labels() -> dict:
+    """Подписи кулдаунов: «40 минут» вместо «2400 сек»."""
+    return {c: utils.fmt_seconds(c) for c in config.CMD_COOLDOWN_PRESETS if c}
 
 
 def rows(seq) -> list[dict]:
@@ -194,6 +199,8 @@ async def api_chat(request: web.Request) -> web.Response:
         "groups": [{"key": k, "title": t, "hint": h}
                    for k, t, h in schema.SECTION_GROUPS],
         "needs_setup": await um.needs_setup(cid, uid),
+        "bot": (None if ch and ch["kind"] == "channel"
+                else await adm_cache.bot_status(bot_of(request), cid)),
         "games_on": bool(s.games_on),
     })
 
@@ -775,7 +782,8 @@ async def api_trig(request: web.Request) -> web.Response:
     if r is None:
         raise web.HTTPNotFound(text="no trigger")
     return js({"trigger": dict(r), "answers": rows(await db.ans_list("trig", rid)),
-               "cooldowns": list(config.CMD_COOLDOWN_PRESETS)})
+               "cooldowns": list(config.CMD_COOLDOWN_PRESETS),
+               "cooldown_labels": _cd_labels()})
 
 
 @routes.post("/api/chat/{cid}/trigs/{rid}")
@@ -849,7 +857,8 @@ async def api_cmd(request: web.Request) -> web.Response:
     if r is None:
         raise web.HTTPNotFound(text="no counter")
     return js({"cmd": dict(r), "answers": rows(await db.ans_list("cmd", rid)),
-               "cooldowns": list(config.CMD_COOLDOWN_PRESETS)})
+               "cooldowns": list(config.CMD_COOLDOWN_PRESETS),
+               "cooldown_labels": _cd_labels()})
 
 
 @routes.post("/api/chat/{cid}/cmds/{rid}")
@@ -1072,6 +1081,33 @@ async def api_active(request: web.Request) -> web.Response:
             "reason": _short_reason(r["reason"]),
         })
     return js({"items": items})
+
+
+@routes.get("/api/chat/{cid}/status")
+async def api_status(request: web.Request) -> web.Response:
+    """Проверка статуса человека — та же карточка, что в меню наказаний."""
+    cid = await cid_of(request)
+    bot = bot_of(request)
+    uid, err = await status_svc.parse_target(bot, request.query.get("q", ""))
+    if uid is None:
+        return js({"ok": False, "error": err})
+    chats = await db.chats_for(uid_of(request))
+    return js({"ok": True, **await status_svc.collect(bot, uid, chats, first=cid)})
+
+
+@routes.post("/api/chat/{cid}/spamprofile")
+async def api_spam_profile(request: web.Request) -> web.Response:
+    """«Спам-профиль» со страницы проверки: профиль — в базу этого чата."""
+    cid = await cid_of(request)
+    data = await body(request)
+    uid = int(data.get("user_id") or 0)
+    if uid <= 0:
+        raise web.HTTPBadRequest(text="bad user_id")
+    ok, note = await nn.remember_spam_profile(bot_of(request), cid, uid)
+    if ok:
+        await db.add_event(cid, "card", f"спам-профиль в базу: {uid} "
+                                        f"by {uid_of(request)} (панель)")
+    return js({"ok": ok, "note": note})
 
 
 @routes.get("/api/chat/{cid}/forgiven")

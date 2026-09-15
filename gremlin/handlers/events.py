@@ -164,6 +164,19 @@ async def bot_promoted(update: ChatMemberUpdated, bot: Bot) -> None:
     if update.chat.type not in ("group", "supergroup"):
         return
     adm_cache.invalidate_admins(update.chat.id)
+    adm_cache.invalidate_bot_status(update.chat.id)
+
+
+@router.my_chat_member()
+async def bot_rights_changed(update: ChatMemberUpdated) -> None:
+    """Всё остальное про самого бота: права поменяли, не снимая админки, или
+    админку отобрали, оставив в чате. Карточка чата показывает статус бота,
+    и после правки прав он должен обновиться сразу, а не через полминуты.
+
+    Стоит последним: хендлеры выше ловят свои переходы раньше него.
+    """
+    adm_cache.invalidate_bot_status(update.chat.id)
+    adm_cache.invalidate_admins(update.chat.id)
 
 
 # Кого из ставивших реакции уже смотрели: (чат, юзер) -> когда.
@@ -321,7 +334,12 @@ async def member_updated(update: ChatMemberUpdated, bot: Bot) -> None:
     await db.add_event(
         chat.id, "admin_action", f"{kind}: {target.full_name} ({target.id}) by {actor.id}"
     )
-    await moderation.send_card(bot, chat.id, config.BIT_ADMIN, card, pid, kind)
+    # чат и человека передаём явно: без них «Забанить» под мутом уходила
+    # с k:ban:None:None и падала на нажатии
+    await moderation.send_card(
+        bot, chat.id, config.BIT_ADMIN, card, pid, kind, target.id,
+        markup=moderation.with_spam_button(
+            moderation.card_kb(pid, kind, chat.id, target.id), chat.id, target.id))
 
 
 async def _ban_or_kick(bot: Bot, chat, target, actor) -> None:
@@ -370,8 +388,10 @@ async def _ban_or_kick(bot: Bot, chat, target, actor) -> None:
     )
     await db.add_event(
         chat.id, "admin_action", f"{kind}: {target.full_name} ({target.id}) by {actor.id}")
-    await moderation.send_card(bot, chat.id, config.BIT_ADMIN, card, pid, kind,
-                               target.id)
+    await moderation.send_card(
+        bot, chat.id, config.BIT_ADMIN, card, pid, kind, target.id,
+        markup=moderation.with_spam_button(
+            moderation.card_kb(pid, kind, chat.id, target.id), chat.id, target.id))
 
 
 # ---------- смена названия чата ----------

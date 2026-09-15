@@ -110,6 +110,25 @@ def card_kb(pid: int | None, kind: str,
     return b.as_markup()
 
 
+SPAM_PROFILE_BUTTON = "🧪 Спам-профиль"
+
+
+def with_spam_button(markup: InlineKeyboardMarkup | None, chat_id: int,
+                     user_id: int) -> InlineKeyboardMarkup:
+    """Добавить под карточку ручного наказания кнопку «Спам-профиль».
+
+    Руками банят не только за поведение, но и спам-аккаунты, которых фильтры
+    не узнали. Сами такие профили в базу не кладём: баны за ссоры и флуд
+    засорили бы её обычными людьми, и сравнение начало бы узнавать их. Решает
+    админ — одним нажатием.
+    """
+    from aiogram.types import InlineKeyboardButton
+    rows = list(markup.inline_keyboard) if markup is not None else []
+    rows.append([InlineKeyboardButton(text=SPAM_PROFILE_BUTTON,
+                                      callback_data=f"k:sp:{chat_id}:{user_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 # подписи типов вложений для строки «Сообщение»
 _MEDIA_LABELS = {
     "photo": "фото", "video": "видео", "animation": "гифка", "sticker": "стикер",

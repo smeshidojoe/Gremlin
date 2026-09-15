@@ -330,6 +330,8 @@ async function chatView(cid) {
           <div class="value">пришло ${st.joins} · ушло ${st.leaves}</div></div>
         <div class="row"><div class="label">🔨 Наказаний</div>
           <div class="value">активных ${d.active} · за 7д ${st.pun7}</div></div>
+        ${d.bot ? `<div class="row"><div class="label">🤖 Бот</div>
+          <div class="value">${esc(d.bot.text)}</div></div>` : ''}
         <div style="margin-top:10px" class="wrap">${overview}</div>
       </div>
 
@@ -370,8 +372,13 @@ async function chatView(cid) {
 
 /* --- раздел настроек --- */
 
+/* «Форма» раздела: какие поля видны и что в виджетах. Не изменилась после
+   сохранения — страницу можно не перерисовывать */
+const sectionShape = (d) => JSON.stringify([d.key, d.fields.map((f) => [f.key, f.visible]), d.widget_data]);
+
 async function sectionView(cid, sec) {
   const d = await api(`/chat/${cid}/section/${sec}`);
+  CACHE.sectionShape = sectionShape(d);
   const fields = d.fields.filter((f) => f.visible).map((f) => (
     f.kind === 'toggle'
       ? switchRow(f.key, f.label, !!f.value)
@@ -743,7 +750,7 @@ async function trigView(cid, rid) {
       <div class="row"><div class="label">Кулдаун</div>
         <select data-cooldown="trig" data-id="${rid}">
           ${d.cooldowns.map((c) => `<option value="${c}" ${c === t.cooldown ? 'selected' : ''}>
-            ${c ? c + ' сек' : 'без кулдауна'}</option>`).join('')}
+            ${c ? esc(d.cooldown_labels[c] || c + ' сек') : 'без кулдауна'}</option>`).join('')}
         </select></div>
       ${linkRow(`#/chat/${cid}/answers/trig/${rid}`, '🎲 Варианты ответа', d.answers.length)}
       <button class="btn wide danger" style="margin-top:12px" data-act="trig-del" data-id="${rid}">
@@ -781,7 +788,7 @@ async function cmdView(cid, rid) {
       <div class="row"><div class="label">Кулдаун</div>
         <select data-cooldown="cmd" data-id="${rid}">
           ${d.cooldowns.map((x) => `<option value="${x}" ${x === c.cooldown ? 'selected' : ''}>
-            ${x ? x + ' сек' : 'без кулдауна'}</option>`).join('')}
+            ${x ? esc(d.cooldown_labels[x] || x + ' сек') : 'без кулдауна'}</option>`).join('')}
         </select></div>
       ${linkRow(`#/chat/${cid}/answers/cmd/${rid}`, '🎲 Варианты ответа', d.answers.length)}
       <div class="wrap" style="margin-top:12px">
@@ -841,6 +848,55 @@ async function warnedView(cid) {
   };
 }
 
+/* проверка статуса: своя страница, результат живёт в CACHE до ухода из чата */
+function statusHtml(cid) {
+  const s = CACHE.status;
+  if (!s || String(s.cid) !== String(cid)) return '';
+  const d = s.data;
+  const counts = d.counts.map((c) => `<span class="chip stat">${esc(c.label)}: ${c.n}</span>`).join('')
+    || '<span class="muted">Наказаний не было</span>';
+  const chats = d.chats.length
+    ? d.chats.map((c) => `<div class="item"><div class="body">
+        <b>${esc(c.title)}</b><small>${esc(c.state)}</small>
+        ${c.lines.map((l) => `<small>${esc(l)}</small>`).join('')}
+      </div></div>`).join('')
+    : '<div class="empty">Ни в одном из ваших чатов не встречался.</div>';
+  const events = !d.events.length ? '' : `<div class="card">
+      <h2>📜 Последние события</h2>
+      ${d.events.map((e) => `<div class="item"><div class="body">
+          ${esc(e.icon)} <b>${esc(e.label)}</b> · ${esc(e.chat)}
+          <small>${esc(e.when)} · ${esc(e.body)}</small>
+        </div></div>`).join('')}
+    </div>`;
+  return `<div class="card">
+      <h2><a href="${esc(d.link)}" target="_blank" rel="noopener">${esc(d.name)}</a></h2>
+      <div class="muted mono">${esc(d.user_id)}${d.username ? ' · @' + esc(d.username) : ''}${d.premium ? ' · ⭐ Premium' : ''}</div>
+      ${d.about.concat(d.facts).map((f) => `<div class="intro">${esc(f)}</div>`).join('')}
+      <h2 style="margin-top:12px">⚖️ Наказания в ваших чатах</h2>
+      <div class="wrap">${counts}</div>
+      <div class="wrap" style="margin-top:10px">
+        <button class="btn ghost" data-act="spam-profile" data-uid="${esc(d.user_id)}">🧪 Спам-профиль</button>
+      </div>
+    </div>
+    <div class="card"><h2>💬 Чаты</h2>${chats}</div>
+    ${events}`;
+}
+
+async function statusView(cid) {
+  return {
+    title: 'Проверка статуса',
+    back: `#/chat/${cid}/active`,
+    html: `<div class="card">
+      <div class="intro">id, @username или ссылка t.me/… — покажу, в каких ваших чатах человек
+        встречался, что на нём висит сейчас, сколько наказаний было и последние события.</div>
+      <div class="wrap" style="margin-top:10px">
+        <button class="btn" data-act="status-check">🔎 Проверить</button>
+      </div>
+    </div>
+    ${statusHtml(cid)}`,
+  };
+}
+
 async function activeView(cid) {
   const d = await api(`/chat/${cid}/active`);
   const f = await api(`/chat/${cid}/forgiven`);
@@ -859,7 +915,8 @@ async function activeView(cid) {
   return {
     title: 'Наказания',
     back: `#/chat/${cid}`,
-    html: `<div class="card">
+    html: `<div class="card">${linkRow(`#/chat/${cid}/status`, '🔎 Проверка статуса', '')}</div>
+    <div class="card">
       <h2>📋 Активные (${d.items.length})</h2>
       <div>
         ${d.items.map((p) => `<div class="item">
@@ -1230,6 +1287,7 @@ const ROUTES = [
   [/^chat\/(-?\d+)\/answers\/(\w+)\/(-?\d+)$/, answersView],
   [/^chat\/(-?\d+)\/warned$/, warnedView],
   [/^chat\/(-?\d+)\/active$/, activeView],
+  [/^chat\/(-?\d+)\/status$/, statusView],
   [/^chat\/(-?\d+)\/games$/, gamesView],
   [/^chat\/(-?\d+)\/copy$/, copyView],
   [/^chat\/(-?\d+)\/stats$/, statsView],
@@ -1246,8 +1304,15 @@ function curChat() {
   return m ? m[1] : null;
 }
 
+let lastPath = null;   // что рисовали прошлый раз — чтобы не терять место на странице
+
 async function render() {
   const path = here();
+  // Та же страница после действия (сняли наказание, включили раздел) —
+  // остаёмся где были. Иначе после каждого нажатия внизу длинного списка
+  // приходилось листать обратно
+  const keepScroll = path === lastPath;
+  const y = window.scrollY;
   for (const [re, view] of ROUTES) {
     const m = path.match(re);
     if (!m) continue;
@@ -1261,7 +1326,8 @@ async function render() {
       if (tg && tg.BackButton) {
         if (back) tg.BackButton.show(); else tg.BackButton.hide();
       }
-      window.scrollTo(0, 0);
+      window.scrollTo(0, keepScroll ? y : 0);
+      lastPath = path;
     } catch (e) {
       $app.innerHTML = `<div class="card"><div class="empty">${esc(e.message)}</div></div>`;
     }
@@ -1577,6 +1643,22 @@ const ACT = {
     render();
   },
 
+  async 'spam-profile'(el) {
+    const r = await api(`/chat/${curChat()}/spamprofile`, { json: { user_id: +el.dataset.uid } });
+    toast(r.note);
+    if (r.ok) el.remove();
+  },
+
+  async 'status-check'() {
+    const q = await ask({ title: 'Проверка статуса', ok: 'Проверить',
+      hint: 'id, @username или ссылка t.me/…' });
+    if (!q) return;
+    const r = await api(`/chat/${curChat()}/status?q=${encodeURIComponent(q)}`);
+    if (!r.ok) { toast(r.error); return; }
+    CACHE.status = { cid: curChat(), data: r };
+    render();
+  },
+
   async unforgive(el) {
     await api(`/chat/${curChat()}/forgiven/${el.dataset.id}`, { method: 'DELETE' });
     toast('Правило снова работает');
@@ -1859,13 +1941,17 @@ document.addEventListener('click', async (e) => {
 document.addEventListener('change', async (e) => {
   const el = e.target;
   try {
-    if (el.dataset.toggle !== undefined) {
-      await api(`/chat/${curChat()}/set`, { json: { key: el.dataset.toggle, value: el.checked ? 1 : 0 } });
-      haptic();
-      render();
-    } else if (el.dataset.select !== undefined) {
-      await api(`/chat/${curChat()}/set`, { json: { key: el.dataset.select, value: el.value } });
-      render();
+    if (el.dataset.toggle !== undefined || el.dataset.select !== undefined) {
+      const toggle = el.dataset.toggle !== undefined;
+      const key = toggle ? el.dataset.toggle : el.dataset.select;
+      const r = await api(`/chat/${curChat()}/set`,
+        { json: { key, value: toggle ? (el.checked ? 1 : 0) : el.value } });
+      if (toggle) haptic();
+      // Браузер уже показал новое значение — перерисовка нужна, только если от
+      // него что-то зависит: появилось или пропало другое поле, поменялся виджет.
+      // Иначе страница мигала и прыгала на каждое нажатие
+      const page = here().match(/^chat\/-?\d+\/s\/(\w+)$/);
+      if (!page || page[1] !== r.key || sectionShape(r) !== CACHE.sectionShape) render();
     } else if (el.dataset.game !== undefined) {
       await api(`/chat/${curChat()}/bit`, { json: { key: 'games_on', bit: +el.dataset.game } });
       render();

@@ -113,6 +113,7 @@ CREATE TABLE IF NOT EXISTS settings(
     mentions_check  INTEGER NOT NULL DEFAULT 0,
     anon_on         INTEGER NOT NULL DEFAULT 1,
     forwards_on     INTEGER NOT NULL DEFAULT 0,
+    forwards_users  INTEGER NOT NULL DEFAULT 0,
     words_on        INTEGER NOT NULL DEFAULT 0,
     words_punish    TEXT    NOT NULL DEFAULT 'ban',
     words_mute_min  INTEGER NOT NULL DEFAULT 1440,
@@ -413,6 +414,7 @@ class Settings:
     mentions_check: int = 0
     anon_on: int = 1
     forwards_on: int = 0
+    forwards_users: int = 0
     words_on: int = 0
     words_punish: str = "ban"
     words_mute_min: int = 1440
@@ -521,6 +523,7 @@ _SETTINGS_MIGRATIONS = {
     "captcha_on": "INTEGER NOT NULL DEFAULT 0",
     "captcha_timeout": "INTEGER NOT NULL DEFAULT 120",
     "forwards_on": "INTEGER NOT NULL DEFAULT 0",
+    "forwards_users": "INTEGER NOT NULL DEFAULT 0",
     "mentions_check": "INTEGER NOT NULL DEFAULT 0",
     "watch_on": "INTEGER NOT NULL DEFAULT 0",
     "watch_bots": "INTEGER NOT NULL DEFAULT 1",
@@ -2325,9 +2328,13 @@ async def msg_inc(chat_id: int, user_id: int, username: str | None = None,
            VALUES (?, ?, ?, ?, ?)
            ON CONFLICT(user_id) DO UPDATE SET
              username = COALESCE(excluded.username, users.username),
-             first_name = COALESCE(excluded.first_name, users.first_name)""",
+             first_name = COALESCE(excluded.first_name, users.first_name),
+             last_seen = excluded.last_seen""",
         (user_id, username, first_name, now, now),
     )
+    # last_seen раньше двигала только личка с ботом (track_user): у человека,
+    # который пишет в чате каждый день, «последний раз» навсегда застывал на
+    # дате первого сообщения
     await _db.commit()
 
 
@@ -2392,6 +2399,99 @@ async def trust_facts(chat_id: int, user_id: int) -> dict:
         "SELECT COUNT(*) FROM punishments WHERE chat_id = ? AND user_id = ? AND created >= ?",
         (chat_id, user_id, _now() - 30 * 86400))
     return {"days": int(days_known), "msgs": int(msgs30), "pun": int(pun30)}
+
+
+async def user_status_counts(user_id: int, chat_ids: list[int]) -> dict:
+    """Сколько всего было у человека в этих чатах: наказаний по видам, варнов,
+    прощений, и отмечен ли он в CAS.
+
+    Считаем и снятые наказания: вопрос «сколько было», а не «что висит». Копии,
+    разошедшиеся по сетке, не считаем — это то же самое наказание, и бан в
+    сетке из пяти чатов иначе выглядел бы пятью банами.
+    """
+    out = {"kinds": {}, "warns": 0, "forgiven": 0, "cas": False, "last_day": None}
+    if chat_ids:
+        ph = ",".join("?" * len(chat_ids))
+        cur = await _db.execute(
+            f"SELECT MAX(day) FROM msg_stats WHERE user_id = ? AND chat_id IN ({ph})",
+            (user_id, *chat_ids))
+        out["last_day"] = (await cur.fetchone())[0]
+        cur = await _db.execute(
+            f"""SELECT kind, COUNT(*) AS n FROM punishments
+                WHERE user_id = ? AND chat_id IN ({ph})
+                  AND COALESCE(reason, '') NOT LIKE 'сетка · %'
+                GROUP BY kind""", (user_id, *chat_ids))
+        out["kinds"] = {r["kind"]: r["n"] for r in await cur.fetchall()}
+        for key, table in (("warns", "warns"), ("forgiven", "forgiven")):
+            cur = await _db.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE user_id = ? AND chat_id IN ({ph})",
+                (user_id, *chat_ids))
+            out[key] = (await cur.fetchone())[0] or 0
+    cur = await _db.execute("SELECT listed FROM cas_cache WHERE user_id = ?", (user_id,))
+    row = await cur.fetchone()
+    out["cas"] = bool(row and row["listed"])
+    return out
+
+
+async def user_seen_chats(user_id: int, chat_ids: list[int]) -> set[int]:
+    """В каких из этих чатов бот хоть что-то знает о человеке: писал, был
+    наказан, получал варн или прощение, стоит в вайтлисте, попадал в
+    наблюдение или в теневую оценку, упоминается в логе."""
+    if not chat_ids:
+        return set()
+    ph = ",".join("?" * len(chat_ids))
+    tables = ("msg_stats", "punishments", "warns", "forgiven", "whitelist",
+              "watch_profiles", "verdicts")
+    parts = [f"SELECT chat_id FROM {t} WHERE user_id = ? AND chat_id IN ({ph})"
+             for t in tables]
+    args: list = []
+    for _ in tables:
+        args += [user_id, *chat_ids]
+    # у событий id живёт только в тексте; границы числа проверять тут дорого,
+    # ложное совпадение даст лишь лишний чат в списке
+    parts.append(f"SELECT chat_id FROM events WHERE chat_id IN ({ph}) AND text LIKE ?")
+    args += [*chat_ids, f"%{user_id}%"]
+    cur = await _db.execute(" UNION ".join(parts), args)
+    return {r[0] for r in await cur.fetchall()}
+
+
+_NOT_ABOUT_PEOPLE = ("bot", "nn", "digest")
+
+
+async def user_events(user_id: int, chat_ids: list[int], limit: int = 8) -> list[dict]:
+    """Последние записи лога про человека.
+
+    Отдельного поля с id у событий нет, он живёт в тексте: «Имя (id)», «id by …».
+    LIKE находит и чужие числа, где этот id стоит внутри, поэтому границы
+    числа досматриваем здесь и берём строк с запасом.
+    """
+    if not chat_ids:
+        return []
+    ph = ",".join("?" * len(chat_ids))
+    skip = ",".join("?" * len(_NOT_ABOUT_PEOPLE))
+    cur = await _db.execute(
+        f"""SELECT chat_id, ts, kind, text FROM events
+            WHERE chat_id IN ({ph}) AND text LIKE ? AND kind NOT IN ({skip})
+            ORDER BY id DESC LIMIT ?""",
+        (*chat_ids, f"%{user_id}%", *_NOT_ABOUT_PEOPLE, limit * 4))
+    exact = re.compile(rf"(?<!\d){user_id}(?!\d)")
+    out = [dict(r) for r in await cur.fetchall() if exact.search(r["text"] or "")]
+    return out[:limit]
+
+
+async def user_chat_facts(chat_id: int, user_id: int) -> dict:
+    """Что бот сам знает о человеке в одном чате: сколько писал и что висит."""
+    cur = await _db.execute(
+        """SELECT SUM(cnt) AS n, MIN(day) AS a, MAX(day) AS b FROM msg_stats
+           WHERE chat_id = ? AND user_id = ?""", (chat_id, user_id))
+    row = await cur.fetchone()
+    cur = await _db.execute(
+        """SELECT kind, until_ts, reason FROM punishments
+           WHERE chat_id = ? AND user_id = ? AND active = 1
+             AND (until_ts IS NULL OR until_ts > ?)
+           ORDER BY created DESC""", (chat_id, user_id, _now()))
+    return {"msgs": row["n"] or 0, "first_day": row["a"], "last_day": row["b"],
+            "active": [dict(r) for r in await cur.fetchall()]}
 
 
 async def chat_stats(chat_id: int) -> dict:

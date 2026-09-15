@@ -274,6 +274,29 @@ async def refresh_members(chat_id: int | None = None) -> int:
         return 0
 
 
+async def joined_at(chat_id: int, user_id: int) -> int | None:
+    """Когда человек вступил в чат. Bot API этого не отдаёт, юзербот — умеет.
+
+    None — юзербот не поднят, сам в чате не сидит, человека не знает или
+    Telegram даты не дал (у создателя чата её нет).
+    """
+    client = _client_ref
+    if client is None or not client.is_connected():
+        return None
+    try:
+        from telethon.tl.functions.channels import GetParticipantRequest
+        res = await asyncio.wait_for(client(GetParticipantRequest(
+            await client.get_input_entity(chat_id),
+            await client.get_input_entity(user_id),
+        )), 5)
+    except Exception:
+        logger.debug("дату вступления %s в %s не узнать", user_id, chat_id,
+                     exc_info=True)
+        return None
+    date = getattr(res.participant, "date", None)
+    return int(date.timestamp()) if date else None
+
+
 async def start(bot: Bot) -> object | None:
     """Поднять юзербота. Возвращает клиент (или None, если выключен/не настроен)."""
     if not config.USERBOT_ON:

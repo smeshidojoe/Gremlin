@@ -655,6 +655,55 @@ async def remember_face(chat_id: int, user_id: int, name: str, label: str) -> No
     _faces.pop(chat_id, None)
 
 
+async def remember_spam_profile(bot, chat_id: int, user_id: int) -> tuple[bool, str]:
+    """Админ сказал «это спам-аккаунт»: записать профиль в базу для сравнения.
+
+    Пишем тем же видом строки, каким сравниваем и запоминаем при автобане, —
+    имя, ник, описание и канал вместе (profile.face_text). Иначе ручные записи
+    лежали бы голыми именами, а спрашивали бы описаниями.
+
+    Возвращает (записали ли, что сказать человеку).
+    """
+    import types
+
+    from .. import config, db
+    from . import profile as prof_svc
+
+    user = None
+    try:
+        user = (await bot.get_chat_member(chat_id, user_id)).user
+    except Exception:
+        pass
+    if user is None:
+        row = await db.get_user(user_id)
+        if row is None:
+            return False, "Не знаю этого человека: ни имени, ни ника."
+        user = types.SimpleNamespace(full_name=row["first_name"] or "",
+                                     username=row["username"])
+    face = " ".join(prof_svc.face_text(user, await prof_svc.fetch(bot, user_id)).split())
+    if len(face) < 4:
+        return False, "Записывать нечего: имя пустое, профиль закрыт."
+    stored = face[:config.SAMPLE_TEXT_LIMIT]
+
+    mine = [r for r in await db.samples_of_origin(chat_id, "profile")
+            if r["user_id"] == user_id]
+    if any(r["label"] == "spam" and r["text"] == stored for r in mine):
+        return False, "Этот профиль уже в базе спама."
+    # раньше его отметили нормальным («больше не трогать») — теперь передумали;
+    # старая пометка иначе спорила бы с новой в каждом сравнении
+    for r in mine:
+        if r["label"] != "spam":
+            await db.sample_relabel(r["id"], "spam")
+    await remember_face(chat_id, user_id, face, "spam")
+
+    note = "Профиль записан в базу спама: похожих бот узнает сразу."
+    s = await db.get_settings(chat_id)
+    if not s.watch_nn:
+        note += (" Сравнение профилей в наблюдении сейчас выключено — "
+                 "база заработает, когда его включат.")
+    return True, note
+
+
 async def face_score(chat_id: int, name: str) -> int | None:
     """Насколько имя похоже на профили, за которые уже банили (в процентах).
 

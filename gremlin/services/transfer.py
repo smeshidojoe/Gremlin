@@ -21,7 +21,7 @@ logger = logging.getLogger("gremlin.transfer")
 GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
     "inline": ("🤖 Инлайн-боты", ("inline_on", "inline_punish", "inline_mute_min",
                                   "inline_spam")),
-    "links": ("🔗 Ссылки", ("links_on", "extlinks_on", "mentions_check", "forwards_on",
+    "links": ("🔗 Ссылки", ("links_on", "extlinks_on", "mentions_check", "forwards_on", "forwards_users",
                             "lp_tg", "lm_tg", "lp_ext", "lm_ext",
                             "lp_men", "lm_men", "lp_fwd", "lm_fwd",
                             "gp_tg", "gm_tg", "gp_ext", "gm_ext",

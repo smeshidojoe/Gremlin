@@ -206,8 +206,12 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
     card = _manual_card_text(
         kind, message.chat.title, target, reason, until, message.from_user, body,
     )
+    kb_user = target.id if kind == "kick" else None
+    markup = moderation.with_spam_button(
+        moderation.card_kb(pid, kind, message.chat.id, kb_user),
+        message.chat.id, target.id)
     sent = await moderation.send_card(bot, message.chat.id, bit, card, pid, kind,
-                                      target.id if kind == "kick" else None)
+                                      kb_user, markup=markup)
     if kind != "kick":
         # кик по сетке не расходится: выгнать человека из шести чатов за то,
         # что он мешал в одном, — не то, о чём просили
@@ -1106,24 +1110,33 @@ async def moderate(message: Message, bot: Bot) -> None:
         )
         return
 
-    # --- пересылки: из каналов, групп и от людей ---
-    if s.forwards_on and message.forward_origin is not None and "links" not in scopes:
+    # --- пересылки: из каналов и групп, отдельным переключателем — от людей ---
+    # Пересланное от человека — обычно мем или скрин переписки, а не реклама.
+    # Одно время оно удалялось вместе с пересылками из каналов, и в чатах, где
+    # закрыты только каналы, пропадали обычные сообщения. Теперь это отдельный
+    # переключатель, по умолчанию выключенный.
+    if ((s.forwards_on or s.forwards_users) and message.forward_origin is not None
+            and "links" not in scopes):
         origin = message.forward_origin
-        origin_chat = getattr(origin, "chat", None)
+        # у пересылки из канала чат в .chat, у анонимного админа группы —
+        # в .sender_chat; второе раньше выглядело «скрытым отправителем»
+        origin_chat = (getattr(origin, "chat", None)
+                       or getattr(origin, "sender_chat", None))
         origin_user = getattr(origin, "sender_user", None)
         source = None                    # что писать в причине; None = пересылку пропускаем
         if origin_chat is not None:
-            if origin_chat.id != chat.id:      # свои же сообщения пересылать можно
+            # свои же сообщения пересылать можно
+            if s.forwards_on and origin_chat.id != chat.id:
                 allowed = await db.wl_scopes_for(chat.id, origin_chat.id, origin_chat.username)
                 if not allowed & {"all", "anon", "links"}:
                     kind = "канала" if origin_chat.type == "channel" else "чата"
                     source = f"из {kind}: {origin_chat.title or origin_chat.id}"
         elif origin_user is not None:
-            if origin_user.id != user.id:      # своё же — не нарушение
+            if s.forwards_users and origin_user.id != user.id:   # своё — не нарушение
                 allowed = await db.wl_scopes_for(chat.id, origin_user.id, origin_user.username)
                 if not allowed & {"all", "links"}:
                     source = f"от {origin_user.full_name}"
-        else:
+        elif s.forwards_users:
             # скрытый отправитель: id не отдают, есть только подпись
             source = f"от {getattr(origin, 'sender_user_name', 'скрытого отправителя')}"
         if source is not None:

@@ -37,6 +37,18 @@ def fmt_minutes(minutes: int) -> str:
     return f"{d}д" + (f" {rem_h}ч" if rem_h else "")
 
 
+def fmt_seconds(sec: int) -> str:
+    """Секунды -> «30 секунд» / «40 минут».
+
+    Больше часа тоже пишем минутами: пресеты кулдауна так читаются одной
+    линейкой — 10, 30, 40, 60 минут, — а не «2400 сек», которые надо делить.
+    """
+    if sec < 60 or sec % 60:
+        return f"{sec} {plural(sec, 'секунда', 'секунды', 'секунд')}"
+    m = sec // 60
+    return f"{m} {plural(m, 'минута', 'минуты', 'минут')}"
+
+
 def until_ts(minutes: int) -> int | None:
     """Минуты -> unix-время окончания. 0/None -> None (навсегда)."""
     if not minutes:
@@ -150,12 +162,18 @@ _EVENT_WORDS = {
 }
 
 
-def event_line(kind: str, text: str, ts: int, chat_title: str | None = None) -> str:
-    """Одна строка лога в читаемом виде."""
+def event_parts(kind: str, text: str | None) -> tuple[str, str, str]:
+    """Событие лога -> (значок, подпись, текст по-русски)."""
     icon, label = EVENT_KINDS.get(kind, ("•", kind))
     body = text or ""
     for en, ru in _EVENT_WORDS.items():
         body = body.replace(en, ru)
+    return icon, label, body
+
+
+def event_line(kind: str, text: str, ts: int, chat_title: str | None = None) -> str:
+    """Одна строка лога в читаемом виде."""
+    icon, label, body = event_parts(kind, text)
     where = f" · {esc(chat_title)}" if chat_title else ""
     return f"{icon} <b>{label}</b> · {rel_time(ts)}{where}\n    {esc(body)}"
 

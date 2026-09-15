@@ -3,7 +3,7 @@ import asyncio
 import logging
 
 from aiogram import Bot, F, Router
-from aiogram.types import CallbackQuery, InlineKeyboardButton
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .. import db
@@ -125,6 +125,32 @@ async def card_forgive(cb: CallbackQuery) -> None:
                        f"by {cb.from_user.id}")
     await _mark(cb, f"\n🕊 <b>Больше не трогаем: {label}</b>")
     await cb.answer("Прощён" if added else "Уже был прощён")
+
+
+def _without_spam(markup) -> InlineKeyboardMarkup | None:
+    """Кнопки карточки без «Спам-профиля»: нажатую второй раз показывать незачем."""
+    if markup is None:
+        return None
+    rows = [row for row in markup.inline_keyboard
+            if not any((b.callback_data or "").startswith("k:sp:") for b in row)]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+@router.callback_query(F.data.startswith("k:sp:"))
+async def card_spam_profile(cb: CallbackQuery, bot: Bot) -> None:
+    """«Спам-профиль» под ручным наказанием: профиль — в базу для сравнения."""
+    from ..services import nn
+    _, _, chat_id, user_id = cb.data.split(":")
+    chat_id, user_id = int(chat_id), int(user_id)
+    ok, note = await nn.remember_spam_profile(bot, chat_id, user_id)
+    if not ok:
+        await cb.answer(note, show_alert=True)
+        return
+    await db.add_event(chat_id, "card",
+                       f"спам-профиль в базу: {user_id} by {cb.from_user.id}")
+    await _mark(cb, "\n🧪 <b>Профиль записан в базу спама</b>",
+                _without_spam(cb.message.reply_markup))
+    await cb.answer("Записан")
 
 
 @router.callback_query(F.data.startswith("k:ban:"))

@@ -72,6 +72,8 @@ SECTIONS: list[Section] = [
         "считает рекламой упоминание чужого канала. Работает медленнее, "
         "поэтому выключено по умолчанию.\n"
         "«Блок пересылок» убирает пересланное из других чатов и каналов.\n"
+        "«Пересылки от людей» — то же для пересланного от людей. Обычно это "
+        "мемы и скрины переписки, поэтому выключено по умолчанию.\n"
         "Наказание задаётся отдельно для участников и для тех, кто в чате "
         "не состоит, — кнопки ниже.",
         fields=[
@@ -79,6 +81,7 @@ SECTIONS: list[Section] = [
             Field("extlinks_on", "toggle", "Внешние ссылки (любые сайты)"),
             Field("mentions_check", "toggle", "Проверка @упоминаний каналов"),
             Field("forwards_on", "toggle", "Блок пересылок"),
+            Field("forwards_users", "toggle", "Пересылки от людей"),
         ],
         widgets=["links_pun", "link_wl"],
     ),
@@ -189,7 +192,7 @@ SECTIONS: list[Section] = [
         fields=[
             Field("flood_on", "toggle", "Статус"),
             Field("flood_msgs", "cycle", "Сообщений", list(config.FLOOD_MSGS_PRESETS), fmt="plain"),
-            Field("flood_window", "cycle", "Окно, сек", list(config.FLOOD_WINDOW_PRESETS), fmt="sec"),
+            Field("flood_window", "cycle", "Окно", list(config.FLOOD_WINDOW_PRESETS), fmt="sec"),
             Field("flood_mute_min", "cycle", "Мут", _MUTE, fmt="minutes"),
         ],
     ),
@@ -202,7 +205,7 @@ SECTIONS: list[Section] = [
         "ссылке человек сможет.",
         fields=[
             Field("captcha_on", "toggle", "Статус"),
-            Field("captcha_timeout", "cycle", "Время, сек", list(config.CAPTCHA_TIMEOUT_PRESETS), fmt="sec"),
+            Field("captcha_timeout", "cycle", "Время", list(config.CAPTCHA_TIMEOUT_PRESETS), fmt="sec"),
         ],
     ),
     Section(
@@ -669,7 +672,7 @@ def value_label(f: Field, val) -> str:
     if f.fmt == "minutes":
         return utils.fmt_minutes(val)
     if f.fmt == "sec":
-        return f"{val} сек"
+        return utils.fmt_seconds(val)
     return str(val)
 
 

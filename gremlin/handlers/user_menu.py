@@ -45,6 +45,7 @@ class Input(StatesGroup):
     seed_q = State()            # ждём слово для поиска по стартовому набору
     sub_chat = State()          # ждём канал для проверки подписки
     prof_words = State()        # ждём слова для списка профилей
+    status = State()            # ждём id/@username/пересылку для проверки статуса
 
 
 _HOME_TEXT = "<b>🧌 Gremlin</b>\n\nМодерация и мониторинг чатов."
@@ -242,7 +243,8 @@ async def view_copy_pick(cid: int, src: int, picked: set[str]) -> tuple[str, Inl
     return text, b.as_markup()
 
 
-async def view_chat(cid: int, viewer_id: int) -> tuple[str, InlineKeyboardMarkup]:
+async def view_chat(cid: int, viewer_id: int,
+                    bot: Bot | None = None) -> tuple[str, InlineKeyboardMarkup]:
     """Мини-дашборд чата: данные + сводка настроек + кнопки разделов."""
     ch = await db.get_chat(cid)
     s = await db.get_settings(cid)
@@ -254,6 +256,12 @@ async def view_chat(cid: int, viewer_id: int) -> tuple[str, InlineKeyboardMarkup
     if viewer_id in config.ADMIN_IDS and ch and ch["owner_id"]:
         # чужие чаты в списке видит только владелец бота — подскажем, чей это
         owner_line = f"👤 Владелец: {utils.esc(await db.user_handle(ch['owner_id']))}\n"
+    # Статус бота видят все, кто настраивает чат: без прав модерация молчит,
+    # и понять это можно только по тому, что спам почему-то остаётся
+    bot_line = ""
+    if bot is not None and not (ch and ch["kind"] == "channel"):
+        from ..services import adm_cache
+        bot_line = f"🤖 Бот: {(await adm_cache.bot_status(bot, cid))['text']}\n"
     text = (
         f"<b>⚙️ {utils.esc(ch['title'] if ch else str(cid))}</b>\n"
         f"<code>{cid}</code>\n"
@@ -261,7 +269,8 @@ async def view_chat(cid: int, viewer_id: int) -> tuple[str, InlineKeyboardMarkup
         f"💬 Сообщений: сегодня <b>{st['d1']}</b> · за 7д <b>{st['d7']}</b>\n"
         f"👥 За 7д: пришло <b>{st['joins']}</b> · ушло <b>{st['leaves']}</b>\n"
         f"🔨 Наказаний: активных <b>{pun}</b> · за 7д <b>{st['pun7']}</b>\n"
-        f"🪪 Лог-чат: {await _log_chat_label(s.log_chat_id)}\n\n"
+        f"🪪 Лог-чат: {await _log_chat_label(s.log_chat_id)}\n"
+        f"{bot_line}\n"
         f"{' · '.join(marks[:half])}\n{' · '.join(marks[half:])}"
     )
     b = InlineKeyboardBuilder()
@@ -1817,6 +1826,7 @@ async def view_punishments(cid: int, page: int = 0) -> tuple[str, InlineKeyboard
     b.row(_btn("🔓 Массовый разбан", f"u:mub:{cid}"),
           _btn("👢 Массовый кик", f"u:mkick:{cid}"))
     b.row(_btn("⛔ Массовый бан", f"u:mban:{cid}"))
+    b.row(_btn("🔎 Проверка статуса", f"u:ps:{cid}"))
     b.row(_btn("⚙️ Настройки", f"u:s:{cid}:punish_cfg"))
     b.row(_btn("⬅️ Назад", f"u:c:{cid}"))
     return "\n".join(lines), b.as_markup()
@@ -2116,7 +2126,7 @@ async def cb_chat(cb: CallbackQuery, state: FSMContext) -> None:
     if await needs_setup(cid, cb.from_user.id):
         text, kb = await view_setup(cid)       # свежий чат — сперва развилка
     else:
-        text, kb = await view_chat(cid, cb.from_user.id)
+        text, kb = await view_chat(cid, cb.from_user.id, cb.bot)
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer()
 
@@ -2129,7 +2139,7 @@ async def cb_setup_skip(cb: CallbackQuery, state: FSMContext) -> None:
         return
     await state.clear()
     await db.kv_set(setup_key(cid), "1")
-    text, kb = await view_chat(cid, cb.from_user.id)
+    text, kb = await view_chat(cid, cb.from_user.id, cb.bot)
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer()
 
@@ -2206,7 +2216,7 @@ async def cb_copy_do(cb: CallbackQuery, state: FSMContext) -> None:
     moved = ", ".join(f"{k}: {v}" for k, v in stats.items() if v)
     note = (f"✅ Настройки перенесены из «{utils.esc(ch['title'] if ch else src)}».\n"
             f"{moved or 'нечего было копировать'}.\n\n")
-    text, kb = await view_chat(cid, cb.from_user.id)
+    text, kb = await view_chat(cid, cb.from_user.id, cb.bot)
     await cb.message.edit_text(note + text, reply_markup=kb)
 
 
@@ -2241,7 +2251,7 @@ async def cb_section(cb: CallbackQuery, state: FSMContext) -> None:
 
 async def _rerender(cb: CallbackQuery, cid: int, sec: str) -> None:
     if sec == "chat":
-        text, kb = await view_chat(cid, cb.from_user.id)
+        text, kb = await view_chat(cid, cb.from_user.id, cb.bot)
     else:
         text, kb = await view_section(cid, sec)
     await cb.message.edit_text(text, reply_markup=kb)
@@ -2616,7 +2626,7 @@ async def view_cmd(cid: int, rid: int) -> tuple[str, InlineKeyboardMarkup]:
     if r is None:
         b.button(text="⬅️ Назад", callback_data=f"u:cml:{cid}:0")
         return "Счётчик не найден.", b.as_markup()
-    cd = f"{r['cooldown']} сек" if r["cooldown"] else "без кулдауна"
+    cd = utils.fmt_seconds(r["cooldown"]) if r["cooldown"] else "без кулдауна"
     answers = await db.ans_list("cmd", rid)
     text = (
         f"<b>🔢 {utils.esc(r['cmd'])}</b>\n\n"
@@ -3308,6 +3318,64 @@ async def cb_punishments(cb: CallbackQuery) -> None:
     await cb.answer()
 
 
+@router.callback_query(F.data.startswith("u:ps:"))
+async def cb_status_check(cb: CallbackQuery, state: FSMContext) -> None:
+    """Проверка статуса: ждём, кого смотреть. Ответ придёт в это же сообщение."""
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    from ..services import status as status_svc
+    await _ask(cb, state, Input.status, status_svc.PROMPT, f"u:p:{cid}:0", cid=cid)
+
+
+@router.message(StateFilter(Input.status))
+async def status_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    from ..services import status as status_svc
+    cid = (await state.get_data())["cid"]
+    uid, err = await status_svc.parse_target(
+        bot, message.text or message.caption, message)
+    if uid is None:
+        await _retry(message, bot, state,
+                     f"{status_svc.PROMPT}\n\n⚠️ {utils.esc(err)}")
+        return
+    # по запросу в Telegram на чат, плюс юзербот — это пара секунд, и без
+    # пометки кажется, что бот ввод проглотил
+    await _edit_menu(message, bot, state, "🔎 Смотрю…", None)
+    # только чаты спрашивающего: чужие владельцу показывать нельзя
+    chats = await db.chats_for(message.from_user.id)
+    d = await status_svc.collect(bot, uid, chats, first=cid)
+    b = InlineKeyboardBuilder()
+    b.row(_btn("🧪 Спам-профиль", f"u:spp:{cid}:{uid}"))
+    b.row(_btn("🔎 Проверить другого", f"u:ps:{cid}"))
+    b.row(_btn("⬅️ Назад", f"u:p:{cid}:0"))
+    await _edit_menu(message, bot, state, status_svc.render(d), b.as_markup())
+    await state.clear()
+
+
+@router.callback_query(F.data.startswith("u:spp:"))
+async def cb_status_spam(cb: CallbackQuery, bot: Bot) -> None:
+    """«Спам-профиль» в карточке проверки: профиль — в базу этого чата."""
+    _, _, cid, uid = cb.data.split(":")
+    cid, uid = int(cid), int(uid)
+    if not await _guard(cb, cid):
+        return
+    from ..services import nn
+    ok, note = await nn.remember_spam_profile(bot, cid, uid)
+    if ok:
+        await db.add_event(cid, "card", f"спам-профиль в базу: {uid} "
+                                        f"by {cb.from_user.id} (проверка статуса)")
+        markup = cb.message.reply_markup
+        if markup is not None:
+            rows = [row for row in markup.inline_keyboard
+                    if not any(btn.callback_data == cb.data for btn in row)]
+            try:
+                await cb.message.edit_reply_markup(
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+            except Exception:
+                pass
+    await cb.answer(note, show_alert=True)
+
+
 @router.callback_query(F.data.startswith("u:pa:"))
 async def cb_active(cb: CallbackQuery, state: FSMContext) -> None:
     _, _, cid, page = cb.data.split(":")
@@ -3622,7 +3690,7 @@ async def view_trig(cid: int, rid: int) -> tuple[str, InlineKeyboardMarkup]:
     if r is None:
         b.button(text="⬅️ Назад", callback_data=f"u:tgl:{cid}:0")
         return "Триггер не найден.", b.as_markup()
-    cd = f"{r['cooldown']} сек" if r["cooldown"] else "без кулдауна"
+    cd = utils.fmt_seconds(r["cooldown"]) if r["cooldown"] else "без кулдауна"
     answers = await db.ans_list("trig", rid)
     text = (
         f"<b>🎯 Триггер</b>\n\n"

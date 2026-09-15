@@ -1,4 +1,5 @@
 """Рантайм-состояние процесса."""
+import asyncio
 import time
 
 _started = time.monotonic()
@@ -35,3 +36,16 @@ def bot():
 def set_bot(obj) -> None:
     global _bot
     _bot = obj
+
+
+# Фоновые задачи «запустил и забыл». asyncio держит на задачу только слабую
+# ссылку: без своей её может подобрать сборщик мусора посреди работы, и
+# рассылка по сетке или таймер капчи молча не доходили бы до конца.
+_tasks: set[asyncio.Task] = set()
+
+
+def spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+    return task

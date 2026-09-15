@@ -1313,6 +1313,9 @@ async function render() {
   // приходилось листать обратно
   const keepScroll = path === lastPath;
   const y = window.scrollY;
+  // результат проверки статуса живёт, пока открыта её страница: вернулся
+  // позже — делаешь свежий запрос, а не смотришь на данные часовой давности
+  if (!/\/status$/.test(path)) delete CACHE.status;
   for (const [re, view] of ROUTES) {
     const m = path.match(re);
     if (!m) continue;

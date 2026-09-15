@@ -1,12 +1,11 @@
 """Кнопки на карточках в лог-чате: снять наказание / подтвердить."""
-import asyncio
 import logging
 
 from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from .. import db
+from .. import db, runtime
 
 logger = logging.getLogger("gremlin.cards")
 
@@ -39,11 +38,34 @@ async def _mark(cb: CallbackQuery, note: str, markup=None) -> bool:
     return True
 
 
+async def may_act(cb: CallbackQuery, chat_id: int) -> bool:
+    """Кнопки карточек — только тем, кто и так вправе модерировать этот чат:
+    его админам, его владельцу в боте и владельцу бота.
+
+    Карточку видит любой, кто сидит в лог-чате, а лог-чатом бывает и сам чат.
+    Раньше «Разбанить» или «Забанить» мог нажать кто угодно из них.
+    """
+    from .. import config
+    from ..services import adm_cache
+    uid = cb.from_user.id
+    if uid in config.ADMIN_IDS:
+        return True
+    ch = await db.get_chat(chat_id)
+    if ch is not None and ch["owner_id"] == uid:
+        return True
+    if uid in await adm_cache.chat_admin_ids(cb.bot, chat_id):
+        return True
+    await cb.answer("Эти кнопки — для админов чата.", show_alert=True)
+    return False
+
+
 @router.callback_query(F.data.startswith("k:lift:"))
 async def card_lift(cb: CallbackQuery, bot: Bot) -> None:
     from ..services import moderation
     pid = int(cb.data.split(":")[2])
     p = await db.get_punishment(pid)             # чат берём до снятия, потом он нужен для лога
+    if p is not None and not await may_act(cb, p["chat_id"]):
+        return
     ok, text, link = await moderation.lift_punishment(bot, pid)
     if not ok:
         await cb.answer(text, show_alert=True)
@@ -81,7 +103,7 @@ async def card_lift(cb: CallbackQuery, bot: Bot) -> None:
     if p is not None:
         # снятие тоже расходится по сетке, если так настроено
         from ..services import net
-        asyncio.create_task(net.lift_and_note(
+        runtime.spawn(net.lift_and_note(
             bot, [(cb.message.chat.id, cb.message.message_id)],
             p["chat_id"], p["user_id"],
         ))
@@ -110,6 +132,8 @@ async def card_forgive(cb: CallbackQuery) -> None:
     p = await db.get_punishment(pid)
     if p is None:
         await cb.answer("Наказание не найдено.", show_alert=True)
+        return
+    if not await may_act(cb, p["chat_id"]):
         return
     scope = moderation.forgive_scope(p["reason"])
     if scope is None:
@@ -142,6 +166,8 @@ async def card_spam_profile(cb: CallbackQuery, bot: Bot) -> None:
     from ..services import nn
     _, _, chat_id, user_id = cb.data.split(":")
     chat_id, user_id = int(chat_id), int(user_id)
+    if not await may_act(cb, chat_id):
+        return
     ok, note = await nn.remember_spam_profile(bot, chat_id, user_id)
     if not ok:
         await cb.answer(note, show_alert=True)
@@ -158,6 +184,8 @@ async def card_ban(cb: CallbackQuery, bot: Bot) -> None:
     """Забанить по карточке (мут/удаление/подозрение -> бан)."""
     _, _, chat_id, user_id = cb.data.split(":")
     chat_id, user_id = int(chat_id), int(user_id)
+    if not await may_act(cb, chat_id):
+        return
     from ..services import adm_cache
     member = await adm_cache.is_member(bot, chat_id, user_id)   # до бана
     try:
@@ -177,16 +205,13 @@ async def card_ban(cb: CallbackQuery, bot: Bot) -> None:
     if last is not None:
         await db.sample_relabel(last["id"], "spam", origin="card")
         nn.invalidate(chat_id)
-    # и сам профиль: имя с ником — тоже улика, по ней узнаются следующие такие же
-    row = await db.get_user(user_id)
-    face = " ".join(x for x in (
-        (row["first_name"] if row else None),
-        (f"@{row['username']}" if row and row["username"] else None)) if x)
-    if face:
-        await nn.remember_face(chat_id, user_id, face, "spam")
+    # и сам профиль — тем же видом строки, каким его потом сравнивают: имя,
+    # ник, описание и канал. Раньше писались только имя с ником, и такие
+    # записи сравнивались с полными профилями вполсилы
+    await nn.remember_spam_profile(bot, chat_id, user_id)
     await _mark(cb, "\n\n⛔ <b>Забанен</b>")
     from ..services import net
-    asyncio.create_task(net.spread_id_and_note(
+    runtime.spawn(net.spread_id_and_note(
         bot, [(cb.message.chat.id, cb.message.message_id)], chat_id, user_id,
         "ban", 0, "бан из карточки", cb.from_user.id,
     ))
@@ -197,5 +222,8 @@ async def card_ban(cb: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data == "k:wok")
 async def card_watch_ok(cb: CallbackQuery) -> None:
+    # чата наблюдения в кнопке нет — пускаем админов того чата, где карточка
+    if not await may_act(cb, cb.message.chat.id):
+        return
     ok = await _mark(cb, "\n\n🕊 <b>Оставлен под наблюдением</b>")
     await cb.answer("" if ok else "Оставлен под наблюдением")

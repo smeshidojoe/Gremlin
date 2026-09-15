@@ -3401,7 +3401,7 @@ async def cb_lift(cb: CallbackQuery, bot: Bot) -> None:
     ok, msg, _ = await moderation.lift_punishment(bot, pid, invite=False)
     if ok and p is not None:
         from ..services import net
-        asyncio.create_task(net.lift(bot, p["chat_id"], p["user_id"]))
+        runtime.spawn(net.lift(bot, p["chat_id"], p["user_id"]))
     text, kb = await view_active(cid, page)      # остаёмся на той же странице
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer(msg, show_alert=not ok)

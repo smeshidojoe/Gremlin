@@ -18,8 +18,8 @@ from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from .. import config, db, utils
-from ..services import adm_cache, moderation
+from .. import config, db, runtime, utils
+from ..services import adm_cache, countdown, moderation
 
 logger = logging.getLogger("gremlin.games")
 
@@ -118,7 +118,7 @@ async def _cleanup(bot: Bot, chat_id: int, msg_id: int,
 
 
 def _later(bot: Bot, chat_id: int, msg_id: int) -> None:
-    asyncio.create_task(_cleanup(bot, chat_id, msg_id))
+    runtime.spawn(_cleanup(bot, chat_id, msg_id))
 
 
 async def _who(user_id: int) -> str:
@@ -253,23 +253,31 @@ async def cmd_duel(message: Message, bot: Bot) -> None:
     kind, minutes = await prize(s, config.GAME_DUEL)
     b = InlineKeyboardBuilder()
     b.button(text="⚔️ Принять вызов", callback_data="g:duel")
+    head = (f"⚔️ <b>Дуэль!</b>\n\n{utils.mention(me.id, me.full_name, me.username)} "
+            f"вызывает {utils.mention(foe.id, foe.full_name, foe.username)}.\n"
+            f"Проигравший получает {prize_label(kind, minutes)}.\n\n")
     sent = await message.answer(
-        f"⚔️ <b>Дуэль!</b>\n\n{utils.mention(me.id, me.full_name, me.username)} "
-        f"вызывает {utils.mention(foe.id, foe.full_name, foe.username)}.\n"
-        f"Проигравший получает {prize_label(kind, minutes)}.\n\n"
-        f"⏳ На раздумья {config.DUEL_WAIT} сек.",
+        f"{head}⏳ На раздумья {countdown.label(config.DUEL_WAIT)}.",
         reply_markup=b.as_markup(),
     )
     key = (message.chat.id, sent.message_id)
     _duels[key] = {"caller": me.id, "foe": foe.id}
-    asyncio.create_task(_duel_timeout(bot, key, foe.id))
+    runtime.spawn(_duel_timeout(bot, key, foe.id, head, b.as_markup()))
 
 
-async def _duel_timeout(bot: Bot, key: tuple[int, int], foe: int) -> None:
-    await asyncio.sleep(config.DUEL_WAIT)
+async def _duel_timeout(bot: Bot, key: tuple[int, int], foe: int, head: str,
+                        markup) -> None:
+    chat_id, msg_id = key
+
+    async def draw(left: int) -> None:
+        await bot.edit_message_text(f"{head}⏳ На раздумья {countdown.label(left)}.",
+                                    chat_id=chat_id, message_id=msg_id,
+                                    reply_markup=markup)
+
+    # вызов приняли — отсчёт обрывается, дальше сообщение правит сама дуэль
+    await countdown.run(config.DUEL_WAIT, draw, stop=lambda: key not in _duels)
     if _duels.pop(key, None) is None:
         return                       # дуэль уже состоялась
-    chat_id, msg_id = key
     try:
         await bot.edit_message_text(
             f"⚔️ <b>Дуэль не состоялась</b>\n\n{await _who(foe)} струсил и не вышел "
@@ -359,12 +367,12 @@ async def cmd_battle(message: Message, bot: Bot) -> None:
     sent = await message.answer(
         f"🏝 <b>Королевская битва!</b>\n\nВыживет один. Первый выбывший получает "
         f"{prize_label(kind, minutes)}, последний — славу.\n\n"
-        f"👥 Бойцов: 0\n⏳ До начала матча: {config.BATTLE_JOIN} сек",
+        f"👥 Бойцов: 0\n⏳ До начала матча: {countdown.label(config.BATTLE_JOIN)}",
         reply_markup=b.as_markup(),
     )
     key = (message.chat.id, sent.message_id)
     _battles[key] = set()
-    asyncio.create_task(_battle_run(bot, key))
+    runtime.spawn(_battle_run(bot, key))
 
 
 @router.callback_query(F.data == "g:battle")
@@ -381,13 +389,19 @@ async def cb_battle(cb: CallbackQuery, bot: Bot) -> None:
     await cb.answer("Ты на арене 🏝")
 
 
-async def _battle_draw(bot: Bot, chat_id: int, msg_id: int, log: list,
+async def _battle_edit(bot: Bot, chat_id: int, msg_id: int, log: list,
                        left: int) -> None:
     """Перерисовать сводку матча с таймером до следующего события."""
-    tail = f"\n\n⏳ Следующее событие через {left} сек" if left else ""
+    tail = f"\n\n⏳ Следующее событие через {countdown.label(left)}" if left else ""
+    await bot.edit_message_text("\n".join(log[-12:]) + tail, chat_id=chat_id,
+                                message_id=msg_id, reply_markup=None)
+
+
+async def _battle_draw(bot: Bot, chat_id: int, msg_id: int, log: list,
+                       left: int) -> None:
+    """То же разово, вне отсчёта."""
     try:
-        await bot.edit_message_text("\n".join(log[-12:]) + tail, chat_id=chat_id,
-                                    message_id=msg_id, reply_markup=None)
+        await _battle_edit(bot, chat_id, msg_id, log, left)
     except Exception:
         pass          # текст не изменился или сообщение удалили
 
@@ -400,17 +414,13 @@ async def _battle_run(bot: Bot, key: tuple[int, int]) -> None:
             f"{prize_label(kind, minutes)}, последний — славу.")
     b = InlineKeyboardBuilder()
     b.button(text="🏝 Вписаться", callback_data="g:battle")
-    left = config.BATTLE_JOIN
-    while left > 0:
-        await asyncio.sleep(min(10, left))
-        left -= min(10, left)
-        try:
-            await bot.edit_message_text(
-                f"{head}\n\n👥 Бойцов: {len(_battles.get(key, ()))}\n"
-                f"⏳ До начала матча: {left} сек",
-                chat_id=chat_id, message_id=msg_id, reply_markup=b.as_markup())
-        except Exception:
-            pass
+    async def draw_join(left: int) -> None:
+        await bot.edit_message_text(
+            f"{head}\n\n👥 Бойцов: {len(_battles.get(key, ()))}\n"
+            f"⏳ До начала матча: {countdown.label(left)}",
+            chat_id=chat_id, message_id=msg_id, reply_markup=b.as_markup())
+
+    await countdown.run(config.BATTLE_JOIN, draw_join)
 
     fighters = list(_battles.pop(key, set()))
     random.shuffle(fighters)
@@ -430,11 +440,12 @@ async def _battle_run(bot: Bot, key: tuple[int, int]) -> None:
            f"{utils.plural(len(fighters), 'боец', 'бойца', 'бойцов')}."]
     first_out = None
     while len(fighters) > 1:
-        # тикаем чаще, чем выбиваем: внизу живой таймер до следующего события
-        for left in range(config.BATTLE_TICK, 0, -config.BATTLE_REFRESH):
-            await asyncio.sleep(min(config.BATTLE_REFRESH, left))
-            await _battle_draw(bot, chat_id, msg_id, log,
-                               max(0, left - config.BATTLE_REFRESH))
+        # Живой таймер до следующего события — без посекундного хвоста:
+        # события идут подряд весь матч, и секунды в конце каждого дали бы
+        # больше правок в минуту, чем Telegram разрешает
+        await countdown.run(
+            config.BATTLE_TICK,
+            lambda left: _battle_edit(bot, chat_id, msg_id, log, left), fine=0)
         dead = fighters.pop()
         first_out = first_out or dead
         log.append(f"💀 {await _who(dead)} {_death(used)}")
@@ -478,16 +489,20 @@ async def cmd_court(message: Message, bot: Bot) -> None:
     b.button(text="👎 Виновен", callback_data="g:court:1")
     b.button(text="👍 Невиновен", callback_data="g:court:0")
     b.adjust(2)
-    sent = await message.answer(
-        f"⚖️ <b>Народный суд</b>\n\n"
-        f"Подсудимый: {utils.mention(accused.id, accused.full_name, accused.username)}\n"
-        f"Обвинение: {utils.esc(charge)}\n\n"
-        f"⏳ Голосование {config.COURT_VOTE} сек\n👎 0 · 👍 0",
-        reply_markup=b.as_markup(),
-    )
+    head = (f"⚖️ <b>Народный суд</b>\n\n"
+            f"Подсудимый: {utils.mention(accused.id, accused.full_name, accused.username)}\n"
+            f"Обвинение: {utils.esc(charge)}\n\n")
+    sent = await message.answer(head + _court_tail(config.COURT_VOTE, {}),
+                                reply_markup=b.as_markup())
     key = (message.chat.id, sent.message_id)
     _courts[key] = {"accused": accused.id, "charge": charge, "votes": {}}
-    asyncio.create_task(_court_run(bot, key))
+    runtime.spawn(_court_run(bot, key, head, b.as_markup()))
+
+
+def _court_tail(left: int, votes: dict) -> str:
+    """Таймер и сколько проголосовало. Как именно голосуют, до приговора не
+    показываем: видя счёт, остальные просто присоединялись бы к большинству."""
+    return f"⏳ Голосование: {countdown.label(left)}\n🗳 Голосов: {len(votes)}"
 
 
 _CHEATS = (
@@ -527,9 +542,18 @@ async def _punish_by_court(bot: Bot, chat_id: int, court: dict) -> bool:
                          f"приговор чата: {court['charge']}")
 
 
-async def _court_run(bot: Bot, key: tuple[int, int]) -> None:
+async def _court_run(bot: Bot, key: tuple[int, int], head: str, markup) -> None:
     chat_id, msg_id = key
-    await asyncio.sleep(config.COURT_VOTE)
+
+    async def draw(left: int) -> None:
+        court = _courts.get(key)
+        if court is None:
+            return
+        await bot.edit_message_text(head + _court_tail(left, court["votes"]),
+                                    chat_id=chat_id, message_id=msg_id,
+                                    reply_markup=markup)
+
+    await countdown.run(config.COURT_VOTE, draw)
     court = _courts.pop(key, None)
     if court is None:
         return

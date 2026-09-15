@@ -11,7 +11,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from .. import config, db, utils
+from .. import config, db, runtime, utils
 from . import adm_cache, media
 
 logger = logging.getLogger("gremlin.moderation")
@@ -1010,5 +1010,5 @@ async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
         from . import net
         # в сетку уходит задуманное наказание, а не подменённое здесь: у соседей
         # свой расклад, и подменённый бан увозил бы туда «навсегда» вместо срока
-        asyncio.create_task(net.spread_and_note(bot, sent, chat.id, user,
-                                                punish_kind, mute_min, reason, None))
+        runtime.spawn(net.spread_and_note(bot, sent, chat.id, user,
+                                          punish_kind, mute_min, reason, None))

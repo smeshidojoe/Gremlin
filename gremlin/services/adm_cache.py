@@ -183,6 +183,9 @@ MEMBER_TTL = 900
 # chat_id -> когда последний раз писали в лог о сбое getChatMember
 _member_fail_logged: dict[int, float] = {}
 MEMBER_FAIL_LOG_EVERY = 600
+# ответы Telegram, которые означают «в чате не состоит», а не сбой
+_NOT_MEMBER_ERRORS = ("user not found", "member not found", "participant_id_invalid",
+                      "user_not_participant", "user_id_invalid")
 
 
 def member_cached(chat_id: int, user_id: int) -> bool | None:
@@ -220,16 +223,21 @@ async def is_member(bot: Bot, chat_id: int, user_id: int) -> bool:
         else:
             member = True
     except Exception as e:
-        # Молча считать участником нельзя: по этому ответу пишется was_member,
-        # выдаётся ссылка на возврат и уровень доверия, и потом не отличить
-        # настоящего участника от сбоя. В лог — не чаще раза на чат за 10 минут,
-        # иначе при лежащем API каждое сообщение даст строку
-        if now - _member_fail_logged.get(chat_id, -MEMBER_FAIL_LOG_EVERY) \
-                >= MEMBER_FAIL_LOG_EVERY:
-            _member_fail_logged[chat_id] = now
-            logger.warning("getChatMember упал в %s для %s, считаем участником: %s",
-                           chat_id, user_id, e)
-        return True                     # не кэшируем — вдруг разовый сбой
+        # «Такого участника нет» — это ответ, а не сбой: кого Telegram в чате
+        # не находит, тот в нём не состоит. Раньше и это считалось участником,
+        # отсюда was_member=1 и ссылка на возврат тому, кто в чате не был
+        if not any(mark in str(e).lower() for mark in _NOT_MEMBER_ERRORS):
+            # Настоящий сбой (сеть, лимиты) по-прежнему считаем участником —
+            # лучше пропустить, чем наказать своего, — но пишем в лог, не
+            # чаще раза на чат за 10 минут: по этому ответу пишется was_member
+            # и выдаётся ссылка на возврат
+            if now - _member_fail_logged.get(chat_id, -MEMBER_FAIL_LOG_EVERY) \
+                    >= MEMBER_FAIL_LOG_EVERY:
+                _member_fail_logged[chat_id] = now
+                logger.warning("getChatMember упал в %s для %s, считаем участником: %s",
+                               chat_id, user_id, e)
+            return True                 # не кэшируем — вдруг разовый сбой
+        member = False
     if len(_members) > 20000:
         _members.clear()
     _members[key] = (now + MEMBER_TTL, member)
@@ -238,6 +246,16 @@ async def is_member(bot: Bot, chat_id: int, user_id: int) -> bool:
 
 def invalidate_member(chat_id: int, user_id: int) -> None:
     _members.pop((chat_id, user_id), None)
+
+
+def note_member(chat_id: int, user_id: int, member: bool) -> None:
+    """Запомнить членство, уже узнанное другим запросом к getChatMember.
+
+    Проверка статуса спрашивает Telegram сама, а следом доверие спросило бы
+    ещё раз — тот же запрос на каждый чат дважды."""
+    if len(_members) > 20000:
+        _members.clear()
+    _members[(chat_id, user_id)] = (time.monotonic() + MEMBER_TTL, member)
 
 
 # Права, без которых модерация ломается молча: (поле, что сказать человеку).

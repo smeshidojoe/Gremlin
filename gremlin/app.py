@@ -197,6 +197,14 @@ async def main() -> None:
     titles_task = asyncio.create_task(games.titles_scheduler(bot))
     backup_task = asyncio.create_task(backup.scheduler())
     sweeper_task = asyncio.create_task(moderation.card_sweeper(bot))
+    # капча, которую ждали до перезапуска: таймеры в памяти пропали вместе с ним
+    try:
+        from .handlers import group as group_h
+        resumed = await group_h.resume_captcha(bot)
+        if resumed:
+            logger.info("капча: поднято ожиданий после перезапуска: %d", resumed)
+    except Exception:
+        logger.warning("капча не поднялась после перезапуска", exc_info=True)
     # разовые правки данных: улики профилей вернуть в свой список и
     # завести списки слов для профилей — до того, как что-то проверится
     try:

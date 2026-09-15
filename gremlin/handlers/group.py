@@ -1,5 +1,6 @@
 """Групповой пайплайн: команды !mute/!ban/!warn, капча и автомодерация всех сообщений."""
 import asyncio
+import json
 import logging
 import random
 import re
@@ -10,7 +11,7 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from .. import config, db, utils
+from .. import config, db, runtime, utils
 from ..services import (
     adm_cache, filters, media, moderation, net, nn, resolve, triggers, trust, watch,
 )
@@ -215,7 +216,7 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
     if kind != "kick":
         # кик по сетке не расходится: выгнать человека из шести чатов за то,
         # что он мешал в одном, — не то, о чём просили
-        asyncio.create_task(net.spread_and_note(
+        runtime.spawn(net.spread_and_note(
             bot, sent, message.chat.id, target, net_kind, mute_min, reason,
             message.from_user.id,
         ))
@@ -393,8 +394,8 @@ async def cmd_warn(message: Message, bot: Bot) -> None:
     )
     sent = await moderation.send_card(bot, message.chat.id, config.BIT_WARN, card,
                                       user_id=target.id)
-    asyncio.create_task(net.warn_and_note(bot, sent, message.chat.id, target, reason,
-                                          message.from_user.id))
+    runtime.spawn(net.warn_and_note(bot, sent, message.chat.id, target, reason,
+                                    message.from_user.id))
     await db.add_event(
         message.chat.id, "warn",
         f"варн {count}/{s.warns_limit}: {target.full_name} ({target.id}) — {reason} "
@@ -424,7 +425,7 @@ async def cmd_warn(message: Message, bot: Bot) -> None:
         until, message.from_user,
     )
     sent = await moderation.send_card(bot, message.chat.id, bit, punish_card, pid, kind)
-    asyncio.create_task(net.spread_and_note(
+    runtime.spawn(net.spread_and_note(
         bot, sent, message.chat.id, target, kind, s.warns_mute_min,
         f"набрано {s.warns_limit} варнов", message.from_user.id,
     ))
@@ -505,7 +506,7 @@ async def cmd_lift(message: Message, bot: Bot) -> None:
     )
     bit = config.BIT_BAN if unban else config.BIT_MUTE
     sent = await moderation.send_card(bot, message.chat.id, bit, card)
-    asyncio.create_task(net.lift_and_note(bot, sent, message.chat.id, uid))
+    runtime.spawn(net.lift_and_note(bot, sent, message.chat.id, uid))
     await db.add_event(
         message.chat.id, "manual",
         f"{'unban' if unban else 'unmute'}: {uid} | by {message.from_user.id}",
@@ -773,12 +774,38 @@ async def fire_trigger(bot: Bot, message: Message, s) -> None:
         return  # один триггер на сообщение
 
 
+async def _own_forward(bot: Bot, chat_id: int, origin_chat) -> bool:
+    """Пересылка из своего: этот чат, привязанный канал или чат из списка
+    разрешённых для ссылок.
+
+    Блок пересылок проверялся раньше, чем собирался список «своих» для ссылок,
+    и пост собственного канала, пересланный в обсуждение, удалялся как чужой.
+    """
+    ids = set(db.id_variants(origin_chat.id))
+    if chat_id in ids:
+        return True
+    linked_id, _, _ = await adm_cache.linked_chat(bot, chat_id)
+    if linked_id and linked_id in ids:
+        return True
+    uname = (getattr(origin_chat, "username", None) or "").lower()
+    for r in await db.link_wl_list(chat_id):
+        if r["target_id"] in ids or (uname and (r["username"] or "").lower() == uname):
+            return True
+    return False
+
+
 # ---------- капча новичкам ----------
+
+# ожидание капчи в kv: (чат, человек) -> {msg, until}. В памяти его одного
+# мало — перезапуск стирал таймер, и не нажавшего кнопку уже не кикали
+_CAPTCHA_KEY = "captcha:{}:{}"
+
 
 async def _captcha_timeout(bot: Bot, chat_id: int, user_id: int, timeout: int, msg_id: int) -> None:
     await asyncio.sleep(timeout)
     if _captcha_pending.pop((chat_id, user_id), None) is None:
         return  # уже прошёл
+    await db.kv_set(_CAPTCHA_KEY.format(chat_id, user_id), None)
     try:
         await bot.delete_message(chat_id, msg_id)
     except Exception:
@@ -798,6 +825,29 @@ async def _captcha_timeout(bot: Bot, chat_id: int, user_id: int, timeout: int, m
     await db.add_event(chat_id, "captcha", f"не прошёл капчу, кик: {user_id}")
 
 
+async def resume_captcha(bot: Bot) -> int:
+    """Поднять таймеры капчи после перезапуска. Вернуть, сколько поднято.
+
+    Просроченных за время простоя кикаем сразу: мут у них к этому времени
+    уже сошёл сам, и без кика они остались бы в чате, так и не нажав кнопку.
+    """
+    now = int(time.time())
+    count = 0
+    for key, raw in await db.kv_prefix("captcha:"):
+        try:
+            _, chat_id, user_id = key.split(":")
+            chat_id, user_id = int(chat_id), int(user_id)
+            data = json.loads(raw)
+            msg_id, until = int(data["msg"]), int(data["until"])
+        except (ValueError, KeyError, TypeError):
+            await db.kv_set(key, None)       # битая запись — ждать нечего
+            continue
+        _captcha_pending[(chat_id, user_id)] = msg_id
+        runtime.spawn(_captcha_timeout(bot, chat_id, user_id, max(0, until - now), msg_id))
+        count += 1
+    return count
+
+
 @router.callback_query(F.data.startswith("capt:"))
 async def captcha_pass(cb: CallbackQuery, bot: Bot) -> None:
     _, chat_id, user_id = cb.data.split(":")
@@ -806,6 +856,7 @@ async def captcha_pass(cb: CallbackQuery, bot: Bot) -> None:
         await cb.answer("Это капча не для тебя.", show_alert=True)
         return
     _captcha_pending.pop((chat_id, user_id), None)
+    await db.kv_set(_CAPTCHA_KEY.format(chat_id, user_id), None)
     try:
         await bot.restrict_chat_member(
             chat_id, user_id, permissions=await moderation.unmute_perms(bot, chat_id))
@@ -873,7 +924,7 @@ async def on_join(message: Message, bot: Bot) -> None:
                     await db.add_event(message.chat.id, "watch", f"бан бота @{user.username} ({user.id})")
                     sent = await moderation.send_card(
                         bot, message.chat.id, config.BIT_WATCH, card, pid, "ban")
-                    asyncio.create_task(net.spread_and_note(
+                    runtime.spawn(net.spread_and_note(
                         bot, sent, message.chat.id, user, "ban", 0,
                         "чужой бот добавлен не-админом", None))
                 continue
@@ -906,13 +957,18 @@ async def on_join(message: Message, bot: Bot) -> None:
                 continue
             b = InlineKeyboardBuilder()
             b.button(text="✅ Я не бот", callback_data=f"capt:{message.chat.id}:{user.id}")
+            # время в минутах: пресеты теперь до часа, «3600 сек» никто не считает
+            minutes = max(1, s.captcha_timeout // 60)
             sent = await message.answer(
                 f"👋 {utils.mention(user.id, user.full_name, user.username)}, подтверди, "
-                f"что ты человек — нажми кнопку за {s.captcha_timeout} сек, иначе кик.",
+                f"что ты человек — нажми кнопку за {minutes} "
+                f"{utils.plural(minutes, 'минуту', 'минуты', 'минут')}, иначе кик.",
                 reply_markup=b.as_markup(),
             )
             _captcha_pending[(message.chat.id, user.id)] = sent.message_id
-            asyncio.create_task(
+            await db.kv_set(_CAPTCHA_KEY.format(message.chat.id, user.id), json.dumps(
+                {"msg": sent.message_id, "until": int(time.time()) + s.captcha_timeout}))
+            runtime.spawn(
                 _captcha_timeout(bot, message.chat.id, user.id, s.captcha_timeout, sent.message_id)
             )
     if s.service_join:
@@ -1004,7 +1060,7 @@ async def moderate(message: Message, bot: Bot) -> None:
         # анонимный админ этого же чата — ок; автопересылка из привязанного канала — ок
         if message.sender_chat.id == chat.id or message.is_automatic_forward:
             if message.is_automatic_forward and s.rules_on and _rules_needed(message):
-                asyncio.create_task(_post_rules(message, chat.id))
+                runtime.spawn(_post_rules(message, chat.id))
             return
         anon_body = moderation.message_body(message)   # текст берём до удаления
         sender_scopes = await db.wl_scopes_for(
@@ -1125,8 +1181,8 @@ async def moderate(message: Message, bot: Bot) -> None:
         origin_user = getattr(origin, "sender_user", None)
         source = None                    # что писать в причине; None = пересылку пропускаем
         if origin_chat is not None:
-            # свои же сообщения пересылать можно
-            if s.forwards_on and origin_chat.id != chat.id:
+            # своё пересылать можно: этот чат, привязанный канал, разрешённые
+            if s.forwards_on and not await _own_forward(bot, chat.id, origin_chat):
                 allowed = await db.wl_scopes_for(chat.id, origin_chat.id, origin_chat.username)
                 if not allowed & {"all", "anon", "links"}:
                     kind = "канала" if origin_chat.type == "channel" else "чата"

@@ -13,7 +13,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from .. import config, db, utils
+from .. import config, db, runtime, utils
 from ..services import adm_cache, moderation
 from . import group
 
@@ -318,7 +318,7 @@ async def member_updated(update: ChatMemberUpdated, bot: Bot) -> None:
 
     if kind == "ban":
         # решаем не сразу: сперва надо понять, бан это или кик
-        asyncio.create_task(_ban_or_kick(bot, chat, target, actor))
+        runtime.spawn(_ban_or_kick(bot, chat, target, actor))
         return
 
     pid = await db.add_punishment(
@@ -723,6 +723,9 @@ async def sub_take(cb: CallbackQuery, bot: Bot) -> None:
     """Кнопка «Принять» на карточке заявки."""
     _, _, cid, uid = cb.data.split(":")
     cid, uid = int(cid), int(uid)
+    from .cards import may_act
+    if not await may_act(cb, cid):
+        return
     try:
         await bot.approve_chat_join_request(cid, uid)
     except Exception as e:
@@ -738,6 +741,9 @@ async def sub_drop(cb: CallbackQuery, bot: Bot) -> None:
     """Кнопка «Отказать»: заявку отклоняем, человека не трогаем."""
     _, _, cid, uid = cb.data.split(":")
     cid, uid = int(cid), int(uid)
+    from .cards import may_act
+    if not await may_act(cb, cid):
+        return
     try:
         await bot.decline_chat_join_request(cid, uid)
     except Exception as e:
@@ -757,6 +763,9 @@ async def sub_ban(cb: CallbackQuery, bot: Bot) -> None:
     from ..services import moderation
     _, _, cid, uid = cb.data.split(":")
     cid, uid = int(cid), int(uid)
+    from .cards import may_act
+    if not await may_act(cb, cid):
+        return
     try:
         await bot.decline_chat_join_request(cid, uid)
     except Exception:

@@ -17,7 +17,7 @@ import time
 
 from aiohttp import web
 
-from .. import config, db, schema, utils
+from .. import config, db, runtime, schema, utils
 from ..handlers import fun as fun_h, user_menu as um
 from ..services import (adm_cache, cas, digest as digest_svc, filters as flt,
                         media, moderation, net as net_svc, nn, resolve,
@@ -709,8 +709,8 @@ async def api_linkwl_add(request: web.Request) -> web.Response:
 
 @routes.delete("/api/chat/{cid}/linkwl/{rid}")
 async def api_linkwl_del(request: web.Request) -> web.Response:
-    await cid_of(request)
-    await db.link_wl_remove(int(request.match_info["rid"]))
+    cid = await cid_of(request)
+    await db.link_wl_remove(int(request.match_info["rid"]), cid)
     return js({"ok": True})
 
 
@@ -733,12 +733,26 @@ async def api_inlinewl_add(request: web.Request) -> web.Response:
 
 @routes.delete("/api/chat/{cid}/inlinewl/{rid}")
 async def api_inlinewl_del(request: web.Request) -> web.Response:
-    await cid_of(request)
-    await db.inline_wl_remove(int(request.match_info["rid"]))
+    cid = await cid_of(request)
+    await db.inline_wl_remove(int(request.match_info["rid"]), cid)
     return js({"ok": True})
 
 
 # ---------- триггеры ----------
+
+async def _row_of(request, getter, what: str):
+    """Запись по id из пути — только если она из этого чата.
+
+    Проверки одного cid мало: id записей идут подряд, и владелец своего чата,
+    подставив чужой id, читал бы, правил и удалял чужие триггеры и счётчики.
+    """
+    cid = await cid_of(request)
+    rid = int(request.match_info["rid"])
+    row = await getter(rid)
+    if row is None or row["chat_id"] != cid:
+        raise web.HTTPNotFound(text=f"no {what}")
+    return rid, row
+
 
 @routes.get("/api/chat/{cid}/trigs")
 async def api_trigs(request: web.Request) -> web.Response:
@@ -776,11 +790,7 @@ async def api_trig_add(request: web.Request) -> web.Response:
 
 @routes.get("/api/chat/{cid}/trigs/{rid}")
 async def api_trig(request: web.Request) -> web.Response:
-    await cid_of(request)
-    rid = int(request.match_info["rid"])
-    r = await db.trig_get(rid)
-    if r is None:
-        raise web.HTTPNotFound(text="no trigger")
+    rid, r = await _row_of(request, db.trig_get, "trigger")
     return js({"trigger": dict(r), "answers": rows(await db.ans_list("trig", rid)),
                "cooldowns": list(config.CMD_COOLDOWN_PRESETS),
                "cooldown_labels": _cd_labels()})
@@ -788,8 +798,7 @@ async def api_trig(request: web.Request) -> web.Response:
 
 @routes.post("/api/chat/{cid}/trigs/{rid}")
 async def api_trig_edit(request: web.Request) -> web.Response:
-    await cid_of(request)
-    rid = int(request.match_info["rid"])
+    rid, _ = await _row_of(request, db.trig_get, "trigger")
     data = await body(request)
     if "phrase" in data:
         phrase = (data["phrase"] or "").strip().lower()
@@ -806,8 +815,7 @@ async def api_trig_edit(request: web.Request) -> web.Response:
 
 @routes.delete("/api/chat/{cid}/trigs/{rid}")
 async def api_trig_del(request: web.Request) -> web.Response:
-    await cid_of(request)
-    rid = int(request.match_info["rid"])
+    rid, _ = await _row_of(request, db.trig_get, "trigger")
     await db.ans_clear("trig", rid)      # вместе с вариантами и их медиа
     await db.trig_remove(rid)
     return js({"ok": True})
@@ -851,11 +859,7 @@ async def api_cmd_add(request: web.Request) -> web.Response:
 
 @routes.get("/api/chat/{cid}/cmds/{rid}")
 async def api_cmd(request: web.Request) -> web.Response:
-    await cid_of(request)
-    rid = int(request.match_info["rid"])
-    r = await db.cmd_get(rid)
-    if r is None:
-        raise web.HTTPNotFound(text="no counter")
+    rid, r = await _row_of(request, db.cmd_get, "counter")
     return js({"cmd": dict(r), "answers": rows(await db.ans_list("cmd", rid)),
                "cooldowns": list(config.CMD_COOLDOWN_PRESETS),
                "cooldown_labels": _cd_labels()})
@@ -863,8 +867,7 @@ async def api_cmd(request: web.Request) -> web.Response:
 
 @routes.post("/api/chat/{cid}/cmds/{rid}")
 async def api_cmd_edit(request: web.Request) -> web.Response:
-    await cid_of(request)
-    rid = int(request.match_info["rid"])
+    rid, _ = await _row_of(request, db.cmd_get, "counter")
     data = await body(request)
     if "cooldown" in data:
         cd = int(data["cooldown"])
@@ -878,8 +881,7 @@ async def api_cmd_edit(request: web.Request) -> web.Response:
 
 @routes.delete("/api/chat/{cid}/cmds/{rid}")
 async def api_cmd_del(request: web.Request) -> web.Response:
-    await cid_of(request)
-    rid = int(request.match_info["rid"])
+    rid, _ = await _row_of(request, db.cmd_get, "counter")
     await db.ans_clear("cmd", rid)
     await db.cmd_remove(rid)
     return js({"ok": True})
@@ -888,6 +890,24 @@ async def api_cmd_del(request: web.Request) -> web.Response:
 # ---------- варианты ответов (триггеры, счётчики, приветствие, правила) ----------
 
 _ANS_OWNERS = {"trig", "cmd", "welcome", "rules", "sub", "paste"}
+# у этих владелец варианта — сам чат
+_ANS_CHAT_OWNED = ("welcome", "rules", "sub", "paste")
+
+
+async def _ans_owner_ok(owner: str, oid: int, cid: int) -> bool:
+    """Свой ли объект у варианта ответа: у приветствия, правил, заявок и паст
+    это сам чат, у триггера и счётчика — запись этого чата.
+
+    Проверка жила в трёх местах и разошлась: удаление знало только
+    приветствие и правила, загрузка — ещё заявки, и заготовки паст и заявок
+    из панели не удалялись, а медиа к пастам не загружалось.
+    """
+    if owner in _ANS_CHAT_OWNED:
+        return oid == cid
+    if owner not in ("trig", "cmd"):
+        return False
+    row = await (db.trig_get(oid) if owner == "trig" else db.cmd_get(oid))
+    return row is not None and row["chat_id"] == cid
 
 
 async def _ans_scope(request) -> tuple[int, str, int]:
@@ -898,15 +918,8 @@ async def _ans_scope(request) -> tuple[int, str, int]:
     if owner not in _ANS_OWNERS:
         raise web.HTTPBadRequest(text="bad owner")
     oid = int(oid)
-    # у приветствия и правил владелец — сам чат; у триггера и счётчика
-    # проверяем, что запись принадлежит именно этому чату
-    if owner in ("welcome", "rules", "sub", "paste"):
-        if oid != cid:
-            raise web.HTTPForbidden(text="not your object")
-    else:
-        row = await (db.trig_get(oid) if owner == "trig" else db.cmd_get(oid))
-        if row is None or row["chat_id"] != cid:
-            raise web.HTTPForbidden(text="not your object")
+    if not await _ans_owner_ok(owner, oid, cid):
+        raise web.HTTPForbidden(text="not your object")
     return cid, owner, oid
 
 
@@ -955,17 +968,13 @@ async def api_answer_upload(request: web.Request) -> web.Response:
         elif part.name == "file":
             if owner not in _ANS_OWNERS or oid is None:
                 raise web.HTTPBadRequest(text="сначала owner и oid")
+            # права — до записи на диск: иначе отвергнутый файл оставался лежать
+            if not await _ans_owner_ok(owner, oid, cid):
+                raise web.HTTPForbidden(text="not your object")
             kind = _media_kind(part.filename or "")
             saved = await _save_upload(part, cid, kind, owner)
     if saved is None:
         raise web.HTTPBadRequest(text="Файл не пришёл.")
-    if owner in ("welcome", "rules", "sub"):
-        if oid != cid:
-            raise web.HTTPForbidden(text="not your object")
-    else:
-        row = await (db.trig_get(oid) if owner == "trig" else db.cmd_get(oid))
-        if row is None or row["chat_id"] != cid:
-            raise web.HTTPForbidden(text="not your object")
     rid = await db.ans_add(owner, oid, caption or None, saved, kind)
     return js({"id": rid, "media_type": kind})
 
@@ -1015,14 +1024,8 @@ async def api_answer_del(request: web.Request) -> web.Response:
     if a is None:
         return js({"ok": True})
     # чужой вариант удалить нельзя: сверяем владельца с этим чатом
-    if a["owner"] in ("welcome", "rules"):
-        if a["owner_id"] != cid:
-            raise web.HTTPForbidden(text="not your object")
-    else:
-        row = await (db.trig_get(a["owner_id"]) if a["owner"] == "trig"
-                     else db.cmd_get(a["owner_id"]))
-        if row is None or row["chat_id"] != cid:
-            raise web.HTTPForbidden(text="not your object")
+    if not await _ans_owner_ok(a["owner"], a["owner_id"], cid):
+        raise web.HTTPForbidden(text="not your object")
     await db.ans_remove(a["id"])
     return js({"ok": True})
 
@@ -1100,7 +1103,10 @@ async def api_spam_profile(request: web.Request) -> web.Response:
     """«Спам-профиль» со страницы проверки: профиль — в базу этого чата."""
     cid = await cid_of(request)
     data = await body(request)
-    uid = int(data.get("user_id") or 0)
+    try:
+        uid = int(data.get("user_id") or 0)
+    except (TypeError, ValueError):
+        uid = 0
     if uid <= 0:
         raise web.HTTPBadRequest(text="bad user_id")
     ok, note = await nn.remember_spam_profile(bot_of(request), cid, uid)
@@ -1151,7 +1157,7 @@ async def api_lift(request: web.Request) -> web.Response:
         raise web.HTTPForbidden(text="not your punishment")
     ok, msg, _ = await moderation.lift_punishment(bot_of(request), pid, invite=False)
     if ok:
-        asyncio.create_task(net_svc.lift(bot_of(request), p["chat_id"], p["user_id"]))
+        runtime.spawn(net_svc.lift(bot_of(request), p["chat_id"], p["user_id"]))
     return js({"ok": ok, "note": _strip_tags(msg)})
 
 

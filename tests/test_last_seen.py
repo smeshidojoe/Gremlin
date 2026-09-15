@@ -5,7 +5,7 @@ from gremlin import db, utils
 from gremlin.services import profile
 from gremlin.services import status as st
 
-from conftest import CHAT, FakeBot
+from conftest import FakeBot
 
 U = 9400
 DAY = 86400
@@ -23,8 +23,9 @@ async def test_chat_message_moves_last_seen(chat, monkeypatch):
     assert (row["username"], row["first_name"]) == ("katya", "Катя")
 
 
-async def test_status_uses_latest_message_for_old_rows(chat, monkeypatch):
-    """Старые записи с застывшим last_seen: дату берём из счётчика сообщений."""
+async def test_status_dates_come_from_messages(chat, monkeypatch):
+    """Даты в проверке статуса — из счётчика сообщений, а не из общей записи
+    о человеке: та застывала и к тому же выдавала активность в чужих чатах."""
     monkeypatch.setattr(profile, "_cache", {})
     first = 1_780_000_000
     await db._db.execute(
@@ -32,8 +33,8 @@ async def test_status_uses_latest_message_for_old_rows(chat, monkeypatch):
         " VALUES (?, ?, ?, ?, ?)", (U, "katya", "Катя", first, first))
     today = utils.day_num()
     await db._db.execute(
-        "INSERT INTO msg_stats (chat_id, user_id, day, cnt) VALUES (?, ?, ?, ?)",
-        (chat, U, today, 5))
+        "INSERT INTO msg_stats (chat_id, user_id, day, cnt) VALUES (?, ?, ?, ?), (?, ?, ?, ?)",
+        (chat, U, today - 3, 2, chat, U, today, 5))
     await db._db.commit()
 
     class Bot(FakeBot):
@@ -41,6 +42,5 @@ async def test_status_uses_latest_message_for_old_rows(chat, monkeypatch):
             return types.SimpleNamespace(status="member", user=None)
 
     d = await st.collect(Bot(), U, [{"chat_id": chat, "title": "Чат"}])
-    fact = d["facts"][0]
-    assert fact.startswith(f"👁 бот впервые заметил его {st._date(first)}")
-    assert fact.endswith(f"последняя активность {st._day_date(today)}")
+    assert d["facts"] == [f"✉️ пишет в ваших чатах с {st._day_date(today - 3)}"
+                          f" · последнее сообщение {st._day_date(today)}"]

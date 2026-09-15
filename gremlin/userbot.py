@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 from aiogram import Bot
 
-from . import config, db, utils
+from . import config, db, runtime, utils
 from .services import moderation, stats_collect, watch
 
 logger = logging.getLogger("gremlin.userbot")
@@ -216,7 +216,7 @@ async def _handle_bot_spam(bot: Bot, chat_id: int, message, sender) -> None:
     )
     if pid:
         from .services import net
-        asyncio.create_task(net.spread_and_note(
+        runtime.spawn(net.spread_and_note(
             bot, sent, chat_id, await net.user_stub(uid), applied, mute_min,
             f"вызов спам-бота @{bot_uname}", None))
 
@@ -317,7 +317,7 @@ async def start(bot: Bot) -> object | None:
     _client_ref = client
     me = await client.get_me()
     logger.info("юзербот запущен: @%s (id=%s)", me.username, me.id)
-    asyncio.create_task(_watchdog(client))
+    runtime.spawn(_watchdog(client))
 
     @client.on(events.NewMessage())
     async def _on_message(event) -> None:

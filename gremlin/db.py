@@ -1334,8 +1334,13 @@ async def link_wl_add(chat_id: int, target_id: int | None, username: str | None,
     return True
 
 
-async def link_wl_remove(row_id: int) -> None:
-    await _db.execute("DELETE FROM link_wl WHERE id = ?", (row_id,))
+async def link_wl_remove(row_id: int, chat_id: int | None = None) -> None:
+    """chat_id — удалить, только если запись из этого чата: id приходит снаружи."""
+    if chat_id is None:
+        await _db.execute("DELETE FROM link_wl WHERE id = ?", (row_id,))
+    else:
+        await _db.execute("DELETE FROM link_wl WHERE id = ? AND chat_id = ?",
+                          (row_id, chat_id))
     await _db.commit()
 
 
@@ -1365,8 +1370,13 @@ async def inline_wl_add(chat_id: int, username: str,
     return True
 
 
-async def inline_wl_remove(row_id: int) -> None:
-    await _db.execute("DELETE FROM inline_wl WHERE id = ?", (row_id,))
+async def inline_wl_remove(row_id: int, chat_id: int | None = None) -> None:
+    """chat_id — удалить, только если запись из этого чата: id приходит снаружи."""
+    if chat_id is None:
+        await _db.execute("DELETE FROM inline_wl WHERE id = ?", (row_id,))
+    else:
+        await _db.execute("DELETE FROM inline_wl WHERE id = ? AND chat_id = ?",
+                          (row_id, chat_id))
     await _db.commit()
 
 
@@ -2409,13 +2419,14 @@ async def user_status_counts(user_id: int, chat_ids: list[int]) -> dict:
     разошедшиеся по сетке, не считаем — это то же самое наказание, и бан в
     сетке из пяти чатов иначе выглядел бы пятью банами.
     """
-    out = {"kinds": {}, "warns": 0, "forgiven": 0, "cas": False, "last_day": None}
+    out = {"kinds": {}, "warns": 0, "forgiven": 0, "cas": False,
+           "first_day": None, "last_day": None}
     if chat_ids:
         ph = ",".join("?" * len(chat_ids))
         cur = await _db.execute(
-            f"SELECT MAX(day) FROM msg_stats WHERE user_id = ? AND chat_id IN ({ph})",
-            (user_id, *chat_ids))
-        out["last_day"] = (await cur.fetchone())[0]
+            f"SELECT MIN(day), MAX(day) FROM msg_stats"
+            f" WHERE user_id = ? AND chat_id IN ({ph})", (user_id, *chat_ids))
+        out["first_day"], out["last_day"] = tuple(await cur.fetchone())
         cur = await _db.execute(
             f"""SELECT kind, COUNT(*) AS n FROM punishments
                 WHERE user_id = ? AND chat_id IN ({ph})
@@ -2447,12 +2458,21 @@ async def user_seen_chats(user_id: int, chat_ids: list[int]) -> set[int]:
     args: list = []
     for _ in tables:
         args += [user_id, *chat_ids]
-    # у событий id живёт только в тексте; границы числа проверять тут дорого,
-    # ложное совпадение даст лишь лишний чат в списке
-    parts.append(f"SELECT chat_id FROM events WHERE chat_id IN ({ph}) AND text LIKE ?")
-    args += [*chat_ids, f"%{user_id}%"]
     cur = await _db.execute(" UNION ".join(parts), args)
-    return {r[0] for r in await cur.fetchall()}
+    found = {r[0] for r in await cur.fetchall()}
+    # У событий id живёт только в тексте, а LIKE находит его и внутри чужих
+    # чисел: у короткого id так в список попадали чужие чаты. Границы числа
+    # досматриваем здесь, и только по чатам, которые ещё не нашлись
+    rest = [c for c in chat_ids if c not in found]
+    if rest:
+        cur = await _db.execute(
+            f"SELECT chat_id, text FROM events WHERE chat_id IN "
+            f"({','.join('?' * len(rest))}) AND text LIKE ?",
+            (*rest, f"%{user_id}%"))
+        exact = re.compile(rf"(?<!\d){user_id}(?!\d)")
+        found |= {r["chat_id"] for r in await cur.fetchall()
+                  if exact.search(r["text"] or "")}
+    return found
 
 
 _NOT_ABOUT_PEOPLE = ("bot", "nn", "digest")

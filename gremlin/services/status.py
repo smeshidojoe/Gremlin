@@ -17,6 +17,7 @@ from datetime import datetime
 from aiogram import Bot
 
 from .. import config, db, utils
+from . import adm_cache
 
 _ID = re.compile(r"^\d{1,15}$")
 _NAME = re.compile(
@@ -141,6 +142,7 @@ async def _chat(bot: Bot, chat, uid: int) -> dict:
     in_chat, tg_kind = False, None
     if m is not None:
         out["state"], in_chat, tg_kind = _state(m)
+        adm_cache.note_member(cid, uid, in_chat)   # доверию ниже не спрашивать снова
         out["user"] = getattr(m, "user", None)
         # «в чате нет» — ответ Telegram про любого человека на свете,
         # показывать чат только из-за него незачем
@@ -231,15 +233,11 @@ async def collect(bot: Bot, user_id: int, chats, first: int | None = None) -> di
                        "n": stats["forgiven"]})
 
     facts = []
-    if known and known["first_seen"]:
-        # first_seen — когда бот впервые заметил человека, а не когда тот
-        # вступил: до появления бота в чате записей нет. Дата вступления — в
-        # строке чата «в чате с». last_seen долго не двигали сообщения в чатах,
-        # поэтому сверяем его с последним днём из счётчика сообщений
-        last = max(known["last_seen"] or 0,
-                   _day_ts(stats["last_day"]) if stats["last_day"] else 0)
-        facts.append(f"👁 бот впервые заметил его {_date(known['first_seen'])}"
-                     + (f" · последняя активность {_date(last)}" if last else ""))
+    if stats["first_day"]:
+        # Только по чатам спрашивающего: first_seen и last_seen в базе общие на
+        # человека, и через них владелец видел активность в чужих чатах
+        first, last = _day_date(stats["first_day"]), _day_date(stats["last_day"])
+        facts.append(f"✉️ пишет в ваших чатах с {first} · последнее сообщение {last}")
     if stats["cas"]:
         facts.append("🌐 в общем списке спамеров (CAS)")
 

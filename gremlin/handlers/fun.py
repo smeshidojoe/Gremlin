@@ -17,8 +17,8 @@ from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from .. import config, db, utils
-from ..services import adm_cache, moderation
+from .. import config, db, runtime, utils
+from ..services import adm_cache, countdown, moderation
 
 logger = logging.getLogger("gremlin.fun")
 
@@ -293,7 +293,7 @@ async def _lone_hero(bot: Bot, chat_id: int, msg_id: int, who_id: int, cfg: dict
     except Exception:
         logger.warning("рулетка: не вышло похвалить героя", exc_info=True)
     await db.add_event(chat_id, "manual", f"бан-рулетка: {who_id} уцелел | by {by_id}")
-    asyncio.create_task(_cleanup(bot, chat_id, msg_id))
+    runtime.spawn(_cleanup(bot, chat_id, msg_id))
 
 
 async def _mention(user_id: int) -> str:
@@ -329,7 +329,7 @@ async def _finish(bot: Bot, chat_id: int, msg_id: int, winner: int, cfg: dict,
         logger.warning("рулетка: не вышло объявить победителя", exc_info=True)
     await db.add_event(chat_id, "manual",
                        f"бан-рулетка: {cfg['kind']} для {winner} | by {by_id}")
-    asyncio.create_task(_cleanup(bot, chat_id, msg_id))
+    runtime.spawn(_cleanup(bot, chat_id, msg_id))
 
 
 async def _run_all(bot: Bot, cfg: dict, by_id: int) -> str:
@@ -360,11 +360,12 @@ async def _run_opt(bot: Bot, cfg: dict, by_id: int) -> str:
     b.button(text="🎰 Участвовать", callback_data="f:join")
     head = ("🎯 <b>Бан-рулетка!</b>\n\nЖми кнопку, если чувствуешь удачу.\n"
             f"Приз — <b>{KIND_LABEL[cfg['kind']]}</b>.")
-    msg = await bot.send_message(chat_id, f"{head}\n\n⏳ Сбор: {timer} сек\n👥 Смельчаков: 0",
+    msg = await bot.send_message(chat_id, f"{head}\n\n⏳ Сбор: {countdown.label(timer)}"
+                                          "\n👥 Смельчаков: 0",
                                  reply_markup=b.as_markup())
     key = (chat_id, msg.message_id)
     _joined[key] = set()
-    asyncio.create_task(_collect(bot, key, cfg, by_id, head))
+    runtime.spawn(_collect(bot, key, cfg, by_id, head))
     return f"Сбор участников на {timer} сек запущен."
 
 
@@ -372,20 +373,17 @@ async def _collect(bot: Bot, key: tuple[int, int], cfg: dict, by_id: int,
                    head: str) -> None:
     """Обратный отсчёт, затем розыгрыш среди нажавших."""
     chat_id, msg_id = key
-    left = cfg["timer"]
-    step = 10 if left > 60 else 5
     b = InlineKeyboardBuilder()
     b.button(text="🎰 Участвовать", callback_data="f:join")
-    while left > 0:
-        await asyncio.sleep(min(step, left))
-        left -= min(step, left)
-        try:
-            await bot.edit_message_text(
-                f"{head}\n\n⏳ Сбор: {left} сек\n👥 Смельчаков: {len(_joined.get(key, ()))}",
-                chat_id=chat_id, message_id=msg_id, reply_markup=b.as_markup(),
-            )
-        except Exception:
-            pass          # текст не изменился или сообщение удалили — не страшно
+
+    async def draw(left: int) -> None:
+        await bot.edit_message_text(
+            f"{head}\n\n⏳ Сбор: {countdown.label(left)}\n"
+            f"👥 Смельчаков: {len(_joined.get(key, ()))}",
+            chat_id=chat_id, message_id=msg_id, reply_markup=b.as_markup(),
+        )
+
+    await countdown.run(cfg["timer"], draw)
 
     # кнопку жмут и комментаторы под постами: они в группе не состоят
     people = await _in_chat(bot, chat_id, list(_joined.pop(key, set())))
@@ -396,7 +394,7 @@ async def _collect(bot: Bot, key: tuple[int, int], cfg: dict, by_id: int,
                 chat_id=chat_id, message_id=msg_id, reply_markup=None)
         except Exception:
             pass
-        asyncio.create_task(_cleanup(bot, chat_id, msg_id))
+        runtime.spawn(_cleanup(bot, chat_id, msg_id))
         return
     spin_head = "🎯 <b>Бан-рулетка!</b>\n\nБарабан крутится, судьба выбирает жертву"
     await _spin(bot, chat_id, msg_id, spin_head)

@@ -8,6 +8,7 @@
 разовая, в истории чата ей делать нечего.
 """
 import asyncio
+import json
 import logging
 import random
 import re
@@ -25,17 +26,56 @@ logger = logging.getLogger("gremlin.games")
 router = Router()
 router.message.filter(F.chat.type.in_({"group", "supergroup"}))
 
-# кулдаун рулетки: (chat_id, user_id) -> когда крутил
-_rus_fired: dict[tuple[int, int], float] = {}
+# Револьвер один на чат: барабан на RUS_CHANCE гнёзд и один патрон.
+# Раньше каждый выстрел был независимым «один из шести», а ожидание в 6 часов
+# висело на человеке — по сути монетка, которую можно бросить раз в шесть
+# часов. Барабан ничего не помнил, и пять промахов подряд выглядели как
+# поломка. Теперь он проворачивается: шанс растёт с каждым щелчком, на
+# последнем гнезде выстрел гарантирован, и после выстрела револьвер уходит
+# на перезарядку для всего чата.
+#
+# Состояние лежит в kv, а не в памяти: иначе перезапуск бота бесплатно
+# перезаряжал бы револьвер и обнулял набитые щелчки.
+_RUS_KEY = "rus_drum:{}"
+# один щелчок за раз: двое, нажавшие одновременно, иначе прочли бы барабан
+# в одном положении и провернули его на одно гнездо вместо двух
+_rus_locks: dict[int, asyncio.Lock] = {}
 
 
-def _prune_rus(now: float) -> None:
-    """Кулдаун живёт 6 часов, а запись о нём лежала вечно: в чате на тысячу
-    человек это тысяча мёртвых строк, которые никто никогда не убирал."""
-    if len(_rus_fired) <= 5000:
-        return
-    for key in [k for k, ts in _rus_fired.items() if now - ts > config.RUS_CD]:
-        del _rus_fired[key]
+async def _drum_load(chat_id: int) -> dict:
+    raw = await db.kv_get(_RUS_KEY.format(chat_id))
+    try:
+        return json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+async def _drum_save(chat_id: int, drum: dict) -> None:
+    await db.kv_set(_RUS_KEY.format(chat_id), json.dumps(drum))
+
+
+async def _pull(chat_id: int) -> tuple[str, int]:
+    """Нажать на спуск. Вернуть (что вышло, число).
+
+    ('reload', секунд до готовности) — револьвер на перезарядке;
+    ('miss', сколько гнёзд осталось) — щелчок, барабан провернулся;
+    ('hit', 0) — выстрел, револьвер ушёл на перезарядку.
+    """
+    lock = _rus_locks.setdefault(chat_id, asyncio.Lock())
+    async with lock:
+        now = int(time.time())
+        drum = await _drum_load(chat_id)
+        if drum.get("reload_until", 0) > now:
+            return "reload", drum["reload_until"] - now
+        if "bullet" not in drum:
+            # заряжаем: патрон в случайное гнездо, крутим с нуля
+            drum = {"bullet": random.randrange(config.RUS_CHANCE), "pulls": 0}
+        if drum["pulls"] >= drum["bullet"]:
+            await _drum_save(chat_id, {"reload_until": now + config.RUS_CD})
+            return "hit", 0
+        drum["pulls"] += 1
+        await _drum_save(chat_id, drum)
+        return "miss", config.RUS_CHANCE - drum["pulls"]
 # открытые дуэли и суды: (chat_id, message_id) -> состояние
 _duels: dict[tuple[int, int], dict] = {}
 _courts: dict[tuple[int, int], dict] = {}
@@ -153,43 +193,44 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
     if not await _allowed(bot, message, config.GAME_RUS):
         return
     player, by_admin = await _rus_target(message, bot)
-    # Кулдаун считаем на игрока, а не на того, кто позвал: иначе админ гонял
-    # бы одного человека по кругу без остановки.
-    key = (message.chat.id, player.id)
-    now = time.time()
-    left = config.RUS_CD - (now - _rus_fired.get(key, 0))
-    if left > 0:
-        waiting = ("Барабан ещё горячий" if not by_admin
-                   else f"{utils.esc(player.full_name)} крутил недавно")
+    # Щелчок считаем сразу, до паузы: пока барабан «крутится» две секунды,
+    # следующий игрок уже должен видеть его провёрнутым.
+    outcome, value = await _pull(message.chat.id)
+    if outcome == "reload":
         sent = await message.reply(
-            f"🔫 {waiting}. Возвращайся через "
-            f"{utils.fmt_minutes(int(left // 60) or 1)}.")
+            f"🔫 Револьвер на перезарядке. Будет готов через "
+            f"{utils.fmt_minutes(value // 60 or 1)}.")
         _later(bot, message.chat.id, sent.message_id)
         return
-    _prune_rus(now)
-    _rus_fired[key] = now
 
     s = await db.get_settings(message.chat.id)
     kind, minutes = await prize(s, config.GAME_RUS)
-    hit = random.randrange(config.RUS_CHANCE) == 0
     who = utils.mention(player.id, player.full_name, player.username)
     sent = await message.reply("🔫 Крутим барабан…" if not by_admin
                                else f"🔫 Барабан крутят за {who}…")
     await asyncio.sleep(2)
     # итог выстрела оставляем в чате: он короткий, и по нему видно, кто
-    # когда крутил. Самоуничтожается только служебная воркотня про кулдаун
-    if not hit:
-        await sent.edit_text(f"🔫 {who}: {random.choice(_RUS_SAFE)}")
+    # когда крутил. Самоуничтожается только служебная воркотня про перезарядку
+    if outcome == "miss":
+        word = utils.plural(value, "гнездо", "гнезда", "гнёзд")
+        await sent.edit_text(
+            f"🔫 {who}: {random.choice(_RUS_SAFE)}\n"
+            f"<i>В барабане {value} {word} — шанс 1 из {value}.</i>")
         return
+    reload_note = (f"<i>Револьвер ушёл на перезарядку на "
+                   f"{utils.fmt_minutes(config.RUS_CD // 60)}.</i>")
+    # патрон потрачен в любом случае: иначе админ разряжал бы барабан без
+    # последствий, а перезарядку чату всё равно пришлось бы ждать
     if not await _can_target(bot, message.chat.id, player.id):
         await sent.edit_text(f"🔫 {who}: {random.choice(_RUS_HIT)}\n"
-                             f"<i>…но админов пуля не берёт.</i>")
+                             f"<i>…но админов пуля не берёт.</i>\n{reload_note}")
         return
     ok = await _punish(bot, message.chat.id, player.id, kind, minutes,
                        "проиграл в русскую рулетку")
     tail = (f"{prize_label(kind, minutes).capitalize()}." if ok
             else "…но пистолет заклинило: у бота нет прав.")
-    await sent.edit_text(f"🔫 {who}: {random.choice(_RUS_HIT)}\n{tail}")
+    await sent.edit_text(f"🔫 {who}: {random.choice(_RUS_HIT)}\n{tail}\n"
+                         f"{reload_note}")
 
 
 # ---------- дуэль ----------

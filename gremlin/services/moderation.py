@@ -441,8 +441,14 @@ async def lift_punishment(bot: Bot, pid: int,
     await db.deactivate_punishment(pid)
     # не состоял в чате (комментатор под постом канала) — возвращать некуда
     was_member = bool(p["was_member"]) if "was_member" in p.keys() else True
-    link = (await invite_back(bot, chat_id, uid)
-            if (kind == "ban" and invite and was_member) else None)
+    # В обсуждение с «вступить, чтобы писать» участником делает сам комментарий
+    # под постом. Такой «участник» в чат не заходил, ссылка ему ни к чему:
+    # после разбана он вернётся тем же путём, через комментарии
+    link = None
+    if kind == "ban" and invite and was_member:
+        from . import adm_cache
+        if not await adm_cache.joins_by_comment(bot, chat_id):
+            link = await invite_back(bot, chat_id, uid)
     return True, "Снято.", link
 
 

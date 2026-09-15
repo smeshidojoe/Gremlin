@@ -59,7 +59,6 @@ def _caches() -> str:
         ("сообщения", len(moderation._seen_msgs)),
         ("флуд", len(filters._flood)),
         ("реакции", len(events._reacted)),
-        ("рулетка", len(games._rus_fired)),
         ("заявки", len(subscribe._pending) + len(subscribe._tries)),
         ("кулдауны", len(group._cmd_fired) + len(group._guest_cmd_fired)),
         ("нейрофильтр", len(nn._profile) + len(nn._faces) + len(nn._clusters)),

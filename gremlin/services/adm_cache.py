@@ -37,6 +37,9 @@ _linked: dict[int, tuple[float, tuple]] = {}
 # что за чат: 'channel', 'supergroup', 'group'. Заполняется попутно, когда мы
 # и так ходим в getChat — отдельных запросов ради этого не делаем
 _kind: dict[int, str] = {}
+# обсуждение канала с «вступить, чтобы писать»: комментарий под постом
+# делает человека участником группы. Тоже попутно из того же getChat
+_comment_joins: dict[int, bool] = {}
 
 
 async def linked_chat(bot: Bot, chat_id: int) -> tuple[int | None, str | None, str | None]:
@@ -55,6 +58,8 @@ async def linked_chat(bot: Bot, chat_id: int) -> tuple[int | None, str | None, s
         if chat.type:
             _kind[chat_id] = chat.type
         linked_id = getattr(chat, "linked_chat_id", None)
+        _comment_joins[chat_id] = bool(
+            linked_id and getattr(chat, "join_to_send_messages", None))
         if linked_id:
             uname, title = None, None
             try:
@@ -69,6 +74,17 @@ async def linked_chat(bot: Bot, chat_id: int) -> tuple[int | None, str | None, s
         pass
     _linked[chat_id] = (now + config.ADMIN_CACHE_TTL, result)
     return result
+
+
+async def joins_by_comment(bot: Bot, chat_id: int) -> bool:
+    """В группу вступают комментарием под постом привязанного канала.
+
+    Так бывает у обсуждения с «вступить, чтобы писать»: Telegram молча делает
+    комментатора участником, без ссылки, заявки и служебного сообщения. Сам
+    человек при этом в чат не заходил и считает, что в нём не состоит.
+    """
+    await linked_chat(bot, chat_id)
+    return _comment_joins.get(chat_id, False)
 
 
 async def username_chat_type(bot: Bot, username: str) -> str | None:
@@ -164,6 +180,9 @@ async def reconcile_chats(bot) -> list[tuple[int, str]]:
 # (chat_id, user_id) -> (expires, состоит ли в чате)
 _members: dict[tuple[int, int], tuple[float, bool]] = {}
 MEMBER_TTL = 900
+# chat_id -> когда последний раз писали в лог о сбое getChatMember
+_member_fail_logged: dict[int, float] = {}
+MEMBER_FAIL_LOG_EVERY = 600
 
 
 def member_cached(chat_id: int, user_id: int) -> bool | None:
@@ -200,7 +219,16 @@ async def is_member(bot: Bot, chat_id: int, user_id: int) -> bool:
             member = bool(getattr(m, "is_member", True))
         else:
             member = True
-    except Exception:
+    except Exception as e:
+        # Молча считать участником нельзя: по этому ответу пишется was_member,
+        # выдаётся ссылка на возврат и уровень доверия, и потом не отличить
+        # настоящего участника от сбоя. В лог — не чаще раза на чат за 10 минут,
+        # иначе при лежащем API каждое сообщение даст строку
+        if now - _member_fail_logged.get(chat_id, -MEMBER_FAIL_LOG_EVERY) \
+                >= MEMBER_FAIL_LOG_EVERY:
+            _member_fail_logged[chat_id] = now
+            logger.warning("getChatMember упал в %s для %s, считаем участником: %s",
+                           chat_id, user_id, e)
         return True                     # не кэшируем — вдруг разовый сбой
     if len(_members) > 20000:
         _members.clear()

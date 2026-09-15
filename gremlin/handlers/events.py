@@ -191,7 +191,12 @@ async def reaction_put(update: MessageReactionUpdated, bot: Bot) -> None:
         return
     if user.id in config.ADMIN_IDS:
         return
-    if "all" in await db.free_scopes(update.chat.id, user.id, user.username):
+    # Реакция ведёт в наблюдение, поэтому и освобождение от наблюдения должно
+    # действовать здесь. Раньше проверялся только полный игнор: человека,
+    # прощённого кнопкой «больше не трогать: наблюдение», через 25 минут
+    # забанило за поставленную реакцию — тем же правилом, за которое простили.
+    # Сообщения и вход в чат этот уровень учитывали, реакции — нет.
+    if await db.free_scopes(update.chat.id, user.id, user.username) & {"all", "watch"}:
         return
 
     key = (update.chat.id, user.id)

@@ -8,12 +8,13 @@ import time
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .. import config, db, runtime, utils
 from ..services import (
-    adm_cache, filters, media, moderation, net, nn, resolve, triggers, trust, watch,
+    adm_cache, filters, media, moderation, net, nn, raid, resolve, triggers,
+    trust, watch,
 )
 
 logger = logging.getLogger("gremlin.group")
@@ -513,6 +514,146 @@ async def cmd_lift(message: Message, bot: Bot) -> None:
     )
 
 
+# Кто когда жаловался: (чат, жалобщик) -> когда. Пауза нужна против того, кто
+# решил завалить лог-чат жалобами на всех подряд.
+_report_fired: dict[tuple[int, int], float] = {}
+# На какие сообщения уже жаловались: (чат, сообщение) -> карточка и счётчик.
+# Вторая жалоба не плодит карточку, а увеличивает счётчик в первой.
+_reports: dict[tuple[int, int], dict] = {}
+
+
+def _forget_old_reports(now: float) -> None:
+    """Карточку старше суток Telegram править не даст — помнить её незачем."""
+    if len(_reports) <= 500:
+        return
+    for key, rec in list(_reports.items()):
+        if now - rec["at"] > config.REPORT_TTL:
+            del _reports[key]
+
+
+async def _say_and_forget(bot: Bot, message: Message, text: str) -> None:
+    """Ответить в чат и через минуту убрать и ответ, и саму команду: кто
+    пожаловался, в чате видеть незачем."""
+    try:
+        sent = await message.reply(text)
+    except Exception:
+        return
+
+    async def clean() -> None:
+        await asyncio.sleep(60)
+        for mid in (sent.message_id, message.message_id):
+            try:
+                await bot.delete_message(message.chat.id, mid)
+            except Exception:
+                pass
+
+    runtime.spawn(clean())
+
+
+def _report_btn(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+def _report_card(chat, who, target, reason: str, reply, count: int) -> str:
+    """Карточка жалобы: кто, на кого, за что и само сообщение."""
+    lines = [
+        f"🚨 <b>Жалоба</b> · {utils.esc(chat.title)}",
+        f"👤 На кого: {utils.mention(target.id, target.full_name, target.username)} "
+        f"(<code>{target.id}</code>)",
+        f"🙋 Пожаловался: {utils.mention(who.id, who.full_name, who.username)}",
+    ]
+    if reason:
+        lines.append(f"📎 Причина: {utils.esc(utils.chunk(reason, 200))}")
+    if count > 1:
+        lines.append(f"🔁 Пожаловались: <b>{count}</b>")
+    return "\n".join(lines) + moderation.message_body(reply, with_link=True)
+
+
+async def _bump_report(bot: Bot, rec: dict) -> None:
+    """Дописать в карточку, что пожаловался ещё кто-то."""
+    head, _, tail = rec["text"].partition("\n\n")
+    if "🔁 Пожаловались:" in head:
+        head = re.sub(r"🔁 Пожаловались: <b>\d+</b>",
+                      f"🔁 Пожаловались: <b>{rec['count']}</b>", head)
+    else:
+        head += f"\n🔁 Пожаловались: <b>{rec['count']}</b>"
+    rec["text"] = head + (f"\n\n{tail}" if tail else "")
+    for chat_id, msg_id in rec["cards"]:
+        try:
+            await bot.edit_message_text(rec["text"], chat_id=chat_id,
+                                        message_id=msg_id,
+                                        reply_markup=rec["markup"])
+        except Exception:
+            pass          # карточку уже разобрали или она старше 48 часов
+
+
+@router.message(F.text.regexp(r"(?i)^(!report|!репорт|!жалоба|@admin)(\s|$)"))
+async def cmd_report(message: Message, bot: Bot) -> None:
+    """Жалоба участника: ответ на чужое сообщение уходит карточкой в лог-чат."""
+    if stale(message):
+        return
+    chat, who = message.chat, message.from_user
+    s = await db.get_settings(chat.id)
+    if not s.report_on or who is None:
+        return
+    reply = message.reply_to_message
+    if reply is None or reply.from_user is None or reply.from_user.is_bot:
+        await _say_and_forget(bot, message,
+                              "🚨 Жалобу шлют ответом на сообщение человека.")
+        return
+    target = reply.from_user
+    if target.id == who.id:
+        await _say_and_forget(bot, message, "🚨 На себя жаловаться не надо.")
+        return
+    if s.report_who == "members" and not await adm_cache.is_member(bot, chat.id, who.id):
+        await _say_and_forget(bot, message,
+                              "🚨 Жаловаться могут только участники чата.")
+        return
+    admins = await adm_cache.chat_admin_ids(bot, chat.id)
+    # Ответ тот же, что и при принятой жалобе: иначе бот сам подсказывал бы,
+    # на кого жаловаться бесполезно.
+    if not s.report_admins and (target.id in admins or target.id in config.ADMIN_IDS):
+        await _say_and_forget(bot, message, "🚨 Жалоба отправлена админам.")
+        return
+
+    now = time.monotonic()
+    left = s.report_cd - (now - _report_fired.get((chat.id, who.id), -s.report_cd))
+    if left > 0 and who.id not in admins:
+        await _say_and_forget(
+            bot, message,
+            f"🚨 Слишком часто. Следующая жалоба через {int(left) // 60 + 1} мин.")
+        return
+    _report_fired[(chat.id, who.id)] = now
+
+    key = (chat.id, reply.message_id)
+    rec = _reports.get(key)
+    if rec is not None:
+        rec["count"] += 1
+        await _bump_report(bot, rec)
+        await _say_and_forget(bot, message, "🚨 Жалоба отправлена админам.")
+        return
+
+    reason = " ".join((message.text or "").split()[1:])
+    card = _report_card(chat, who, target, reason, reply, 1)
+    b = InlineKeyboardBuilder()
+    b.row(_report_btn("🗑 Удалить", f"k:rdel:{chat.id}:{reply.message_id}"),
+          _report_btn("🔇 Мут", f"k:rmute:{chat.id}:{target.id}:{reply.message_id}"))
+    b.row(_report_btn("⛔ Бан", f"k:rban:{chat.id}:{target.id}:{reply.message_id}"),
+          _report_btn(moderation.SPAM_PROFILE_BUTTON, f"k:sp:{chat.id}:{target.id}"))
+    b.row(_report_btn("✅ Отклонить", f"k:rno:{chat.id}"))
+    markup = b.as_markup()
+    sent = await moderation.send_card(bot, chat.id, config.BIT_REPORT, card,
+                                      markup=markup)
+    _forget_old_reports(time.time())
+    # текст сообщения храним сразу: кнопка «Бан» положит его в копилку уликой,
+    # а к тому времени само сообщение уже будет удалено
+    _reports[key] = {"count": 1, "cards": sent, "text": card, "markup": markup,
+                     "at": time.time(), "body": reply.text or reply.caption or ""}
+    await db.add_event(chat.id, "report",
+                       f"жалоба на {target.full_name} ({target.id}) | by {who.id}")
+    await _say_and_forget(bot, message, "🚨 Жалоба отправлена админам.")
+
+
 @router.message(F.text.regexp(r"^!(dm|дм)(\s|$)"))
 async def cmd_delete(message: Message, bot: Bot) -> None:
     """!dm ответом на сообщение — удалить его вместе с самой командой."""
@@ -597,7 +738,7 @@ async def fire_counter(bot: Bot, message: Message, s) -> None:
         key, wait = (row["id"], user.id), row["cooldown"]
         store = _cmd_fired
 
-    if wait and now - store.get(key, 0) < wait:
+    if wait and now - store.get(key, utils.NEVER) < wait:
         # Сообщение убираем: иначе в чате копятся вызовы, на которые бот молчит.
         try:
             await message.delete()
@@ -693,7 +834,7 @@ async def fire_rates(bot: Bot, message: Message, s) -> bool:
         return True          # правку не пересчитываем, но и дальше не пускаем
 
     now = time.monotonic()
-    if s.rates_cd and now - _rates_fired.get(message.chat.id, 0) < s.rates_cd:
+    if s.rates_cd and now - _rates_fired.get(message.chat.id, utils.NEVER) < s.rates_cd:
         # Просто молчим. Удалять сообщение человека из-за того, что тикает
         # пауза, нельзя: со стороны это выглядит так, будто бот стёр вопрос
         # про курс без всякой причины.
@@ -733,7 +874,8 @@ async def fire_paste(bot: Bot, message: Message, s) -> None:
     if len(body) < s.paste_min:
         return
     now = time.monotonic()
-    if s.paste_cd and now - _paste_fired.get(message.chat.id, 0) < s.paste_cd * 60:
+    if s.paste_cd and now - _paste_fired.get(message.chat.id,
+                                             utils.NEVER) < s.paste_cd * 60:
         return
     ans = await db.ans_pick("paste", message.chat.id)
     if ans is None:
@@ -760,7 +902,7 @@ async def fire_trigger(bot: Bot, message: Message, s) -> None:
         if not triggers.phrase_matches(t["phrase"], low):
             continue
         key = (message.chat.id, t["id"])
-        if t["cooldown"] and now - _trig_fired.get(key, 0) < t["cooldown"]:
+        if t["cooldown"] and now - _trig_fired.get(key, utils.NEVER) < t["cooldown"]:
             continue  # этот на кулдауне — пробуем следующий совпавший
         _trig_fired[key] = now
         try:
@@ -848,6 +990,43 @@ async def resume_captcha(bot: Bot) -> int:
     return count
 
 
+async def ask_captcha(bot: Bot, chat, user, s) -> bool:
+    """Мут новичку и кнопка «Я не бот». True — капча выставлена.
+
+    Зовут её и обычный вход, и защита от набегов, поэтому сообщение уходит
+    через bot, а не ответом на служебное: при набеге служебного может не быть.
+    """
+    try:
+        # Мут со сроком: снятие висит на задаче в памяти, и перезапуск бота
+        # во время капчи оставлял человека немым навсегда. Срок ставим с
+        # запасом — обычно мут снимает кнопка или кик по таймауту.
+        await bot.restrict_chat_member(
+            chat.id, user.id,
+            permissions=await moderation.mute_perms(bot, chat.id, s.mute_reactions),
+            until_date=int(time.time()) + s.captcha_timeout + 60,
+        )
+    except Exception:
+        logger.warning("captcha restrict failed in %s", chat.id, exc_info=True)
+        return False
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Я не бот", callback_data=f"capt:{chat.id}:{user.id}")
+    # время в минутах: пресеты теперь до часа, «3600 сек» никто не считает
+    minutes = max(1, s.captcha_timeout // 60)
+    sent = await bot.send_message(
+        chat.id,
+        f"👋 {utils.mention(user.id, user.full_name, user.username)}, подтверди, "
+        f"что ты человек — нажми кнопку за {minutes} "
+        f"{utils.plural(minutes, 'минуту', 'минуты', 'минут')}, иначе кик.",
+        reply_markup=b.as_markup(),
+    )
+    _captcha_pending[(chat.id, user.id)] = sent.message_id
+    await db.kv_set(_CAPTCHA_KEY.format(chat.id, user.id), json.dumps(
+        {"msg": sent.message_id, "until": int(time.time()) + s.captcha_timeout}))
+    runtime.spawn(_captcha_timeout(bot, chat.id, user.id, s.captcha_timeout,
+                                   sent.message_id))
+    return True
+
+
 @router.callback_query(F.data.startswith("capt:"))
 async def captcha_pass(cb: CallbackQuery, bot: Bot) -> None:
     _, chat_id, user_id = cb.data.split(":")
@@ -881,8 +1060,16 @@ async def on_join(message: Message, bot: Bot) -> None:
         adm_cache.invalidate_member(message.chat.id, user.id)
         if not user.is_bot:
             await db.add_event(message.chat.id, "join", f"{user.full_name} ({user.id})")
+    # Набег смотрит не на человека, а на скорость входов. С тем, кого режим
+    # уже обработал, дальше не здороваемся и капчей не мучаем: с ним решено
+    raided = set()
+    for user in message.new_chat_members or []:
+        action = await raid.note_join(bot, message.chat, user, s)
+        if action and await raid.apply(bot, message.chat, user, s, action):
+            raided.add(user.id)
     if s.welcome_on:
-        humans = [u for u in message.new_chat_members or [] if not u.is_bot]
+        humans = [u for u in message.new_chat_members or []
+                  if not u.is_bot and u.id not in raided]
         if humans:
             names = ", ".join(
                 utils.mention(u.id, u.first_name, u.username) for u in humans
@@ -903,6 +1090,8 @@ async def on_join(message: Message, bot: Bot) -> None:
             adder.id in admins or adder.id in config.ADMIN_IDS
         )
         for user in message.new_chat_members or []:
+            if user.id in raided:
+                continue
             # чужие боты: банить, если добавил не-админ
             if user.is_bot and user.id != bot.id:
                 if s.watch_bots and not adder_is_admin:
@@ -937,40 +1126,13 @@ async def on_join(message: Message, bot: Bot) -> None:
     if s.captcha_on:
         admins = await adm_cache.chat_admin_ids(bot, message.chat.id)
         for user in message.new_chat_members or []:
-            if user.is_bot or user.id in admins or user.id in config.ADMIN_IDS:
+            if (user.is_bot or user.id in admins or user.id in config.ADMIN_IDS
+                    or user.id in raided):
                 continue
             scopes = await db.free_scopes(message.chat.id, user.id, user.username)
             if "all" in scopes:
                 continue
-            try:
-                # Мут со сроком: снятие висит на задаче в памяти, и перезапуск бота
-                # во время капчи оставлял человека немым навсегда. Срок ставим с
-                # запасом — обычно мут снимает кнопка или кик по таймауту.
-                await bot.restrict_chat_member(
-                    message.chat.id, user.id,
-                    permissions=await moderation.mute_perms(
-                        bot, message.chat.id, s.mute_reactions),
-                    until_date=int(time.time()) + s.captcha_timeout + 60,
-                )
-            except Exception:
-                logger.warning("captcha restrict failed in %s", message.chat.id, exc_info=True)
-                continue
-            b = InlineKeyboardBuilder()
-            b.button(text="✅ Я не бот", callback_data=f"capt:{message.chat.id}:{user.id}")
-            # время в минутах: пресеты теперь до часа, «3600 сек» никто не считает
-            minutes = max(1, s.captcha_timeout // 60)
-            sent = await message.answer(
-                f"👋 {utils.mention(user.id, user.full_name, user.username)}, подтверди, "
-                f"что ты человек — нажми кнопку за {minutes} "
-                f"{utils.plural(minutes, 'минуту', 'минуты', 'минут')}, иначе кик.",
-                reply_markup=b.as_markup(),
-            )
-            _captcha_pending[(message.chat.id, user.id)] = sent.message_id
-            await db.kv_set(_CAPTCHA_KEY.format(message.chat.id, user.id), json.dumps(
-                {"msg": sent.message_id, "until": int(time.time()) + s.captcha_timeout}))
-            runtime.spawn(
-                _captcha_timeout(bot, message.chat.id, user.id, s.captcha_timeout, sent.message_id)
-            )
+            await ask_captcha(bot, message.chat, user, s)
     if s.service_join:
         try:
             await message.delete()

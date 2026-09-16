@@ -14,7 +14,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .. import config, db, runtime, utils
-from ..services import adm_cache, moderation
+from ..services import adm_cache, moderation, raid
 from . import group
 
 logger = logging.getLogger("gremlin.events")
@@ -214,7 +214,7 @@ async def reaction_put(update: MessageReactionUpdated, bot: Bot) -> None:
 
     key = (update.chat.id, user.id)
     now = time.monotonic()
-    if now - _reacted.get(key, 0) < config.REACTION_TTL:
+    if now - _reacted.get(key, utils.NEVER) < config.REACTION_TTL:
         return
     if len(_reacted) > config.REACTION_KEEP:
         _reacted.clear()
@@ -284,6 +284,15 @@ async def member_updated(update: ChatMemberUpdated, bot: Bot) -> None:
         await moderation.revoke_unban_link(bot, chat.id, target.id)
     if target.is_bot:
         return
+
+    # Вход без служебного сообщения виден только здесь: в больших чатах
+    # Telegram их прячет. Набег считаем по обоим путям, иначе половина
+    # входов прошла бы мимо счёта
+    if new.status == "member" and old.status in ("left", "kicked"):
+        s = await db.get_settings(chat.id)
+        action = await raid.note_join(bot, chat, target, s)
+        if action:
+            await raid.apply(bot, chat, target, s, action)
 
     def _muted(m) -> bool:
         return m.status == "restricted" and getattr(m, "can_send_messages", True) is False
@@ -787,12 +796,23 @@ async def _user_stub(uid: int):
 
 
 async def _sub_done(cb: CallbackQuery, note: str) -> None:
-    """Дописать итог в карточку и убрать кнопки."""
+    """Дописать итог в карточку и убрать кнопки — во всех её копиях.
+
+    Карточка уходит и в лог чата, и в глобальный лог. Правилась только та,
+    где нажали: в другом логе кнопки оставались живыми, и заявку можно было
+    «решить» второй раз. Карточки наказаний так умеют давно — теперь и эта.
+    """
+    from ..services import moderation
+    text = cb.message.html_text + "\n\n" + note
     try:
-        await cb.message.edit_text(cb.message.html_text + "\n\n" + note,
-                                   reply_markup=None)
+        await cb.message.edit_text(text, reply_markup=None)
     except Exception:
         logger.debug("карточку заявки не поправить", exc_info=True)
+    else:
+        moderation.remember_card(cb.message.chat.id, cb.message.message_id,
+                                 text, None)
+    await moderation.update_twins(cb.bot, cb.message.chat.id,
+                                  cb.message.message_id, text)
     await cb.answer()
 
 

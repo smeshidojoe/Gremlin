@@ -149,6 +149,16 @@ CREATE TABLE IF NOT EXISTS settings(
     warns_limit     INTEGER NOT NULL DEFAULT 3,
     warns_punish    TEXT    NOT NULL DEFAULT 'mute',
     warns_mute_min  INTEGER NOT NULL DEFAULT 1440,
+    report_on       INTEGER NOT NULL DEFAULT 0,
+    report_who      TEXT    NOT NULL DEFAULT 'all',
+    report_cd       INTEGER NOT NULL DEFAULT 300,
+    report_mute_min INTEGER NOT NULL DEFAULT 60,
+    report_admins   INTEGER NOT NULL DEFAULT 0,
+    raid_on         INTEGER NOT NULL DEFAULT 0,
+    raid_joins      INTEGER NOT NULL DEFAULT 5,
+    raid_window     INTEGER NOT NULL DEFAULT 60,
+    raid_action     TEXT    NOT NULL DEFAULT 'mute',
+    raid_hold       INTEGER NOT NULL DEFAULT 15,
     rules_on        INTEGER NOT NULL DEFAULT 0,
     trust_on        INTEGER NOT NULL DEFAULT 0,
     trust_soften    INTEGER NOT NULL DEFAULT 1,
@@ -210,7 +220,7 @@ CREATE TABLE IF NOT EXISTS settings(
     asr_on          INTEGER NOT NULL DEFAULT 0,
     asr_max_sec     INTEGER NOT NULL DEFAULT 120,
     cards_on        INTEGER NOT NULL DEFAULT 1,
-    card_mask       INTEGER NOT NULL DEFAULT 8191,
+    card_mask       INTEGER NOT NULL DEFAULT 32767,
     log_chat_id     INTEGER
 );
 CREATE TABLE IF NOT EXISTS triggers(
@@ -450,6 +460,16 @@ class Settings:
     warns_limit: int = 3
     warns_punish: str = "mute"
     warns_mute_min: int = 1440
+    report_on: int = 0
+    report_who: str = "all"
+    report_cd: int = 300
+    report_mute_min: int = 60
+    report_admins: int = 0
+    raid_on: int = 0
+    raid_joins: int = 5
+    raid_window: int = 60
+    raid_action: str = "mute"
+    raid_hold: int = 15
     rules_on: int = 0
     trust_on: int = 0
     trust_soften: int = 1
@@ -511,7 +531,7 @@ class Settings:
     asr_on: int = 0
     asr_max_sec: int = 120
     cards_on: int = 1
-    card_mask: int = 8191
+    card_mask: int = 32767
     log_chat_id: int | None = None
 
 
@@ -550,6 +570,16 @@ _SETTINGS_MIGRATIONS = {
     "warns_limit": "INTEGER NOT NULL DEFAULT 3",
     "warns_punish": "TEXT NOT NULL DEFAULT 'mute'",
     "warns_mute_min": "INTEGER NOT NULL DEFAULT 1440",
+    "report_on": "INTEGER NOT NULL DEFAULT 0",
+    "report_who": "TEXT NOT NULL DEFAULT 'all'",
+    "report_cd": "INTEGER NOT NULL DEFAULT 300",
+    "report_mute_min": "INTEGER NOT NULL DEFAULT 60",
+    "report_admins": "INTEGER NOT NULL DEFAULT 0",
+    "raid_on": "INTEGER NOT NULL DEFAULT 0",
+    "raid_joins": "INTEGER NOT NULL DEFAULT 5",
+    "raid_window": "INTEGER NOT NULL DEFAULT 60",
+    "raid_action": "TEXT NOT NULL DEFAULT 'mute'",
+    "raid_hold": "INTEGER NOT NULL DEFAULT 15",
     "rules_on": "INTEGER NOT NULL DEFAULT 0",
     "trust_on": "INTEGER NOT NULL DEFAULT 0",
     "trust_soften": "INTEGER NOT NULL DEFAULT 1",
@@ -640,7 +670,8 @@ _SETTINGS_MIGRATIONS = {
 
 # разовые включения новых card-битов в существующих card_mask: kv-флаг -> бит
 _MASK_MIGRATIONS = {"mig_watch_bit": 1024, "mig_report_bit": 2048,
-                    "mig_sub_bit": 4096}
+                    "mig_sub_bit": 4096, "mig_complaint_bit": 8192,
+                    "mig_raid_bit": 16384}
 
 
 # колонки других таблиц, появившиеся позже: таблица -> {колонка: DDL}

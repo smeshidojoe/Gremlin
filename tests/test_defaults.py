@@ -67,7 +67,7 @@ async def test_without_own_log_global_still_gets_it(logs):
 async def test_new_chat_gets_code_defaults(database):
     await db.get_settings(FRESH)
     s = await db.get_settings(FRESH)
-    assert s.card_mask == 8191 and s.prof_photo_min == 97
+    assert s.card_mask == db.Settings.card_mask and s.prof_photo_min == 97
     assert s.warns_punish == "mute"
 
 
@@ -77,7 +77,7 @@ def _old_settings_table() -> str:
     миграции не добавляют, и запросы при старте на куцей таблице падают."""
     sql = db._SCHEMA[db._SCHEMA.index("CREATE TABLE IF NOT EXISTS settings("):]
     sql = sql[:sql.index(");") + 2]
-    for now, before in (("card_mask       INTEGER NOT NULL DEFAULT 8191",
+    for now, before in ((f"card_mask       INTEGER NOT NULL DEFAULT {db.Settings.card_mask}",
                          "card_mask       INTEGER NOT NULL DEFAULT 255"),
                         ("prof_photo_min  INTEGER NOT NULL DEFAULT 97",
                          "prof_photo_min  INTEGER NOT NULL DEFAULT 85"),
@@ -105,7 +105,7 @@ async def test_defaults_written_explicitly_over_old_schema(tmp_path, monkeypatch
         cur = await db._db.execute(
             "SELECT card_mask, prof_photo_min, warns_punish FROM settings "
             "WHERE chat_id = ?", (FRESH,))
-        assert tuple(await cur.fetchone()) == (8191, 97, "mute")
+        assert tuple(await cur.fetchone()) == (db.Settings.card_mask, 97, "mute")
     finally:
         await db.close()
 

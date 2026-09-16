@@ -1,5 +1,6 @@
 """Кнопки на карточках в лог-чате: снять наказание / подтвердить."""
 import logging
+import types
 
 from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
@@ -177,6 +178,109 @@ async def card_spam_profile(cb: CallbackQuery, bot: Bot) -> None:
     await _mark(cb, "\n🧪 <b>Профиль записан в базу спама</b>",
                 _without_spam(cb.message.reply_markup))
     await cb.answer("Записан")
+
+
+async def _report_punish(cb: CallbackQuery, bot: Bot, kind: str) -> None:
+    """Мут или бан по жалобе.
+
+    Сообщение, на которое жаловались, удаляем и кладём в копилку уликой: за
+    такое наказали — пусть фильтр учится. Текст берём из записи о жалобе,
+    потому что самого сообщения к этому моменту уже нет.
+    """
+    from ..services import moderation, nn
+    from .group import _reports
+    _, _, chat_id, user_id, msg_id = cb.data.split(":")
+    chat_id, user_id, msg_id = int(chat_id), int(user_id), int(msg_id)
+    if not await may_act(cb, chat_id):
+        return
+    s = await db.get_settings(chat_id)
+    rec = _reports.get((chat_id, msg_id))
+    try:
+        await bot.delete_message(chat_id, msg_id)
+    except Exception:
+        pass          # сообщение уже удалили руками
+    user = types.SimpleNamespace(id=user_id, username=None,
+                                 full_name=await db.user_handle(user_id))
+    pid = await moderation.apply_punishment(
+        bot, chat_id, user, kind, s.report_mute_min if kind == "mute" else 0,
+        "по жалобе участников", cb.from_user.id)
+    if pid is None:
+        await cb.answer("Не вышло: у бота нет прав.", show_alert=True)
+        return
+    if rec and rec.get("body"):
+        await db.sample_add(chat_id, user_id, "card", "spam", rec["body"],
+                            feature="жалоба", pid=pid)
+        nn.invalidate(chat_id)
+    await db.add_event(chat_id, "report",
+                       f"{kind} по жалобе: {user_id} by {cb.from_user.id}")
+    word = "Мут выдан" if kind == "mute" else "Забанен"
+    await _mark(cb, f"\n\n✅ <b>{word} по жалобе</b>")
+    await cb.answer(word)
+
+
+@router.callback_query(F.data.startswith("k:raidoff:"))
+async def card_raid_off(cb: CallbackQuery) -> None:
+    """«Снять режим»: набег кончился раньше срока."""
+    from ..services import raid
+    chat_id = int(cb.data.split(":")[2])
+    if not await may_act(cb, chat_id):
+        return
+    came = raid.stop(chat_id)
+    await db.add_event(chat_id, "raid", f"режим снят вручную by {cb.from_user.id}")
+    await _mark(cb, f"\n\n🔓 <b>Режим снят</b> · вошло за набег: {came}")
+    await cb.answer("Снято")
+
+
+@router.callback_query(F.data.startswith("k:raidban:"))
+async def card_raid_ban(cb: CallbackQuery, bot: Bot) -> None:
+    """«Забанить всех»: по списку вошедших за набег."""
+    from ..services import raid
+    chat_id = int(cb.data.split(":")[2])
+    if not await may_act(cb, chat_id):
+        return
+    await cb.answer("Баню, это займёт время…")
+    done = await raid.ban_all(bot, chat_id, cb.from_user.id)
+    await db.add_event(chat_id, "raid",
+                       f"бан всех по набегу: {done} by {cb.from_user.id}")
+    await _mark(cb, f"\n\n⛔ <b>Забанено: {done}</b>")
+
+
+@router.callback_query(F.data.startswith("k:rmute:"))
+async def card_report_mute(cb: CallbackQuery, bot: Bot) -> None:
+    await _report_punish(cb, bot, "mute")
+
+
+@router.callback_query(F.data.startswith("k:rban:"))
+async def card_report_ban(cb: CallbackQuery, bot: Bot) -> None:
+    await _report_punish(cb, bot, "ban")
+
+
+@router.callback_query(F.data.startswith("k:rdel:"))
+async def card_report_delete(cb: CallbackQuery, bot: Bot) -> None:
+    """Удалить сообщение, на которое пожаловались, никого не наказывая."""
+    _, _, chat_id, msg_id = cb.data.split(":")
+    chat_id, msg_id = int(chat_id), int(msg_id)
+    if not await may_act(cb, chat_id):
+        return
+    try:
+        await bot.delete_message(chat_id, msg_id)
+    except Exception:
+        await cb.answer("Не вышло: сообщение старое или нет прав.", show_alert=True)
+        return
+    await db.add_event(chat_id, "report",
+                       f"сообщение удалено по жалобе by {cb.from_user.id}")
+    await _mark(cb, "\n\n🗑 <b>Сообщение удалено</b>")
+    await cb.answer("Удалено")
+
+
+@router.callback_query(F.data.startswith("k:rno:"))
+async def card_report_drop(cb: CallbackQuery) -> None:
+    """Жалоба не по делу: карточку закрываем, никого не трогаем."""
+    chat_id = int(cb.data.split(":")[2])
+    if not await may_act(cb, chat_id):
+        return
+    await _mark(cb, "\n\n✅ <b>Жалоба отклонена</b>")
+    await cb.answer("Отклонена")
 
 
 @router.callback_query(F.data.startswith("k:ban:"))

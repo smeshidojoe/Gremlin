@@ -7,7 +7,12 @@
 'use strict';
 
 const tg = window.Telegram && window.Telegram.WebApp;
-if (tg) { tg.ready(); tg.expand(); }
+if (tg) {
+  tg.ready();
+  tg.expand();
+  // свайп вниз закрывал панель прямо посреди прокрутки длинного списка
+  try { tg.disableVerticalSwipes(); } catch (e) { /* старые клиенты не умеют */ }
+}
 
 const $app = document.getElementById('app');
 const $title = document.getElementById('title');
@@ -38,6 +43,38 @@ function spin(on) {
   $spin.hidden = busy <= 0;
 }
 
+/* Ответы на чтение держим в памяти: вернулся на страницу — она появляется
+   сразу, а свежие данные подтягиваются в фоне. Любое изменение чистит кэш
+   целиком: это дешевле, чем гадать, какие страницы задел ответ сервера. */
+const GET_CACHE = new Map();
+const FRESH_MS = 3000;     // моложе — за свежим в фон не ходим
+
+async function fetchJson(path, init) {
+  const r = await fetch('/api' + path, init);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || ('Ошибка ' + r.status));
+  return data;
+}
+
+/* Фоновое обновление: без индикатора и без ошибок наружу — на экране уже
+   есть прошлый ответ. Пришло другое и страница та же — перерисовываем. */
+async function refresh(path, headers) {
+  if (refresh.busy.has(path)) return;
+  refresh.busy.add(path);
+  const was = here();
+  try {
+    const data = await fetchJson(path, { method: 'GET', headers });
+    const old = GET_CACHE.get(path);
+    GET_CACHE.set(path, { data, at: Date.now() });
+    if (here() === was && JSON.stringify(old && old.data) !== JSON.stringify(data)) render();
+  } catch (e) {
+    /* молчим: страница уже показана */
+  } finally {
+    refresh.busy.delete(path);
+  }
+}
+refresh.busy = new Set();
+
 async function api(path, opts = {}) {
   const headers = { 'X-Init-Data': (tg && tg.initData) || '' };
   let body;
@@ -47,11 +84,18 @@ async function api(path, opts = {}) {
     headers['Content-Type'] = 'application/json';
     body = JSON.stringify(opts.json);
   }
+  const method = opts.method || (body ? 'POST' : 'GET');
+  if (method !== 'GET') GET_CACHE.clear();
+  const hit = method === 'GET' ? GET_CACHE.get(path) : null;
+  if (hit) {
+    if (Date.now() - hit.at > FRESH_MS) refresh(path, headers);
+    return hit.data;
+  }
   spin(true);
   try {
-    const r = await fetch('/api' + path, { method: opts.method || (body ? 'POST' : 'GET'), headers, body });
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(data.error || ('Ошибка ' + r.status));
+    const data = await fetchJson(path, { method, headers, body });
+    if (method === 'GET') GET_CACHE.set(path, { data, at: Date.now() });
+    else hapticDone(true);       // система ответила на действие
     return data;
   } finally {
     spin(false);
@@ -62,12 +106,28 @@ function toast(text) {
   const el = document.getElementById('toast');
   el.textContent = text;
   el.hidden = false;
+  // класс вешаем следующим кадром: иначе браузеру нечего анимировать —
+  // элемент и появился, и оказался на месте в одном кадре
+  requestAnimationFrame(() => el.classList.add('show'));
   clearTimeout(toast._t);
-  toast._t = setTimeout(() => { el.hidden = true; }, 2600);
+  toast._t = setTimeout(() => {
+    el.classList.remove('show');
+    setTimeout(() => { if (!el.classList.contains('show')) el.hidden = true; }, 200);
+  }, 2600);
 }
 
 function haptic(kind) {
   try { tg.HapticFeedback.impactOccurred(kind || 'light'); } catch (e) { /* не всякий клиент умеет */ }
+}
+
+/* Переключили значение — щелчок выбора, а не удар. */
+function hapticPick() {
+  try { tg.HapticFeedback.selectionChanged(); } catch (e) { /* не всякий клиент умеет */ }
+}
+
+/* Действие закончилось: успех или ошибка. */
+function hapticDone(ok) {
+  try { tg.HapticFeedback.notificationOccurred(ok ? 'success' : 'error'); } catch (e) { /* … */ }
 }
 
 function confirmAsk(text) {
@@ -75,6 +135,51 @@ function confirmAsk(text) {
     if (tg && tg.showConfirm) tg.showConfirm(text, resolve);
     else resolve(window.confirm(text));
   });
+}
+
+/* Нижняя шторка: выезжает снизу, уходит тем же путём и закрывается свайпом
+   вниз — как ведут себя шторки в самом Telegram. Возвращает функцию
+   закрытия: ею же пользуются кнопки внутри. */
+function sheetOpen(box, resolve) {
+  box.hidden = false;
+  requestAnimationFrame(() => box.classList.add('open'));
+  const sheet = box.querySelector('.sheet');
+  const close = (val) => {
+    box.classList.remove('open');
+    setTimeout(() => { box.hidden = true; box.innerHTML = ''; }, 220);
+    resolve(val);
+  };
+  dragToClose(sheet, () => close(null));
+  return close;
+}
+
+function dragToClose(sheet, close) {
+  let from = null, moved = 0, started = 0;
+  sheet.addEventListener('pointerdown', (e) => {
+    // за поле ввода и кнопки не тянем: там свои жесты
+    if (e.target.closest('input, textarea, select, button')) return;
+    from = e.clientY;
+    started = Date.now();
+    moved = 0;
+    sheet.setPointerCapture(e.pointerId);
+    sheet.style.transition = 'none';
+  });
+  sheet.addEventListener('pointermove', (e) => {
+    if (from === null) return;
+    moved = Math.max(0, e.clientY - from);      // вверх шторка не едет
+    sheet.style.transform = `translateY(${moved}px)`;
+  });
+  const release = () => {
+    if (from === null) return;
+    from = null;
+    sheet.style.transition = '';
+    // быстрый смах закрывает, даже если утянули недалеко
+    const speed = moved / Math.max(1, Date.now() - started);
+    if (moved > sheet.offsetHeight * 0.3 || speed > 0.11) close();
+    else sheet.style.transform = '';
+  };
+  sheet.addEventListener('pointerup', release);
+  sheet.addEventListener('pointercancel', release);
 }
 
 /* Модалка ввода: одно поле, кнопки «Сохранить» и «Отмена». */
@@ -93,10 +198,9 @@ function ask({ title, hint, value = '', multiline = false, placeholder = '', ok 
           <button class="btn" data-modal="ok">${esc(ok)}</button>
         </div>
       </div>`;
-    box.hidden = false;
+    const close = sheetOpen(box, resolve);
     const input = document.getElementById('ask-input');
     input.focus();
-    const close = (val) => { box.hidden = true; box.innerHTML = ''; resolve(val); };
     box.onclick = (e) => {
       if (e.target === box) return close(null);
       const act = e.target.dataset.modal;
@@ -120,8 +224,7 @@ function pick({ title, options, value }) {
         </div>
         <div class="btns"><button class="btn ghost" data-pick-cancel>Отмена</button></div>
       </div>`;
-    box.hidden = false;
-    const close = (val) => { box.hidden = true; box.innerHTML = ''; resolve(val); };
+    const close = sheetOpen(box, resolve);
     box.onclick = (e) => {
       if (e.target === box || e.target.hasAttribute('data-pick-cancel')) return close(null);
       const b = e.target.closest('[data-pick]');
@@ -898,8 +1001,9 @@ async function statusView(cid) {
 }
 
 async function activeView(cid) {
-  const d = await api(`/chat/${cid}/active`);
-  const f = await api(`/chat/${cid}/forgiven`);
+  // оба списка нужны сразу — ждём их вместе, а не по очереди
+  const [d, f] = await Promise.all([api(`/chat/${cid}/active`),
+                                    api(`/chat/${cid}/forgiven`)]);
   const forgiven = !f.items.length ? '' : `<div class="card">
       <h2>🕊 Прощённые (${f.items.length})</h2>
       <div class="intro">Этих людей правило наказало зря — вы сняли наказание и выключили
@@ -1305,6 +1409,59 @@ function curChat() {
 }
 
 let lastPath = null;   // что рисовали прошлый раз — чтобы не терять место на странице
+const SEEN = new Set();   // какие страницы уже открывали в этот заход
+
+/* Заготовки на время загрузки.
+ *
+ * Угадывать их размер бессмысленно: у каждой страницы своё число строк и
+ * плиток, и оно меняется. Поэтому после отрисовки меряем настоящие карточки и
+ * запоминаем их высоты — в следующий раз заготовка повторит страницу один в
+ * один, вместе с отступами между карточками.
+ *
+ * Ключ помнит ширину окна: на узком экране плитки встают в один столбец, и
+ * высоты другие. Храним в сессии браузера, чтобы пережить перезагрузку. */
+const SHAPES = {};
+
+const shapeKey = (path) => `gremlin:shape:${Math.round(window.innerWidth / 40)}:${path}`;
+
+function rememberShape(path) {
+  const cards = [...$app.children].map((el) => Math.round(el.getBoundingClientRect().height));
+  if (!cards.length || cards.some((h) => !h)) return;
+  SHAPES[path] = cards;
+  try { sessionStorage.setItem(shapeKey(path), JSON.stringify(cards)); } catch (e) { /* приватный режим */ }
+}
+
+function knownShape(path) {
+  if (SHAPES[path]) return SHAPES[path];
+  try {
+    const raw = sessionStorage.getItem(shapeKey(path));
+    if (raw) { SHAPES[path] = JSON.parse(raw); return SHAPES[path]; }
+  } catch (e) { /* приватный режим */ }
+  return null;
+}
+
+/* Пока страницу ни разу не открывали, размеры взять негде — показываем
+   прикидку по типу страницы из настоящих блоков: строка, плитка, элемент. */
+const skelRows = (n) => '<div class="card skel"><div class="ln head"></div>'
+  + '<div class="skel-row"></div>'.repeat(n) + '</div>';
+const skelTiles = (n) => '<div class="card skel"><div class="ln head"></div>'
+  + '<div class="tiles">' + '<div class="skel-tile"></div>'.repeat(n)
+  + '</div></div>';
+const skelItems = (n) => '<div class="card skel"><div class="ln head"></div>'
+  + '<div class="skel-item"></div>'.repeat(n) + '</div>';
+
+function skeletonFor(path) {
+  const shape = knownShape(path);
+  if (shape) {
+    return shape.map((h) => `<div class="card skel" style="height:${h}px"></div>`).join('');
+  }
+  if (path === '') return skelTiles(4) + skelTiles(6);
+  if (/^chat\/-?\d+$/.test(path)) return skelRows(5) + skelTiles(6) + skelTiles(4);
+  if (/^chat\/-?\d+\/s\//.test(path)) return skelRows(4) + skelRows(2);
+  const lists = /^(chat\/-?\d+\/(active|events|trigs|cmds|words|profwords|warned|answers|linkwl)|access|seed|admin\/log)/;
+  if (lists.test(path)) return skelItems(6);
+  return skelRows(3);
+}
 
 async function render() {
   const path = here();
@@ -1319,6 +1476,8 @@ async function render() {
   for (const [re, view] of ROUTES) {
     const m = path.match(re);
     if (!m) continue;
+    // страницу уже открывали — она придёт из кэша мгновенно, мигать нечем
+    if (!SEEN.has(path)) $app.innerHTML = skeletonFor(path);
     try {
       const page = await view(...m.slice(1));
       $app.innerHTML = page.html;
@@ -1331,6 +1490,8 @@ async function render() {
       }
       window.scrollTo(0, keepScroll ? y : 0);
       lastPath = path;
+      SEEN.add(path);
+      rememberShape(path);      // размеры пригодятся следующему заходу
     } catch (e) {
       $app.innerHTML = `<div class="card"><div class="empty">${esc(e.message)}</div></div>`;
     }
@@ -1919,7 +2080,7 @@ const ACT = {
 
 async function bitToggle(key, el) {
   await api(`/chat/${curChat()}/bit`, { json: { key, bit: +el.dataset.bit } });
-  haptic();
+  hapticPick();
   render();
 }
 
@@ -1934,10 +2095,18 @@ document.addEventListener('click', async (e) => {
   const fn = ACT[actEl.dataset.act];
   if (!fn) return;
   e.preventDefault();
+  // второе нажатие, пока идёт первое, — это второй бан и вторая рассылка
+  if (actEl.dataset.busy) return;
+  actEl.dataset.busy = '1';
+  actEl.disabled = true;
   try {
     await fn(actEl);
   } catch (err) {
+    hapticDone(false);
     toast(err.message);
+  } finally {
+    delete actEl.dataset.busy;
+    actEl.disabled = false;
   }
 });
 
@@ -1949,7 +2118,7 @@ document.addEventListener('change', async (e) => {
       const key = toggle ? el.dataset.toggle : el.dataset.select;
       const r = await api(`/chat/${curChat()}/set`,
         { json: { key, value: toggle ? (el.checked ? 1 : 0) : el.value } });
-      if (toggle) haptic();
+      if (toggle) hapticPick();
       // Браузер уже показал новое значение — перерисовка нужна, только если от
       // него что-то зависит: появилось или пропало другое поле, поменялся виджет.
       // Иначе страница мигала и прыгала на каждое нажатие
@@ -1983,6 +2152,7 @@ document.addEventListener('change', async (e) => {
       render();
     }
   } catch (err) {
+    hapticDone(false);
     toast(err.message);
     render();
   }

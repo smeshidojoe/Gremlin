@@ -69,6 +69,10 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
     "wl": ("🕊 Вайтлист", ()),
     # лог-чат не переносим: он свой у каждого чата, и подставлять чужой —
     # верный способ отправить карточки не туда
+    "raid": ("🛡 Защита от набегов", ("raid_on", "raid_joins", "raid_window",
+                                     "raid_action", "raid_hold")),
+    "report": ("🚨 Жалобы", ("report_on", "report_who", "report_cd",
+                            "report_mute_min", "report_admins")),
     "cards": ("🪪 Карточки и лог", ("cards_on", "card_mask")),
 }
 

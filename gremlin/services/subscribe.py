@@ -15,7 +15,7 @@
 import logging
 import time
 
-from .. import config, db
+from .. import config, db, utils
 
 logger = logging.getLogger("gremlin.subscribe")
 
@@ -216,7 +216,7 @@ def clear_problem(chat_id: int) -> None:
 def warn_due(chat_id: int) -> bool:
     """Пора ли снова сказать владельцу. Раз в сутки на чат."""
     now = time.time()
-    if now - _warned.get(chat_id, 0) < config.SUB_WARN_TTL:
+    if now - _warned.get(chat_id, utils.NEVER) < config.SUB_WARN_TTL:
         return False
     _warned[chat_id] = now
     return True

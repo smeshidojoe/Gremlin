@@ -317,15 +317,14 @@ pre.log {
   background: color-mix(in srgb, var(--hint) 18%, transparent);
 }
 .skel .ln.head { width: 40%; height: 15px; margin: 2px 0 12px; }
-.skel-row, .skel-item, .skel-tile {
-  border-radius: 8px;
+/* Плитка и пилюля — той же высоты, что настоящие: 52 и 29 пикселей. */
+.skel-tile, .skel-chip {
   background: color-mix(in srgb, var(--hint) 14%, transparent);
 }
-.skel-row { height: 41px; margin-bottom: 1px; }
+.skel-tile { height: 52px; border-radius: var(--radius); }
+.skel-chip { display: inline-block; height: 29px; border-radius: 999px; }
 /* Карточка с запомненной высотой: внутри пусто, форма уже верная. */
 .card.skel[style] { padding: 0; }
-.skel-item { height: 50px; margin-bottom: 1px; }
-.skel-tile { height: 52px; }
 .skel { animation: breathe 1.3s ease-in-out infinite; }
 @keyframes breathe { 50% { opacity: .5; } }
 
@@ -344,3 +343,44 @@ pre.log {
 @media (prefers-reduced-transparency: reduce) {
   header { background: var(--bg); backdrop-filter: none; }
 }
+
+/* Графики: картинка тянется по ширине карточки, полоски — обычный поток. */
+.skel-chart {
+  aspect-ratio: 320 / 96;
+  margin-top: 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--hint) 14%, transparent);
+}
+.chart { width: 100%; height: auto; display: block; margin-top: 10px; overflow: visible; }
+.chart { touch-action: pan-y; }   /* вертикальная прокрутка страницы важнее */
+.chart-note { color: var(--hint); font-size: 12px; margin-top: 8px; }
+/* Строка чтения: что именно показал график в выбранной точке. */
+.chart-read {
+  margin-top: 6px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  background: color-mix(in srgb, var(--hint) 12%, transparent);
+}
+.bar-num small { display: block; font-size: 10px; opacity: .7; }
+.value small { opacity: .6; margin-left: 4px; }
+/* Рост и спад недели: цветом, чтобы не вчитываться в знак. */
+.row .label small { display: block; font-size: 11px; color: var(--hint); }
+.trend.up { color: var(--ok); }
+.trend.down { color: var(--danger); }
+.bar-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.bar-name { flex: 0 0 38%; font-size: 13px; }
+.bar-track {
+  flex: 1;
+  height: 10px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--hint) 18%, transparent);
+  overflow: hidden;
+}
+.bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width .35s var(--ease-out);
+}
+.bar-num { flex: 0 0 auto; font-size: 13px; color: var(--hint); min-width: 28px; text-align: right; }

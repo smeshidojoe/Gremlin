@@ -4,6 +4,7 @@
 собранная им история продолжает пополняться, а недельные сводки видят всё вместе.
 """
 import logging
+import os
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -11,6 +12,19 @@ from datetime import datetime, timezone
 from .. import config, utils
 
 logger = logging.getLogger("gremlin.stats")
+
+
+def _con_ro() -> sqlite3.Connection | None:
+    """Открыть базу на чтение. None — базы нет.
+
+    Обычный connect создаёт пустой файл, если базы нет. После этого всё,
+    что её читает, падало не на «базы нет», а на «в базе нет таблиц»:
+    раздел сводки переставал открываться вовсе.
+    """
+    if not os.path.exists(config.STATS_DB):
+        return None
+    return sqlite3.connect(f"file:{config.STATS_DB}?mode=ro", uri=True,
+                           timeout=10)
 
 
 def _con() -> sqlite3.Connection:
@@ -142,8 +156,10 @@ def tracked_chat_id() -> int | None:
 
 def _read_tracked_chat_id() -> int | None:
     try:
-        con = _con()
+        con = _con_ro()
     except Exception:
+        return None
+    if con is None:
         return None
     try:
         row = con.execute("SELECT value FROM meta WHERE key='chat_id'").fetchone()

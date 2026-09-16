@@ -64,6 +64,7 @@ async def allowed(user: dict) -> bool:
     return await db.access_allowed(uid, user.get("username"))
 
 
-async def owns(uid: int, chat_id: int) -> bool:
-    """Свой ли это чат. Владелец бота может всё, остальные — только свои чаты."""
-    return await db.owns_chat(uid, chat_id)
+async def owns(uid: int, chat_id: int, need: str = "settings") -> bool:
+    """Хватает ли прав на чат. Уровни те же, что в меню бота:
+    punish (наказания) < settings (разделы) < owner (владельческое)."""
+    return await db.may(uid, chat_id, need)

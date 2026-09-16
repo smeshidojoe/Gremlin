@@ -109,7 +109,7 @@ def _date(ts: int) -> str:
 
 def _day_ts(day: int) -> int:
     """Номер местных суток из msg_stats -> начало этих суток."""
-    return day * 86400 - config.TZ_OFFSET * 3600
+    return utils.day_ts(day)
 
 
 def _day_date(day: int) -> str:

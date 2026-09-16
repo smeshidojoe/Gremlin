@@ -265,6 +265,16 @@ CREATE TABLE IF NOT EXISTS access(
     name     TEXT,          -- имя на момент добавления: боту человек мог не писать
     added    INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS chat_admins(
+    chat_id  INTEGER NOT NULL,
+    user_id  INTEGER NOT NULL,
+    level    TEXT    NOT NULL DEFAULT 'punish',   -- punish | settings
+    username TEXT,
+    name     TEXT,
+    added_by INTEGER,
+    created  INTEGER NOT NULL,
+    UNIQUE(chat_id, user_id)
+);
 CREATE TABLE IF NOT EXISTS watch_profiles(
     chat_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
@@ -1038,7 +1048,80 @@ async def chats_for(user_id: int) -> list[aiosqlite.Row]:
     chats = await moderated_chats()
     if user_id in config.ADMIN_IDS:
         return chats
-    return [c for c in chats if c["owner_id"] == user_id]
+    # плюс чаты, куда владелец пустил человека админом в боте
+    mine = set(await admin_of_chats(user_id))
+    return [c for c in chats
+            if c["owner_id"] == user_id or c["chat_id"] in mine]
+
+
+# ---------- админы чата в боте ----------
+#
+# Владелец пускает своих админов в меню бота. Уровня два: «наказания» — списки,
+# снятие, проверка статуса, жалобы; «настройки» — ещё и разделы модерации.
+# Владельческое (лог-чат, сетки, перенос настроек, удаление бота и сам этот
+# список) не отдаётся никому: иначе доступ раздавался бы по кругу.
+
+ADMIN_LEVELS = ("punish", "settings")
+LEVEL_NAMES = {"punish": "Наказания", "settings": "Настройки", "owner": "Владелец"}
+_RANK = {"punish": 1, "settings": 2, "owner": 3}
+
+
+async def chat_admin_add(chat_id: int, user_id: int, level: str,
+                         username: str | None, name: str | None,
+                         by_id: int) -> None:
+    await _db.execute(
+        """INSERT INTO chat_admins (chat_id, user_id, level, username, name,
+                                    added_by, created)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(chat_id, user_id) DO UPDATE SET
+             level = excluded.level,
+             username = COALESCE(excluded.username, chat_admins.username),
+             name = COALESCE(excluded.name, chat_admins.name)""",
+        (chat_id, user_id, level, username, name, by_id, _now()))
+    await _db.commit()
+
+
+async def chat_admin_remove(chat_id: int, user_id: int) -> None:
+    await _db.execute("DELETE FROM chat_admins WHERE chat_id = ? AND user_id = ?",
+                      (chat_id, user_id))
+    await _db.commit()
+
+
+async def chat_admin_list(chat_id: int) -> list[aiosqlite.Row]:
+    cur = await _db.execute(
+        "SELECT * FROM chat_admins WHERE chat_id = ? ORDER BY created", (chat_id,))
+    return await cur.fetchall()
+
+
+async def chat_admin_level(chat_id: int, user_id: int) -> str | None:
+    cur = await _db.execute(
+        "SELECT level FROM chat_admins WHERE chat_id = ? AND user_id = ?",
+        (chat_id, user_id))
+    row = await cur.fetchone()
+    return row["level"] if row else None
+
+
+async def chat_access(user_id: int, chat_id: int) -> str | None:
+    """Что человеку можно в этом чате: owner, settings, punish или ничего."""
+    if user_id in config.ADMIN_IDS:
+        return "owner"
+    ch = await get_chat(chat_id)
+    if ch is not None and ch["owner_id"] == user_id:
+        return "owner"
+    return await chat_admin_level(chat_id, user_id)
+
+
+async def may(user_id: int, chat_id: int, need: str = "settings") -> bool:
+    """Хватает ли прав на действие. Уровни: punish < settings < owner."""
+    level = await chat_access(user_id, chat_id)
+    return bool(level) and _RANK[level] >= _RANK[need]
+
+
+async def admin_of_chats(user_id: int) -> list[int]:
+    """Чаты, куда человека пустил владелец."""
+    cur = await _db.execute(
+        "SELECT chat_id FROM chat_admins WHERE user_id = ?", (user_id,))
+    return [r[0] for r in await cur.fetchall()]
 
 
 async def owns_chat(user_id: int, chat_id: int) -> bool:
@@ -2583,6 +2666,103 @@ async def user_chat_facts(chat_id: int, user_id: int) -> dict:
             "active": [dict(r) for r in await cur.fetchall()]}
 
 
+async def chart_series(chat_id: int, days: int) -> dict:
+    """Ряды для графиков панели: по суткам, по типам наказаний, по часам.
+
+    Считаем прямо из рабочих таблиц, ничего не накапливая отдельно: за 90 дней
+    это несколько тысяч строк, а лишняя таблица со сводками жила бы своей
+    жизнью и однажды разошлась бы с правдой.
+
+    Пустые сутки в ряду остаются нулями: без них график врёт — неделя молчания
+    выглядела бы как один короткий провал между соседними точками.
+    """
+    last = utils.day_num()
+    first = last - days + 1
+    since = utils.day_ts(first)
+
+    cur = await _db.execute(
+        """SELECT day, SUM(cnt) AS c FROM msg_stats
+           WHERE chat_id = ? AND day >= ? GROUP BY day""", (chat_id, first))
+    msgs = {r["day"]: r["c"] or 0 for r in await cur.fetchall()}
+
+    joins: dict[int, int] = {}
+    leaves: dict[int, int] = {}
+    cur = await _db.execute(
+        """SELECT kind, ts FROM events
+           WHERE chat_id = ? AND ts >= ? AND kind IN ('join', 'leave')""",
+        (chat_id, since))
+    for r in await cur.fetchall():
+        bucket = joins if r["kind"] == "join" else leaves
+        d = utils.day_num(r["ts"])
+        bucket[d] = bucket.get(d, 0) + 1
+
+    series = [{"day": d, "ts": utils.day_ts(d), "msgs": msgs.get(d, 0),
+               "joins": joins.get(d, 0), "leaves": leaves.get(d, 0)}
+              for d in range(first, last + 1)]
+
+    cur = await _db.execute(
+        """SELECT kind, COUNT(*) AS c FROM punishments
+           WHERE chat_id = ? AND created >= ? GROUP BY kind""", (chat_id, since))
+    kinds = {r["kind"]: r["c"] for r in await cur.fetchall()}
+
+    # причины не разбираем здесь: правило из причины достаёт moderation, а
+    # тянуть сервисы в db — это круговой импорт
+    cur = await _db.execute(
+        """SELECT reason, by_id IS NULL AS by_bot, COUNT(*) AS c FROM punishments
+           WHERE chat_id = ? AND created >= ? GROUP BY reason, by_bot""",
+        (chat_id, since))
+    reasons = [{"reason": r["reason"], "by_bot": bool(r["by_bot"]), "count": r["c"]}
+               for r in await cur.fetchall()]
+
+    hours = [0] * 24
+    cur = await _db.execute(
+        """SELECT CAST(((created + ?) % 86400) / 3600 AS INTEGER) AS h,
+                  COUNT(*) AS c FROM punishments
+           WHERE chat_id = ? AND created >= ? GROUP BY h""",
+        (config.TZ_OFFSET * 3600, chat_id, since))
+    for r in await cur.fetchall():
+        hours[int(r["h"]) % 24] = r["c"]
+
+    cur = await _db.execute(
+        """SELECT scope, COUNT(*) AS c FROM forgiven
+           WHERE chat_id = ? AND created >= ? GROUP BY scope""", (chat_id, since))
+    forgiven = {r["scope"]: r["c"] for r in await cur.fetchall()}
+
+    return {"series": series, "kinds": kinds, "reasons": reasons,
+            "hours": hours, "forgiven": forgiven,
+            "prev": await _chart_prev(chat_id, first, days, since)}
+
+
+async def _chart_prev(chat_id: int, first: int, days: int, since: int) -> dict:
+    """Тот же по длине период до начала окна.
+
+    Без него числа на странице не значат ничего: «28 наказаний» — это много
+    или мало, понятно только рядом с прошлым месяцем.
+    """
+    was_since = utils.day_ts(first - days)
+
+    async def one(q: str, args) -> int:
+        cur = await _db.execute(q, args)
+        return (await cur.fetchone())[0] or 0
+
+    return {
+        "msgs": await one(
+            """SELECT SUM(cnt) FROM msg_stats
+               WHERE chat_id = ? AND day BETWEEN ? AND ?""",
+            (chat_id, first - days, first - 1)),
+        "joins": await one(
+            """SELECT COUNT(*) FROM events WHERE chat_id = ? AND kind = 'join'
+               AND ts >= ? AND ts < ?""", (chat_id, was_since, since)),
+        "leaves": await one(
+            """SELECT COUNT(*) FROM events WHERE chat_id = ? AND kind = 'leave'
+               AND ts >= ? AND ts < ?""", (chat_id, was_since, since)),
+        "punished": await one(
+            """SELECT COUNT(*) FROM punishments
+               WHERE chat_id = ? AND created >= ? AND created < ?""",
+            (chat_id, was_since, since)),
+    }
+
+
 async def chat_stats(chat_id: int) -> dict:
     day = utils.day_num()
 
@@ -2599,6 +2779,20 @@ async def chat_stats(chat_id: int) -> dict:
         (chat_id, day - 6),
     )
     top = [(r["user_id"], r["c"]) for r in await cur.fetchall()]
+    y1 = await one("SELECT SUM(cnt) FROM msg_stats WHERE chat_id = ? AND day = ?",
+                   (chat_id, day - 1))
+    d30 = await one("SELECT SUM(cnt) FROM msg_stats WHERE chat_id = ? AND day >= ?",
+                    (chat_id, day - 29))
+    # предыдущая неделя: без неё «за 7д 3000» — число без смысла, непонятно,
+    # это рост или чат затухает
+    p7 = await one(
+        "SELECT SUM(cnt) FROM msg_stats WHERE chat_id = ? AND day BETWEEN ? AND ?",
+        (chat_id, day - 13, day - 7))
+    people7 = await one(
+        "SELECT COUNT(DISTINCT user_id) FROM msg_stats WHERE chat_id = ? AND day >= ?",
+        (chat_id, day - 6))
+    since = await one("SELECT MIN(day) FROM msg_stats WHERE chat_id = ?", (chat_id,))
+
     week_ts = _now() - 7 * 86400
     joins = await one(
         "SELECT COUNT(*) FROM events WHERE chat_id = ? AND kind = 'join' AND ts >= ?",
@@ -2609,8 +2803,13 @@ async def chat_stats(chat_id: int) -> dict:
     pun7 = await one(
         "SELECT COUNT(*) FROM punishments WHERE chat_id = ? AND created >= ?",
         (chat_id, week_ts))
-    return {"total": total, "d1": d1, "d7": d7, "top": top,
-            "joins": joins, "leaves": leaves, "pun7": pun7}
+    pun30 = await one(
+        "SELECT COUNT(*) FROM punishments WHERE chat_id = ? AND created >= ?",
+        (chat_id, _now() - 30 * 86400))
+    return {"total": total, "d1": d1, "d7": d7, "y1": y1, "d30": d30, "p7": p7,
+            "people7": people7, "since": utils.day_ts(since) if since else None,
+            "top": top, "joins": joins, "leaves": leaves,
+            "pun7": pun7, "pun30": pun30}
 
 
 # ---------- наблюдение за профилями ----------
@@ -2684,6 +2883,12 @@ async def access_allowed(user_id: int, username: str | None) -> bool:
         "SELECT 1 FROM access WHERE user_id = ? OR (username IS NOT NULL AND username = ?)",
         (user_id, (username or "").lower()),
     )
+    if await cur.fetchone() is not None:
+        return True
+    # админа чата в общий список доступа вносить не нужно: там он увидел
+    # бы чужие чаты. Пускаем по самой записи о правах
+    cur = await _db.execute("SELECT 1 FROM chat_admins WHERE user_id = ?",
+                            (user_id,))
     return await cur.fetchone() is not None
 
 

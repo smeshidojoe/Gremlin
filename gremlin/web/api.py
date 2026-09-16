@@ -65,13 +65,17 @@ def is_owner(request) -> bool:
     return uid_of(request) in config.ADMIN_IDS
 
 
-async def cid_of(request) -> int:
-    """id чата из пути + проверка прав. Чужой чат — 403 и никаких данных."""
+async def cid_of(request, need: str = "settings") -> int:
+    """id чата из пути + проверка прав. Не хватает уровня — 403 и никаких данных.
+
+    Уровни: punish (наказания, статус, массовые действия) < settings (разделы
+    модерации) < owner (лог-чат, сетки, перенос, удаление бота, список админов).
+    """
     try:
         cid = int(request.match_info["cid"])
     except (KeyError, ValueError):
         raise web.HTTPBadRequest(text="bad chat id")
-    if not await auth.owns(uid_of(request), cid):
+    if not await auth.owns(uid_of(request), cid, need):
         raise web.HTTPForbidden(text="not your chat")
     return cid
 
@@ -160,8 +164,11 @@ async def _log_label(chat_id: int | None) -> str | None:
 @routes.get("/api/chat/{cid}")
 async def api_chat(request: web.Request) -> web.Response:
     """Дашборд чата: данные, сводка тумблеров, список разделов."""
-    cid = await cid_of(request)
+    cid = await cid_of(request, "punish")
     uid = uid_of(request)
+    # админу с уровнем «наказания» разделы настроек не показываем совсем
+    level = await db.chat_access(uid, cid)
+    full = level in ("owner", "settings")
     ch = await db.get_chat(cid)
     s = await db.get_settings(cid)
     st = await db.chat_stats(cid)
@@ -179,7 +186,11 @@ async def api_chat(request: web.Request) -> web.Response:
                          "on": bool(getattr(s, sec.fields[0].key))
                          if sec.fields and sec.fields[0].kind == "toggle" else None})
 
+    if not full:
+        sections = []
+
     return js({
+        "level": level,
         "chat": {
             "chat_id": cid,
             "title": ch["title"] if ch else str(cid),
@@ -196,8 +207,8 @@ async def api_chat(request: web.Request) -> web.Response:
         "overview": [{"key": k, "label": lbl, "on": bool(getattr(s, k))}
                      for k, lbl in schema.OVERVIEW],
         "sections": sections,
-        "groups": [{"key": k, "title": t, "hint": h}
-                   for k, t, h in schema.SECTION_GROUPS],
+        "groups": ([{"key": k, "title": t, "hint": h}
+                    for k, t, h in schema.SECTION_GROUPS] if full else []),
         "needs_setup": await um.needs_setup(cid, uid),
         "bot": (None if ch and ch["kind"] == "channel"
                 else await adm_cache.bot_status(bot_of(request), cid)),
@@ -208,7 +219,7 @@ async def api_chat(request: web.Request) -> web.Response:
 @routes.get("/api/chat/{cid}/stats")
 async def api_stats(request: web.Request) -> web.Response:
     """Статистика чата с расшифровкой топа — тот же экран, что в меню."""
-    cid = await cid_of(request)
+    cid = await cid_of(request, "punish")
     st = await db.chat_stats(cid)
     top = []
     for uid, cnt in st.get("top", []):
@@ -219,7 +230,73 @@ async def api_stats(request: web.Request) -> web.Response:
                     "who": " ".join(x for x in (name, uname) if x) or str(uid)})
     st = dict(st)
     st["top"] = top
+    # дату собираем здесь: у браузера свой часовой пояс, и «считаем с» съезжало
+    st["since_date"] = (utils._local(st["since"]).strftime("%d.%m.%Y")
+                        if st["since"] else None)
     return js(st)
+
+
+# ---------- графики ----------
+#
+# Считаем на сервере, рисуем в браузере: библиотек графиков не берём, тянуть
+# полмегабайта ради шести картинок в мини-аппе незачем.
+
+CHART_RANGES = (7, 30, 90)
+_DOW = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
+_RULE_LABELS = dict(config.WL_SCOPE_LABELS, manual="вручную", other="прочее")
+
+
+@routes.get("/api/chat/{cid}/charts")
+async def api_charts(request: web.Request) -> web.Response:
+    cid = await cid_of(request, "punish")
+    try:
+        days = int(request.query.get("days", 30))
+    except ValueError:
+        days = 30
+    if days not in CHART_RANGES:
+        days = 30
+    d = await db.chart_series(cid, days)
+
+    rules: dict[str, int] = {}
+    for r in d["reasons"]:
+        # ручное наказание к правилу отношения не имеет, а причина бота,
+        # которую не берёт forgive_scope, — это капча, варны, набег, жалоба
+        key = (moderation.forgive_scope(r["reason"]) or "other") if r["by_bot"] else "manual"
+        rules[key] = rules.get(key, 0) + r["count"]
+
+    def named(counts: dict, labels: dict) -> list[dict]:
+        return [{"key": k, "label": labels.get(k, k), "count": n}
+                for k, n in sorted(counts.items(), key=lambda kv: -kv[1]) if n]
+
+    # день недели отдаём отдельно: на графике за 90 дней подпись «12.09» ни о
+    # чём не говорит, а «сб» сразу объясняет провал
+    series = []
+    for row in d["series"]:
+        dt = utils._local(row["ts"])
+        series.append({
+            "date": dt.strftime("%d.%m"),
+            "dow": _DOW[dt.weekday()],
+            "weekend": dt.weekday() >= 5,
+            "msgs": row["msgs"], "joins": row["joins"], "leaves": row["leaves"],
+        })
+    return js({
+        "days": days,
+        "ranges": list(CHART_RANGES),
+        "series": series,
+        "totals": {
+            "msgs": sum(r["msgs"] for r in series),
+            "joins": sum(r["joins"] for r in series),
+            "leaves": sum(r["leaves"] for r in series),
+            "punished": sum(d["kinds"].values()),
+            "forgiven": sum(d["forgiven"].values()),
+            "manual": rules.get("manual", 0),
+        },
+        "prev": d["prev"],
+        "kinds": named(d["kinds"], um._KIND_WORD),
+        "rules": named(rules, _RULE_LABELS),
+        "forgiven": named(d["forgiven"], config.WL_SCOPE_LABELS),
+        "hours": d["hours"],
+    })
 
 
 @routes.get("/api/chat/{cid}/events")
@@ -1045,7 +1122,7 @@ async def api_welcome_migrate(request: web.Request) -> web.Response:
 
 @routes.get("/api/chat/{cid}/warned")
 async def api_warned(request: web.Request) -> web.Response:
-    cid = await cid_of(request)
+    cid = await cid_of(request, "punish")
     s = await db.get_settings(cid)
     items = []
     for r in await db.warn_users(cid):
@@ -1058,7 +1135,7 @@ async def api_warned(request: web.Request) -> web.Response:
 
 @routes.post("/api/chat/{cid}/warned/{uid}/reset")
 async def api_warn_reset(request: web.Request) -> web.Response:
-    cid = await cid_of(request)
+    cid = await cid_of(request, "punish")
     await db.warn_reset(cid, int(request.match_info["uid"]))
     return js({"ok": True})
 
@@ -1067,7 +1144,7 @@ async def api_warn_reset(request: web.Request) -> web.Response:
 
 @routes.get("/api/chat/{cid}/active")
 async def api_active(request: web.Request) -> web.Response:
-    cid = await cid_of(request)
+    cid = await cid_of(request, "punish")
     items = []
     for r in await db.active_punishments(cid, limit=ACTIVE_LIMIT):
         items.append({
@@ -1089,7 +1166,7 @@ async def api_active(request: web.Request) -> web.Response:
 @routes.get("/api/chat/{cid}/status")
 async def api_status(request: web.Request) -> web.Response:
     """Проверка статуса человека — та же карточка, что в меню наказаний."""
-    cid = await cid_of(request)
+    cid = await cid_of(request, "punish")
     bot = bot_of(request)
     uid, err = await status_svc.parse_target(bot, request.query.get("q", ""))
     if uid is None:
@@ -1101,7 +1178,7 @@ async def api_status(request: web.Request) -> web.Response:
 @routes.post("/api/chat/{cid}/spamprofile")
 async def api_spam_profile(request: web.Request) -> web.Response:
     """«Спам-профиль» со страницы проверки: профиль — в базу этого чата."""
-    cid = await cid_of(request)
+    cid = await cid_of(request, "punish")
     data = await body(request)
     try:
         uid = int(data.get("user_id") or 0)
@@ -1118,7 +1195,7 @@ async def api_spam_profile(request: web.Request) -> web.Response:
 
 @routes.get("/api/chat/{cid}/forgiven")
 async def api_forgiven(request: web.Request) -> web.Response:
-    cid = await cid_of(request)
+    cid = await cid_of(request, "punish")
     items = []
     for r in await db.forgiven_list(cid):
         why, swapped = utils.short_reason(r["reason"])
@@ -1138,7 +1215,7 @@ async def api_forgiven(request: web.Request) -> web.Response:
 
 @routes.delete("/api/chat/{cid}/forgiven/{rid}")
 async def api_forgiven_del(request: web.Request) -> web.Response:
-    cid = await cid_of(request)
+    cid = await cid_of(request, "punish")
     rid = int(request.match_info["rid"])
     row = await db.forgiven_get(rid)
     if row is None or row["chat_id"] != cid:
@@ -1150,7 +1227,7 @@ async def api_forgiven_del(request: web.Request) -> web.Response:
 
 @routes.post("/api/chat/{cid}/active/{pid}/lift")
 async def api_lift(request: web.Request) -> web.Response:
-    cid = await cid_of(request)
+    cid = await cid_of(request, "punish")
     pid = int(request.match_info["pid"])
     p = await db.get_punishment(pid)
     if p is None or p["chat_id"] != cid:
@@ -1167,7 +1244,7 @@ _MASS = {"ban": um._ban_one, "unban": um._unban_one, "kick": um._kick_one}
 @routes.post("/api/chat/{cid}/mass")
 async def api_mass(request: web.Request) -> web.Response:
     """Массовые бан/разбан/кик списком id и @username — как в меню."""
-    cid = await cid_of(request)
+    cid = await cid_of(request, "punish")
     data = await body(request)
     worker = _MASS.get(data.get("kind"))
     if worker is None:
@@ -1192,7 +1269,7 @@ async def api_mass(request: web.Request) -> web.Response:
 @routes.post("/api/chat/{cid}/log")
 async def api_log(request: web.Request) -> web.Response:
     """Назначить лог-чат. Пусто — убрать."""
-    cid = await cid_of(request)
+    cid = await cid_of(request, "owner")
     raw = (await body(request)).get("chat_id")
     if raw in (None, "", "-"):
         await db.set_setting(cid, "log_chat_id", None)
@@ -1214,9 +1291,71 @@ async def api_log(request: web.Request) -> web.Response:
     return js({"chat_id": target, "title": await _log_label(target)})
 
 
+# ---------- админы чата в боте ----------
+
+def _admin_row(r) -> dict:
+    return {"user_id": r["user_id"], "level": r["level"],
+            "who": r["name"] or (f"@{r['username']}" if r["username"]
+                                 else str(r["user_id"])),
+            "username": r["username"], "created": r["created"]}
+
+
+@routes.get("/api/chat/{cid}/admins")
+async def api_admins(request: web.Request) -> web.Response:
+    cid = await cid_of(request, "owner")
+    return js({"items": [_admin_row(r) for r in await db.chat_admin_list(cid)],
+               "levels": {k: db.LEVEL_NAMES[k] for k in db.ADMIN_LEVELS}})
+
+
+@routes.post("/api/chat/{cid}/admins")
+async def api_admin_add(request: web.Request) -> web.Response:
+    """Добавить админа или сменить ему уровень."""
+    cid = await cid_of(request, "owner")
+    data = await body(request)
+    level = data.get("level") or "punish"
+    if level not in db.ADMIN_LEVELS:
+        raise web.HTTPBadRequest(text="Неизвестный уровень.")
+    bot = bot_of(request)
+    target = str(data.get("target") or "").strip()
+    uid = int(data["user_id"]) if data.get("user_id") else None
+    if uid is None:
+        if target.lstrip("-").isdigit():
+            uid = int(target)
+        elif target.startswith("@") and len(target) > 3:
+            uid, _name = await resolve.by_username(bot, target)
+        if uid is None:
+            raise web.HTTPBadRequest(text="Нужен id или @username.")
+    if uid == uid_of(request):
+        raise web.HTTPBadRequest(text="Это вы, у вас и так все права.")
+    # доступ к чужому чату не должен появляться из ниоткуда: пускаем только
+    # тех, кому владелец уже доверил админку в самом Telegram
+    if uid not in await adm_cache.chat_admin_ids(bot, cid):
+        raise web.HTTPBadRequest(
+            text="Этот человек не админ чата. Сначала выдайте права в Telegram.")
+    name = username = None
+    try:
+        member = await bot.get_chat_member(cid, uid)
+        name, username = member.user.full_name, member.user.username
+    except Exception:
+        logger.debug("имя админа %s не узнать", uid, exc_info=True)
+    await db.chat_admin_add(cid, uid, level, username, name, uid_of(request))
+    await db.add_event(cid, "card",
+                       f"доступ в бот: {uid} ({level}) by {uid_of(request)}")
+    return js({"items": [_admin_row(r) for r in await db.chat_admin_list(cid)],
+               "note": f"{name or uid}: {db.LEVEL_NAMES[level]}"})
+
+
+@routes.delete("/api/chat/{cid}/admins/{uid}")
+async def api_admin_del(request: web.Request) -> web.Response:
+    cid = await cid_of(request, "owner")
+    uid = int(request.match_info["uid"])
+    await db.chat_admin_remove(cid, uid)
+    await db.add_event(cid, "card", f"доступ в бот снят: {uid} by {uid_of(request)}")
+    return js({"items": [_admin_row(r) for r in await db.chat_admin_list(cid)]})
+
 @routes.get("/api/chat/{cid}/copy")
 async def api_copy_sources(request: web.Request) -> web.Response:
-    cid = await cid_of(request)
+    cid = await cid_of(request, "owner")
     others = [c for c in await db.chats_for(uid_of(request)) if c["chat_id"] != cid]
     return js({
         "chats": [{"chat_id": c["chat_id"], "title": c["title"] or str(c["chat_id"])}
@@ -1227,11 +1366,11 @@ async def api_copy_sources(request: web.Request) -> web.Response:
 
 @routes.post("/api/chat/{cid}/copy")
 async def api_copy(request: web.Request) -> web.Response:
-    cid = await cid_of(request)
+    cid = await cid_of(request, "owner")
     data = await body(request)
     src = int(data.get("src") or 0)
     groups = [g for g in (data.get("groups") or []) if g in transfer.GROUPS]
-    if not await auth.owns(uid_of(request), src):
+    if not await auth.owns(uid_of(request), src, "owner"):
         raise web.HTTPForbidden(text="Чужой чат-источник.")
     if not groups:
         raise web.HTTPBadRequest(text="Не выбрано ни одного раздела.")
@@ -1243,14 +1382,14 @@ async def api_copy(request: web.Request) -> web.Response:
 
 @routes.post("/api/chat/{cid}/setup-skip")
 async def api_setup_skip(request: web.Request) -> web.Response:
-    cid = await cid_of(request)
+    cid = await cid_of(request, "owner")
     await db.kv_set(um.setup_key(cid), "1")
     return js({"ok": True})
 
 
 @routes.post("/api/chat/{cid}/leave")
 async def api_leave(request: web.Request) -> web.Response:
-    cid = await cid_of(request)
+    cid = await cid_of(request, "owner")
     ok, note = await moderation.leave_chat(bot_of(request), cid)
     if not ok:
         raise web.HTTPBadRequest(text=f"Не вышло: {note}")
@@ -1487,7 +1626,7 @@ async def api_net_import(request: web.Request) -> web.Response:
 @routes.post("/api/chat/{cid}/net")
 async def api_chat_net(request: web.Request) -> web.Response:
     """Положить чат в сетку или вынуть из неё — с карточки чата."""
-    cid = await cid_of(request)
+    cid = await cid_of(request, "owner")
     raw = (await body(request)).get("net_id")
     if raw in (None, "", 0, "0"):
         await db.net_assign(cid, None)

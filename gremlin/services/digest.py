@@ -46,6 +46,8 @@ def collect(stats_db: str) -> dict | None:
     con = sqlite3.connect(f"file:{stats_db}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
     try:
+        # файл есть, а таблиц нет: так бывает у базы, которую кто-то создал
+        # подключением. Для сводки это то же самое, что базы нет
         since = _week_start()
         meta = dict(con.execute("SELECT key, value FROM meta").fetchall())
         # сообщения за неделю по людям (каналы/анонимы с отрицательным id пропускаем)
@@ -99,6 +101,9 @@ def collect(stats_db: str) -> dict | None:
             "days": now.weekday() + 1,          # сколько дней недели уже прошло
             "period": f"{datetime.fromisoformat(since):%d.%m} – {now:%d.%m}",
         }
+    except sqlite3.Error:
+        logger.warning("база статистики %s нечитаема", stats_db, exc_info=True)
+        return None
     finally:
         con.close()
 

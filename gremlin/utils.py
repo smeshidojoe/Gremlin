@@ -96,6 +96,12 @@ def day_num(ts: float | None = None) -> int:
     return int(base + config.TZ_OFFSET * 3600) // 86400
 
 
+def day_ts(day: int) -> int:
+    """Номер местных суток -> unix-время их начала. Обратное к day_num."""
+    from . import config
+    return day * 86400 - config.TZ_OFFSET * 3600
+
+
 def day_str(dt: datetime | None = None) -> str:
     """Местная дата YYYY-MM-DD — ключ для daily.day в базе статистики."""
     d = dt.astimezone(_tz()) if dt else local_now()

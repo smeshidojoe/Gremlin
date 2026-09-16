@@ -407,11 +407,18 @@ async function chatView(cid) {
   const setup = d.needs_setup ? `
     <div class="card">
       <h2>🆕 Чат ещё не настраивали</h2>
-      <div class="intro">Можно перенести правила из другого чата — фильтры, стоп-слова,
-        вайтлисты, триггеры и счётчики поедут целиком, вместе с медиа.</div>
+      <div class="intro">Сначала лог-чат: туда бот пишет, кого наказал и за что, кто
+        просится в чат и на кого пожаловались, и ставит кнопки — снять наказание,
+        забанить, впустить. Без него бот работает молча. Заведите под это отдельную
+        группу и добавьте бота туда администратором.
+        ${d.log_chat.chat_id ? `Сейчас: <b>${esc(d.log_chat.title)}</b>.` : 'Сейчас не выбран.'}</div>
+      <div class="intro" style="margin-top:6px">Правила можно не настраивать заново —
+        перенесите из другого своего чата: фильтры, стоп-слова, вайтлисты, триггеры и
+        счётчики целиком, вместе с медиа.</div>
       <div class="wrap" style="margin-top:10px">
-        <button class="btn" data-go="#/chat/${cid}/copy">📥 Перенести настройки</button>
-        <button class="btn ghost" data-act="setup-skip">🛠 С нуля</button>
+        <button class="btn" data-act="set-log">📍 ${d.log_chat.chat_id ? 'Сменить лог-чат' : 'Выбрать лог-чат'}</button>
+        <button class="btn ghost" data-go="#/chat/${cid}/copy">📥 Перенести настройки</button>
+        <button class="btn ghost" data-act="setup-skip">🛠 Дальше сам</button>
       </div>
     </div>` : '';
 
@@ -435,6 +442,8 @@ async function chatView(cid) {
           <div class="value">активных ${d.active} · за 7д ${st.pun7}</div></div>
         ${d.bot ? `<div class="row"><div class="label">🤖 Бот</div>
           <div class="value">${esc(d.bot.text)}</div></div>` : ''}
+        ${d.log_chat.chat_id ? '' : `<div class="intro" style="margin-top:8px">
+          ⚠️ Лог-чат не выбран: бот работает молча, карточек и кнопок нет.</div>`}
         <div style="margin-top:10px" class="wrap">${overview}</div>
       </div>
 
@@ -460,14 +469,16 @@ async function chatView(cid) {
         <div class="tiles">
           ${tile(`#/chat/${cid}/active`, '🚫 Наказания', { sub: 'активных ' + d.active })}
           ${tile(`#/chat/${cid}/stats`, '📈 Статистика')}
-          ${tile(`#/chat/${cid}/events`, '📜 Лог чата')}
-          ${tile(`#/chat/${cid}/copy`, '📥 Перенести настройки')}
-          <button class="tile" data-act="set-log">
-            <span>📍 Лог-чат<small>${esc(d.log_chat.title || 'не задан')}</small></span></button>
-          <button class="tile" data-act="chat-net">
-            <span>🕸 Сетка<small>${esc(d.net ? d.net.title : 'нет')}</small></span></button>
-          <button class="tile" data-act="leave" style="grid-column:1/-1">
-            <span>🚪 Убрать бота из чата</span></button>
+          ${d.level === 'punish' ? '' : tile(`#/chat/${cid}/events`, '📜 Лог чата')}
+          ${d.level !== 'owner' ? '' : `
+            ${tile(`#/chat/${cid}/admins`, '👮 Админы в боте')}
+            ${tile(`#/chat/${cid}/copy`, '📥 Перенести настройки')}
+            <button class="tile" data-act="set-log">
+              <span>📍 Лог-чат<small>${esc(d.log_chat.title || 'не задан')}</small></span></button>
+            <button class="tile" data-act="chat-net">
+              <span>🕸 Сетка<small>${esc(d.net ? d.net.title : 'нет')}</small></span></button>
+            <button class="tile" data-act="leave" style="grid-column:1/-1">
+              <span>🚪 Убрать бота из чата</span></button>`}
         </div>
       </div>`,
   };
@@ -803,6 +814,346 @@ async function wlEntryView(cid, rid) {
   };
 }
 
+async function adminsView(cid) {
+  const d = await api(`/chat/${cid}/admins`);
+  const hint = {
+    punish: 'наказания, проверка статуса, массовые действия',
+    settings: 'то же плюс все разделы модерации',
+  };
+  return {
+    title: 'Админы в боте',
+    back: `#/chat/${cid}`,
+    html: `<div class="card">
+      <div class="intro">Кого пустить в панель и меню бота по этому чату.
+        Добавлять можно только админов самого чата — бот это проверяет.
+        Лог-чат, сетки, перенос настроек, удаление бота и этот список
+        остаются только у вас.</div>
+      <div style="margin-top:10px">
+        ${d.items.map((r) => `<div class="item">
+            <div class="body">${esc(r.who)}
+              <small>${esc(d.levels[r.level])} · ${esc(hint[r.level] || '')}</small></div>
+            <button class="chip" data-act="admin-level" data-uid="${r.user_id}"
+              data-level="${r.level === 'punish' ? 'settings' : 'punish'}">🔁 ${esc(d.levels[r.level])}</button>
+            <button class="x" data-act="admin-del" data-uid="${r.user_id}">✕</button></div>`).join('')
+          || '<div class="empty">Пока никого.</div>'}
+      </div>
+      <button class="btn wide" style="margin-top:10px" data-act="admin-add">➕ Добавить админа</button>
+    </div>`,
+  };
+}
+
+/* --- графики --- */
+/*
+ * Рисуем сами, без библиотек: полмегабайта чужого кода ради шести картинок в
+ * мини-аппе не окупаются, а весь нужный график — это одна строка точек.
+ *
+ * Голая кривая без подписей — картинка «что-то росло»: непонятно ни сколько,
+ * ни когда. Поэтому у каждого графика есть сетка с числами, даты под осью и
+ * строка чтения: нажатие по графику показывает конкретные сутки с днём недели
+ * и числом. Наведение мышью на телефоне недоступно, поэтому именно нажатие.
+ */
+
+const chartMax = (vals) => Math.max(1, ...vals);
+const fmtNum = (n) => Number(n).toLocaleString('ru-RU');
+
+function plural(n, one, few, many) {
+  const t = Math.abs(n) % 100;
+  if (t >= 11 && t <= 14) return many;
+  const l = t % 10;
+  if (l === 1) return one;
+  if (l >= 2 && l <= 4) return few;
+  return many;
+}
+
+/* Поле графика: сверху место под подписи сетки, снизу — под даты. */
+const CW = 320, CH = 136, CPAD = 4, CTOP = 10, CBOT = 22;
+const CPLOT = CH - CTOP - CBOT;
+const cy = (v, max, top = CTOP, h = CPLOT) => (top + h * (1 - v / max)).toFixed(1);
+
+/* Три линии сетки. Числа подписываем у верхней и средней: у нуля и так ясно. */
+function chartGrid(max, top = CTOP, h = CPLOT) {
+  return [1, 0.5, 0].map((k) => {
+    const y = (top + h * (1 - k)).toFixed(1);
+    return `<line x1="0" y1="${y}" x2="${CW}" y2="${y}" stroke="var(--line)" stroke-width=".7"></line>`
+      + (k ? `<text x="1" y="${(Number(y) - 3).toFixed(1)}" font-size="8"
+           fill="var(--hint)">${fmtNum(Math.round(max * k))}</text>` : '');
+  }).join('');
+}
+
+/* Даты под осью: все, если дней мало, иначе пять штук через равные промежутки. */
+function chartDates(series) {
+  const n = series.length;
+  const step = n <= 8 ? 1 : Math.ceil(n / 5);
+  const idx = [];
+  for (let i = 0; i < n; i += step) idx.push(i);
+  if (idx[idx.length - 1] !== n - 1) idx.push(n - 1);
+  const slot = (CW - CPAD * 2) / n;
+  return idx.map((i) => {
+    const x = CPAD + slot * (i + 0.5);
+    const anchor = i === 0 ? 'start' : (i === n - 1 ? 'end' : 'middle');
+    const label = n <= 8 ? `${series[i].dow} ${series[i].date}` : series[i].date;
+    return `<text x="${x.toFixed(1)}" y="${CH - 7}" font-size="8" fill="var(--hint)"
+      text-anchor="${anchor}">${esc(label)}</text>`;
+  }).join('');
+}
+
+/* Выходные подсвечиваем: половина провалов в чатах — это суббота с воскресеньем. */
+function chartWeekends(series) {
+  const n = series.length;
+  if (n > 45) return '';            // на 90 днях полоски сливаются в кашу
+  const slot = (CW - CPAD * 2) / n;
+  return series.map((r, i) => (r.weekend
+    ? `<rect x="${(CPAD + i * slot).toFixed(1)}" y="${CTOP}" width="${slot.toFixed(1)}"
+        height="${CPLOT}" fill="var(--hint)" opacity=".08"></rect>`
+    : '')).join('');
+}
+
+const chartCursor = (extra = '') => `<line class="cursor" x1="0" y1="${CTOP}" x2="0"
+    y2="${CTOP + CPLOT}" stroke="var(--text)" stroke-width="1" opacity=".35"
+    style="display:none"></line>${extra}`;
+
+/* Линия с заливкой: сообщения по суткам. Пунктир — среднее за период. */
+function lineChart(series) {
+  const vals = series.map((r) => r.msgs);
+  const max = chartMax(vals);
+  const n = vals.length;
+  const slot = (CW - CPAD * 2) / n;
+  const x = (i) => (CPAD + slot * (i + 0.5)).toFixed(1);
+  const line = vals.map((v, i) => `${x(i)},${cy(v, max)}`).join(' ');
+  const avg = vals.reduce((a, b) => a + b, 0) / n;
+  return `<svg class="chart" viewBox="0 0 ${CW} ${CH}" data-kind="msgs" data-n="${n}" role="img">
+    ${chartWeekends(series)}
+    ${chartGrid(max)}
+    <polygon points="${x(0)},${CTOP + CPLOT} ${line} ${x(n - 1)},${CTOP + CPLOT}"
+      fill="var(--accent)" opacity=".16"></polygon>
+    <polyline points="${line}" fill="none" stroke="var(--accent)" stroke-width="2"
+      stroke-linejoin="round" stroke-linecap="round"></polyline>
+    <line x1="0" y1="${cy(avg, max)}" x2="${CW}" y2="${cy(avg, max)}" stroke="var(--accent)"
+      stroke-width="1" stroke-dasharray="3 3" opacity=".6"></line>
+    ${chartCursor('<circle class="dot" r="3.2" fill="var(--accent)" stroke="var(--bg)" stroke-width="1.2" style="display:none"></circle>')}
+    ${chartDates(series)}
+  </svg>`;
+}
+
+/* Парные столбики: вверх пришли, вниз ушли — так виден размен, а не два ряда. */
+function joinsChart(series) {
+  const joins = series.map((r) => r.joins);
+  const leaves = series.map((r) => r.leaves);
+  const max = chartMax([...joins, ...leaves]);
+  const n = series.length;
+  const mid = CTOP + CPLOT / 2;
+  const half = CPLOT / 2;
+  const slot = (CW - CPAD * 2) / n;
+  const w = Math.max(1.2, slot * 0.62);
+  const bar = (v, i, up) => {
+    const h = (half * (v / max)).toFixed(1);
+    if (!Number(h)) return '';
+    const bx = (CPAD + i * slot + (slot - w) / 2).toFixed(1);
+    return `<rect x="${bx}" y="${up ? (mid - h).toFixed(1) : mid}" width="${w.toFixed(1)}"
+      height="${h}" rx="${Math.min(1.5, w / 2).toFixed(1)}"
+      fill="var(--${up ? 'ok' : 'danger'})"></rect>`;
+  };
+  return `<svg class="chart" viewBox="0 0 ${CW} ${CH}" data-kind="flow" data-n="${n}" role="img">
+    ${chartWeekends(series)}
+    <text x="1" y="${(CTOP + 7).toFixed(1)}" font-size="8" fill="var(--hint)">${fmtNum(max)}</text>
+    <text x="1" y="${(mid + half - 1).toFixed(1)}" font-size="8" fill="var(--hint)">${fmtNum(max)}</text>
+    ${joins.map((v, i) => bar(v, i, true)).join('')}
+    ${leaves.map((v, i) => bar(v, i, false)).join('')}
+    <line x1="0" y1="${mid}" x2="${CW}" y2="${mid}" stroke="var(--line)" stroke-width="1"></line>
+    ${chartCursor()}
+    ${chartDates(series)}
+  </svg>`;
+}
+
+/* Сутки по часам: когда бот чаще всего наказывает. */
+function hoursChart(vals) {
+  const max = chartMax(vals);
+  const slot = (CW - CPAD * 2) / 24;
+  const w = slot * 0.66;
+  return `<svg class="chart" viewBox="0 0 ${CW} ${CH}" data-kind="hours" data-n="24" role="img">
+    ${chartGrid(max)}
+    ${vals.map((v, h) => {
+      const bh = (CPLOT * (v / max)).toFixed(1);
+      const bx = (CPAD + h * slot + (slot - w) / 2).toFixed(1);
+      return `<rect x="${bx}" y="${cy(v, max)}" width="${w.toFixed(1)}" height="${bh}"
+        rx="1.5" fill="var(--accent)" opacity="${v ? 1 : 0.22}"></rect>`;
+    }).join('')}
+    ${chartCursor()}
+    ${[0, 3, 6, 9, 12, 15, 18, 21].map((h) => `<text x="${(CPAD + slot * (h + 0.5)).toFixed(1)}"
+      y="${CH - 7}" font-size="8" fill="var(--hint)" text-anchor="middle">${h}</text>`).join('')}
+  </svg>`;
+}
+
+/* Список с полосками: типы наказаний, правила, прощения. */
+function barList(items) {
+  if (!items.length) return '<div class="empty">Пока пусто.</div>';
+  const max = chartMax(items.map((i) => i.count));
+  const total = items.reduce((a, b) => a + b.count, 0);
+  return items.map((i) => `<div class="bar-row">
+    <div class="bar-name">${esc(i.label)}</div>
+    <div class="bar-track"><div class="bar-fill" style="width:${Math.round(i.count / max * 100)}%"></div></div>
+    <div class="bar-num">${i.count}<small>${Math.round(i.count / total * 100)}%</small></div>
+  </div>`).join('');
+}
+
+function chartCard(title, hint, body, read, note) {
+  return `<div class="card">
+    <h2>${esc(title)}</h2>
+    <div class="intro">${esc(hint)}</div>
+    ${body}
+    ${read === null ? '' : `<div class="chart-read" data-read="${esc(read.kind)}">${esc(read.text)}</div>`}
+    ${note ? `<div class="chart-note">${esc(note)}</div>` : ''}
+  </div>`;
+}
+
+/* Последние загруженные ряды: по ним строится подпись при нажатии. */
+let CHART_SEEN = null;
+
+const dayRead = (r) => `${r.date}, ${r.dow} — ${fmtNum(r.msgs)} `
+  + plural(r.msgs, 'сообщение', 'сообщения', 'сообщений');
+const flowRead = (r) => `${r.date}, ${r.dow} — пришло ${r.joins}, ушло ${r.leaves}`;
+const hourRead = (h, v) => `${String(h).padStart(2, '0')}:00 — ${v} `
+  + plural(v, 'наказание', 'наказания', 'наказаний');
+
+/* Нажатие по графику: показать точные сутки (или час) под картинкой. */
+function chartPick(svg, clientX) {
+  if (!CHART_SEEN) return;
+  const kind = svg.dataset.kind;
+  const n = Number(svg.dataset.n);
+  const box = svg.getBoundingClientRect();
+  const rel = Math.min(0.999, Math.max(0, (clientX - box.left) / box.width));
+  // столбик занимает свою долю ширины, поэтому берём номер доли, а не ближайшую точку
+  const i = Math.min(n - 1, Math.floor(rel * n));
+  const read = document.querySelector(`.chart-read[data-read="${kind}"]`);
+  if (kind === 'hours') {
+    if (read) read.textContent = hourRead(i, CHART_SEEN.hours[i]);
+  } else {
+    const row = CHART_SEEN.series[i];
+    if (!row) return;
+    if (read) read.textContent = kind === 'msgs' ? dayRead(row) : flowRead(row);
+  }
+  const slot = (CW - CPAD * 2) / n;
+  const x = CPAD + slot * (i + 0.5);
+  const cursor = svg.querySelector('.cursor');
+  if (cursor) {
+    cursor.setAttribute('x1', x);
+    cursor.setAttribute('x2', x);
+    cursor.style.display = '';
+  }
+  const dot = svg.querySelector('.dot');
+  if (dot && kind === 'msgs') {
+    const max = chartMax(CHART_SEEN.series.map((r) => r.msgs));
+    dot.setAttribute('cx', x);
+    dot.setAttribute('cy', cy(CHART_SEEN.series[i].msgs, max));
+    dot.style.display = '';
+  }
+}
+
+function chartTouch(e) {
+  const svg = e.target.closest && e.target.closest('svg.chart[data-kind]');
+  if (!svg) return;
+  if (e.type === 'pointermove' && !e.buttons) return;
+  chartPick(svg, e.clientX);
+}
+
+document.addEventListener('pointerdown', chartTouch);
+document.addEventListener('pointermove', chartTouch);
+
+/* Рост или спад к прошлому такому же периоду. Пусто — сравнивать не с чем.
+ *
+ * tone = 'plain' для того, где рост не хорош и не плох: наказаний стало
+ * меньше — это может быть и спокойный месяц, и выключенный фильтр, красить
+ * такое в зелёное или красное значит врать. */
+function trendTag(now, before, tone = 'auto') {
+  if (!before) return '';
+  const diff = Math.round((now - before) / before * 100);
+  if (Math.abs(diff) < 3) return ' <span class="muted">без перемен</span>';
+  const sign = diff > 0 ? '+' : '';
+  const cls = tone === 'plain' ? 'muted' : `trend ${diff > 0 ? 'up' : 'down'}`;
+  return ` <span class="${cls}">${sign}${diff}%</span>`;
+}
+
+/* Итоги периода.
+ *
+ * Голые суммы ни о чём не говорят: «28 наказаний» — это много или мало,
+ * понятно только рядом с прошлым таким же отрезком. Поэтому каждая строка —
+ * число и сравнение, а не набор любопытных фактов вроде «самых тихих суток».
+ */
+function chartTotals(d) {
+  const t = d.totals;
+  const p = d.prev || {};
+  const net = t.joins - t.leaves;
+  const netWas = (p.joins || 0) - (p.leaves || 0);
+  const rows = [
+    ['💬 Сообщений', `${fmtNum(t.msgs)}${trendTag(t.msgs, p.msgs)}`,
+      `было ${fmtNum(p.msgs || 0)}`],
+    ['👥 Людей в чате', `${net > 0 ? '+' : ''}${net}`,
+      `пришло ${t.joins} · ушло ${t.leaves} · было ${netWas > 0 ? '+' : ''}${netWas}`],
+    ['🔨 Наказаний', `${t.punished}${trendTag(t.punished, p.punished, 'plain')}`,
+      `ботом ${t.punished - t.manual} · вручную ${t.manual}`],
+  ];
+  if (t.punished) {
+    // прощение — это признанная ошибка фильтра: доля важнее самого числа
+    rows.push(['🕊 Снято как ошибка', `${t.forgiven}`,
+      `${Math.round(t.forgiven / t.punished * 100)}% наказаний`]);
+  }
+  return `<div class="card">
+    <h2>📊 Итоги за период</h2>
+    <div class="intro">Рядом — тот же по длине отрезок до него.</div>
+    ${rows.map(([k, v, sub]) => `<div class="row"><div class="label">${esc(k)}
+      <small>${esc(sub)}</small></div>
+      <div class="value">${v}</div></div>`).join('')}
+  </div>`;
+}
+
+async function chartsView(cid) {
+  const d = await api(`/chat/${cid}/charts?days=${CHART_DAYS}`);
+  CHART_DAYS = d.days;
+  CHART_SEEN = d;
+  const t = d.totals;
+  const last = d.series[d.series.length - 1];
+  const span = d.series.length ? `${d.series[0].date} — ${last.date}` : '';
+  const quiet = !t.msgs && !t.joins && !t.leaves && !t.punished;
+  const hotHour = d.hours.indexOf(Math.max(...d.hours));   // для подписи под часами
+
+  return {
+    title: 'Графики',
+    back: `#/chat/${cid}/stats`,
+    html: `
+      <div class="card">
+        <div class="wrap">
+          ${d.ranges.map((r) => `<button class="chip ${r === d.days ? 'on' : 'off'}"
+            data-act="chart-days" data-days="${r}">${r} дней</button>`).join('')}
+        </div>
+        <div class="chart-note" style="margin-top:8px">${esc(span)} · нажмите на график,
+          чтобы увидеть точное число за день</div>
+      </div>
+      ${quiet ? '<div class="card"><div class="empty">За этот период бот ничего не записал.</div></div>' : `
+      ${chartTotals(d)}
+      ${chartCard('💬 Сообщения по дням',
+        'Столько сообщений бот видел в чате каждые сутки. Пунктир — среднее, серым — выходные.',
+        lineChart(d.series), { kind: 'msgs', text: dayRead(last) },
+        `всего ${fmtNum(t.msgs)} · в среднем ${fmtNum(Math.round(t.msgs / d.series.length))} в сутки`)}
+      ${chartCard('👥 Пришли и ушли',
+        'Вверх — вступившие, вниз — вышедшие. Резкий всплеск вверх обычно и есть набег.',
+        joinsChart(d.series), { kind: 'flow', text: flowRead(last) },
+        `пришло ${t.joins} · ушло ${t.leaves}`)}
+      ${chartCard('🔨 Наказания по типам',
+        'Чего в чате больше: мутов или банов.',
+        barList(d.kinds), null, `всего ${t.punished}`)}
+      ${chartCard('📏 За какие правила',
+        'Какое правило работает чаще всех. «Вручную» — наказания админов, «прочее» — капча, варны, набеги и жалобы.',
+        barList(d.rules), null)}
+      ${chartCard('🕊 Прощения по правилам',
+        'Где бот ошибается: если у правила много прощений, его стоит смягчить.',
+        barList(d.forgiven), null, `всего ${t.forgiven}`)}
+      ${chartCard('🕒 Когда наказывают',
+        'Часы суток по местному времени. Видно, когда в чате спокойно, а когда нужен живой админ.',
+        hoursChart(d.hours), { kind: 'hours', text: hourRead(hotHour, d.hours[hotHour]) })}
+      `}`,
+  };
+}
+
 async function linkwlView(cid) {
   const d = await api(`/chat/${cid}/linkwl`);
   return {
@@ -1103,20 +1454,39 @@ async function copyView(cid) {
 
 async function statsView(cid) {
   const d = await api(`/chat/${cid}/stats`);
+  const share = (n) => (d.d7 ? ` <small>${Math.round(n / d.d7 * 100)}%</small>` : '');
+
   return {
     title: 'Статистика',
     back: `#/chat/${cid}`,
     html: `<div class="card">
       <div class="row"><div class="label">💬 Сообщений</div>
-        <div class="value">сегодня ${d.d1} · 7д ${d.d7} · всего ${d.total}</div></div>
+        <div class="value">сегодня ${fmtNum(d.d1)} · вчера ${fmtNum(d.y1)}</div></div>
+      <div class="row"><div class="label">📆 За 7 дней</div>
+        <div class="value">${fmtNum(d.d7)}${trendTag(d.d7, d.p7)}</div></div>
+      <div class="row"><div class="label">📆 За 30 дней</div>
+        <div class="value">${fmtNum(d.d30)}</div></div>
+      <div class="row"><div class="label">Σ Всего</div>
+        <div class="value">${fmtNum(d.total)}</div></div>
+      <div class="row"><div class="label">🗣 Писали за 7 дней</div>
+        <div class="value">${fmtNum(d.people7)}</div></div>
       <div class="row"><div class="label">👥 За 7 дней</div>
         <div class="value">пришло ${d.joins} · ушло ${d.leaves}</div></div>
-      <div class="row"><div class="label">🔨 Наказаний за 7д</div><div class="value">${d.pun7}</div></div>
+      <div class="row"><div class="label">🔨 Наказаний</div>
+        <div class="value">7д ${d.pun7} · 30д ${d.pun30}</div></div>
+      ${d.since_date ? `<div class="row"><div class="label">📅 Считаем с</div>
+        <div class="value">${esc(d.since_date)}</div></div>` : ''}
+    </div>
+    <div class="card">
+      <div class="tiles">${tile(`#/chat/${cid}/charts`, '📊 Графики',
+        { sub: 'за 7, 30 или 90 дней' })}</div>
     </div>
     <div class="card">
       <h2>🏆 Топ за неделю</h2>
+      <div class="intro">Доля — сколько от всех сообщений недели написал человек.</div>
       ${d.top.map((t, i) => `<div class="item"><div class="body">${i + 1}. ${esc(t.who)}</div>
-        <div class="value">${t.count}</div></div>`).join('') || '<div class="empty">Пока пусто.</div>'}
+        <div class="value">${fmtNum(t.count)}${share(t.count)}</div></div>`).join('')
+        || '<div class="empty">Пока пусто.</div>'}
     </div>`,
   };
 }
@@ -1384,6 +1754,8 @@ const ROUTES = [
   [/^chat\/(-?\d+)\/profwords$/, profWordsView],
   [/^chat\/(-?\d+)\/wl\/(\d+)$/, wlEntryView],
   [/^chat\/(-?\d+)\/linkwl$/, linkwlView],
+  [/^chat\/(-?\d+)\/admins$/, adminsView],
+  [/^chat\/(-?\d+)\/charts$/, chartsView],
   [/^chat\/(-?\d+)\/trigs$/, trigsView],
   [/^chat\/(-?\d+)\/trig\/(\d+)$/, trigView],
   [/^chat\/(-?\d+)\/cmds$/, cmdsView],
@@ -1413,13 +1785,17 @@ const SEEN = new Set();   // какие страницы уже открывал
 
 /* Заготовки на время загрузки.
  *
- * Угадывать их размер бессмысленно: у каждой страницы своё число строк и
- * плиток, и оно меняется. Поэтому после отрисовки меряем настоящие карточки и
+ * Форму страницы не угадываем: после отрисовки меряем настоящие карточки и
  * запоминаем их высоты — в следующий раз заготовка повторит страницу один в
- * один, вместе с отступами между карточками.
+ * один, вместе с отступами. Ключ помнит ширину окна: на узком экране плитки
+ * встают в столбец, и высоты другие. Храним надолго, а не до конца сессии:
+ * панель закрывают и открывают заново десятки раз в день.
  *
- * Ключ помнит ширину окна: на узком экране плитки встают в один столбец, и
- * высоты другие. Храним в сессии браузера, чтобы пережить перезагрузку. */
+ * Пока страницу ни разу не открывали, собираем прикидку из тех же элементов,
+ * что и настоящая страница: строка сведений, пилюля, плитка, элемент списка.
+ * Так совпадают и высоты, и отступы, и заготовка не подрастает при подмене. */
+let CHART_DAYS = 30;
+
 const SHAPES = {};
 
 const shapeKey = (path) => `gremlin:shape:${Math.round(window.innerWidth / 40)}:${path}`;
@@ -1428,39 +1804,59 @@ function rememberShape(path) {
   const cards = [...$app.children].map((el) => Math.round(el.getBoundingClientRect().height));
   if (!cards.length || cards.some((h) => !h)) return;
   SHAPES[path] = cards;
-  try { sessionStorage.setItem(shapeKey(path), JSON.stringify(cards)); } catch (e) { /* приватный режим */ }
+  try { localStorage.setItem(shapeKey(path), JSON.stringify(cards)); } catch (e) { /* приватный режим */ }
 }
 
 function knownShape(path) {
   if (SHAPES[path]) return SHAPES[path];
   try {
-    const raw = sessionStorage.getItem(shapeKey(path));
+    const raw = localStorage.getItem(shapeKey(path));
     if (raw) { SHAPES[path] = JSON.parse(raw); return SHAPES[path]; }
   } catch (e) { /* приватный режим */ }
   return null;
 }
 
-/* Пока страницу ни разу не открывали, размеры взять негде — показываем
-   прикидку по типу страницы из настоящих блоков: строка, плитка, элемент. */
-const skelRows = (n) => '<div class="card skel"><div class="ln head"></div>'
-  + '<div class="skel-row"></div>'.repeat(n) + '</div>';
-const skelTiles = (n) => '<div class="card skel"><div class="ln head"></div>'
-  + '<div class="tiles">' + '<div class="skel-tile"></div>'.repeat(n)
-  + '</div></div>';
-const skelItems = (n) => '<div class="card skel"><div class="ln head"></div>'
-  + '<div class="skel-item"></div>'.repeat(n) + '</div>';
+const skelCard = (inner) => `<div class="card skel">${inner}</div>`;
+const skelHead = '<div class="ln head"></div>';
+const skelLine = (w) => `<div class="ln" style="width:${w}%"></div>`;
+const skelRows = (n) => ('<div class="row"><div class="label">'
+  + '<div class="ln" style="width:55%"></div></div></div>').repeat(n);
+const skelItems = (n) => ('<div class="item"><div class="body">'
+  + '<div class="ln" style="width:45%"></div>'
+  + '<div class="ln" style="width:75%"></div></div></div>').repeat(n);
+const skelTiles = (n) => '<div class="tiles" style="margin-top:10px">'
+  + '<div class="skel-tile"></div>'.repeat(n) + '</div>';
+// пилюли разной ширины: ряд одинаковых читается как таблица, а не как чипы
+const skelChips = (n) => '<div class="wrap" style="margin-top:10px">'
+  + Array.from({ length: n }, (_, i) => `<span class="skel-chip" style="width:${72 + (i % 4) * 26}px"></span>`).join('')
+  + '</div>';
 
 function skeletonFor(path) {
   const shape = knownShape(path);
   if (shape) {
     return shape.map((h) => `<div class="card skel" style="height:${h}px"></div>`).join('');
   }
-  if (path === '') return skelTiles(4) + skelTiles(6);
-  if (/^chat\/-?\d+$/.test(path)) return skelRows(5) + skelTiles(6) + skelTiles(4);
-  if (/^chat\/-?\d+\/s\//.test(path)) return skelRows(4) + skelRows(2);
-  const lists = /^(chat\/-?\d+\/(active|events|trigs|cmds|words|profwords|warned|answers|linkwl)|access|seed|admin\/log)/;
-  if (lists.test(path)) return skelItems(6);
-  return skelRows(3);
+  if (path === '') return skelCard(skelHead + skelTiles(4)) + skelCard(skelHead + skelTiles(6));
+  if (/^chat\/-?\d+$/.test(path)) {
+    // карточка чата: название, id, владелец, строки сведений и ряд пилюль
+    return skelCard(skelHead + skelLine(30) + skelLine(42) + skelRows(4) + skelChips(13))
+      + skelCard(skelHead + skelLine(65) + skelTiles(6))
+      + skelCard(skelHead + skelLine(65) + skelTiles(4));
+  }
+  if (/^chat\/-?\d+\/charts$/.test(path)) {
+    // страница графиков: полоска периодов, потом карточки с картинками и полосками
+    const chart = skelCard(skelHead + skelLine(88) + '<div class="skel-chart"></div>' + skelLine(35));
+    const bars = skelCard(skelHead + skelLine(70) + skelRows(3));
+    return skelCard(skelChips(3) + skelLine(30)) + chart + chart + bars + bars + bars + chart;
+  }
+  if (/^chat\/-?\d+\/s\//.test(path)) {
+    // раздел: пояснение в несколько строк, потом переключатели
+    return skelCard(skelHead + skelLine(95) + skelLine(88) + skelLine(60) + skelRows(4))
+      + skelCard(skelHead + skelRows(2));
+  }
+  const lists = /^(chat\/-?\d+\/(active|events|trigs|cmds|words|profwords|warned|answers|linkwl)|admins|access|seed|admin\/log)/;
+  if (lists.test(path)) return skelCard(skelHead + skelItems(6));
+  return skelCard(skelHead + skelRows(3));
 }
 
 async function render() {
@@ -1684,6 +2080,34 @@ const ACT = {
     if (!await confirmAsk('Убрать из вайтлиста?')) return;
     await api(`/chat/${curChat()}/wl/${el.dataset.row}`, { method: 'DELETE' });
     go(`#/chat/${curChat()}/s/wl`);
+  },
+
+  'chart-days'(el) {
+    CHART_DAYS = Number(el.dataset.days);
+    render();
+  },
+
+  async 'admin-add'() {
+    const v = await ask({
+      title: 'Пустить в бот',
+      hint: 'id или @username. Человек должен быть админом чата.',
+    });
+    if (!v) return;
+    toast((await api(`/chat/${curChat()}/admins`, { json: { target: v } })).note);
+    render();
+  },
+
+  async 'admin-level'(el) {
+    await api(`/chat/${curChat()}/admins`, {
+      json: { user_id: Number(el.dataset.uid), level: el.dataset.level },
+    });
+    render();
+  },
+
+  async 'admin-del'(el) {
+    if (!await confirmAsk('Убрать доступ?')) return;
+    await api(`/chat/${curChat()}/admins/${el.dataset.uid}`, { method: 'DELETE' });
+    render();
   },
 
   async 'linkwl-add'() {

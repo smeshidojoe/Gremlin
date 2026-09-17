@@ -87,9 +87,54 @@ async def test_card_button(chat):
     cb.bot = SpamBot()
     await cards.card_spam_profile(cb, cb.bot)
     assert "записан в базу спама" in msg.text
-    assert buttons(msg.reply_markup) == ["k:lift:5"]
+    # «Спам-профиль» ушёл, на его месте — отмена
+    assert buttons(msg.reply_markup) == ["k:lift:5", f"k:spu:{chat}:{U}"]
     assert cb.alerts == ["Записан"]
     assert len(await faces(chat)) == 1
+
+    # передумали — запись уходит из базы, кнопка «Спам-профиль» возвращается
+    undo = CB(f"k:spu:{chat}:{U}", message=msg)
+    await cards.card_spam_profile_undo(undo, SpamBot())
+    assert "убран из базы спама" in msg.text
+    assert buttons(msg.reply_markup) == ["k:lift:5", f"k:sp:{chat}:{U}"]
+    assert undo.alerts == ["Убран"]
+    assert await faces(chat) == []
+
+
+async def test_undo_keeps_other_people_and_ok_marks(chat):
+    await nn.remember_face(chat, U, "спамер", "spam")
+    await nn.remember_face(chat, U + 1, "другой спамер", "spam")
+    await nn.remember_face(chat, U, "не трогать", "ok")   # отметка «не трогать»
+    assert await db.spam_profile_forget(chat, U) == 1
+    assert sorted(await faces(chat)) == [("ok", "не трогать"), ("spam", "другой спамер")]
+
+
+async def test_spam_profiles_list_and_delete(chat):
+    await nn.remember_face(chat, U, "Анна 18+ @anna_dm", "spam")
+    await nn.remember_face(chat, U + 1, "Кристина пиши в лс", "spam")
+    rows = await db.spam_profiles(chat)
+    assert [r["text"] for r in rows] == ["Кристина пиши в лс", "Анна 18+ @anna_dm"]
+
+    text, kb = await um.view_spam_profiles(chat)
+    assert "Всего: <b>2</b>" in text and "Анна 18+" in text
+    first = rows[0]["id"]
+    assert f"u:pfd:{chat}:{first}:0" in buttons(kb)
+
+    msg = Sent(text)
+    cb = CB(f"u:pfd:{chat}:{first}:0", uid=OWNER, message=msg)
+    await um.cb_spam_profile_del(cb)
+    assert cb.alerts == ["Убран"]
+    assert [r["text"] for r in await db.spam_profiles(chat)] == ["Анна 18+ @anna_dm"]
+    assert "Всего: <b>1</b>" in msg.text
+
+    # чужой чат удалить не даёт: запись ищется в пределах своего чата
+    assert await db.spam_profile_delete(chat - 1, rows[1]["id"]) is None
+
+
+async def test_watch_page_links_to_the_list(chat):
+    await nn.remember_face(chat, U, "спамер", "spam")
+    _text, kb = await um.view_section(chat, "watch")
+    assert f"u:pf:{chat}:0" in buttons(kb)
 
 
 async def test_status_card_button(chat):

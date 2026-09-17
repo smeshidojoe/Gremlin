@@ -314,14 +314,10 @@ async def wipe_recent(bot: Bot, chat_id: int, user_id: int, keep: int) -> int:
         return 0
     ids = list(dq)[-keep:]
     forget_messages(chat_id, user_id)
-    gone = 0
-    for mid in ids:
-        try:
-            await bot.delete_message(chat_id, mid)
-            gone += 1
-        except Exception:
-            # уже удалено модерацией, или старше 48 часов — обычное дело
-            pass
+    # одним запросом: уборка идёт сразу за баном, часто во время набега, когда
+    # запросов к Telegram и так больше всего
+    from . import deleting
+    gone = await deleting.many(bot, chat_id, ids)
     if gone:
         logger.info("уборка за баном в %s: удалено %d из %d", chat_id, gone, len(ids))
     return gone
@@ -930,10 +926,8 @@ async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
         state["count"] += 1
         if not state["caption"]:
             state["caption"] = message.caption or message.text or ""
-        try:
-            await message.delete()
-        except Exception:
-            logger.warning("delete failed in %s", chat.id, exc_info=True)
+        from . import deleting
+        await deleting.one(message.delete, chat.id)
         return
 
     body = message_body(message)      # текст берём до удаления
@@ -941,10 +935,8 @@ async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
         _album_sweep(time.time())
         _ALBUMS[key] = {"count": 1, "caption": message.caption or message.text or "",
                         "ts": time.time()}
-    try:
-        await message.delete()
-    except Exception:
-        logger.warning("delete failed in %s", chat.id, exc_info=True)
+    from . import deleting
+    await deleting.one(message.delete, chat.id)
 
     reason = f"{feature_label}: {detail}" if detail else feature_label
     pid = await apply_punishment(bot, chat.id, user, punish_kind, mute_min, reason, None)

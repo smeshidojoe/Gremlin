@@ -47,6 +47,7 @@ class Input(StatesGroup):
     prof_words = State()        # ждём слова для списка профилей
     status = State()            # ждём id/@username/пересылку для проверки статуса
     chat_admin = State()        # ждём id/@username админа чата для доступа к боту
+    import_file = State()       # ждём zip с выгрузкой настроек
 
 
 _HOME_TEXT = "<b>🧌 Gremlin</b>\n\nМодерация и мониторинг чатов."
@@ -222,28 +223,62 @@ async def view_copy_from(cid: int, viewer_id: int) -> tuple[str, InlineKeyboardM
     вытащить чужие стоп-слова, вайтлист и триггеры."""
     others = [c for c in await db.chats_for(viewer_id) if c["chat_id"] != cid]
     b = InlineKeyboardBuilder()
-    text = "<b>📥 Откуда перенести</b>\n\nВыберите чат — его настройки скопируются сюда."
+    text = ("<b>📥 Откуда перенести</b>\n\nВыберите чат — его настройки скопируются сюда.\n\n"
+            "Или файлом: «Выгрузить» пришлёт архив со всеми настройками этого чата, "
+            "списками и медиа триггеров. Его можно хранить как резервную копию или "
+            "загрузить в другой чат — даже в другого бота Гремлина.")
     if not others:
-        text = "<b>📥 Откуда перенести</b>\n\nПока неоткуда: других чатов у бота нет."
+        text = ("<b>📥 Откуда перенести</b>\n\nДругих чатов у бота нет, но настройки "
+                "можно выгрузить файлом и загрузить обратно.")
+    b.row(_btn("📤 Выгрузить в файл", f"u:exp:{cid}"),
+          _btn("📥 Загрузить из файла", f"u:imp:{cid}"))
     for c in others:
         b.row(_btn(c["title"] or str(c["chat_id"]), f"u:cps:{cid}:{c['chat_id']}"))
     b.row(_btn("⬅️ Назад", f"u:c:{cid}"))
     return text, b.as_markup()
 
 
-async def view_copy_pick(cid: int, src: int, picked: set[str]) -> tuple[str, InlineKeyboardMarkup]:
-    """Галочки: какие разделы переносим."""
+FROM_FILE = 0     # «источник» в callback, когда настройки едут из файла
+
+
+def _copy_scope(user_id: int, cid: int, src: int) -> tuple[str, ...] | None:
+    """Какие разделы можно отметить. None — загруженный файл уже забыт."""
     from ..services import transfer
-    ch = await db.get_chat(src)
-    text = (
-        f"<b>📥 Перенос из «{utils.esc(ch['title'] if ch else str(src))}»</b>\n\n"
-        "Отметьте, что перенести. Вместе с настройками едут и списки раздела: "
-        "стоп-слова, вайтлист, разрешённые чаты и боты, триггеры с медиа, счётчики.\n"
-        f"Выбрано: <b>{len(picked)}</b> из {len(transfer.ALL_GROUPS)}"
-    )
+    if src != FROM_FILE:
+        return transfer.ALL_GROUPS
+    got = transfer.stashed(user_id, cid)
+    if got is None:
+        return None
+    return tuple(g for g in transfer.ALL_GROUPS if g in got[0]["groups"])
+
+
+async def view_copy_pick(cid: int, src: int, picked: set[str],
+                         user_id: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """Галочки: какие разделы переносим — из другого чата или из файла."""
+    from ..services import transfer
+    scope = _copy_scope(user_id, cid, src) or ()
+    if src == FROM_FILE:
+        snap = (transfer.stashed(user_id, cid) or ({},))[0]
+        inside = ", ".join(f"{k} {v}" for k, v in transfer.describe(snap).items())
+        title = snap.get("chat_title") or "файл"
+        text = (
+            f"<b>📥 Загрузка из выгрузки «{utils.esc(title)}»</b>\n\n"
+            "Отметьте, что загрузить. Настройки раздела заменятся, списки "
+            "дополнятся: что уже есть в чате, останется.\n"
+            + (f"В файле: {utils.esc(inside)}.\n" if inside else "")
+            + f"Выбрано: <b>{len(picked)}</b> из {len(scope)}"
+        )
+    else:
+        ch = await db.get_chat(src)
+        text = (
+            f"<b>📥 Перенос из «{utils.esc(ch['title'] if ch else str(src))}»</b>\n\n"
+            "Отметьте, что перенести. Вместе с настройками едут и списки раздела: "
+            "стоп-слова, вайтлист, разрешённые чаты и боты, триггеры с медиа, счётчики.\n"
+            f"Выбрано: <b>{len(picked)}</b> из {len(scope)}"
+        )
     b = InlineKeyboardBuilder()
     row = []
-    for key in transfer.ALL_GROUPS:
+    for key in scope:
         mark = "✅" if key in picked else "☐"
         row.append(_btn(f"{mark} {transfer.GROUPS[key][0]}", f"u:cpg:{cid}:{src}:{key}"))
         if len(row) == 2:
@@ -313,14 +348,18 @@ async def view_chat(cid: int, viewer_id: int,
             ("📣 Вход по подписке", f"u:s:{cid}:sub"),
             ("🎖 Доверие", f"u:s:{cid}:trust"),
             ("⚠️ Варны", f"u:s:{cid}:warns"),
+            ("🚨 Жалобы", f"u:s:{cid}:report"),
+            ("🛡 Набеги", f"u:s:{cid}:raid"),
+            ("⌨️ Команды чата", f"u:s:{cid}:modcmds"),
             ("🕊 Вайтлист", f"u:s:{cid}:wl"),
             ("👋 Приветствие", f"u:s:{cid}:welcome"),
             ("🎯 Триггеры", f"u:s:{cid}:triggers"),
             ("🔢 Счётчики", f"u:s:{cid}:cmds"),
             ("💱 Курс валют", f"u:s:{cid}:rates"),
             ("🎪 Приколы", f"u:games:{cid}"),
-            ("🖼 Медиа-фильтры", f"u:s:{cid}:media"),
         ]
+        if "media" not in schema.hidden_sections():
+            sections.append(("🖼 Медиа-фильтры", f"u:s:{cid}:media"))
         from ..services import digest as _dg
         if _dg.tracked_chat() == cid:      # подробная статистика — только этот чат
             sections.append(("📊 Недельная сводка", f"u:s:{cid}:digest"))
@@ -564,8 +603,9 @@ async def _render_widget(b: InlineKeyboardBuilder, cid: int, widget: str, s) -> 
         st = await db.samples_stats(cid)
         b.row(_btn(f"📊 Улик: {st['total']} · для сравнения: {st['profile']}",
                    f"u:s:{cid}:nn"))
-        b.row(_btn(f"⛔ Спам: {st['spam']} · 🕊 Норма: {st['ok']} · "
-                   f"✋ Ручные: {st['unknown']}", f"u:s:{cid}:nn"))
+        b.row(_btn(f"💬 Сообщения: ⛔ {st['spam']} · 🕊 {st['ok']} · "
+                   f"✋ {st['unknown']}", f"u:s:{cid}:nn"))
+        b.row(_btn(f"🧪 Профили спамеров: {st['faces_spam']}", f"u:pf:{cid}:0"))
         state = nn.status()
         b.row(_btn(f"🧠 Модель: {'загружена' if state == 'ok' else state}",
                    f"u:s:{cid}:nn"))
@@ -575,7 +615,7 @@ async def _render_widget(b: InlineKeyboardBuilder, cid: int, widget: str, s) -> 
         if st["profile"] < config.NN_MIN_SAMPLES:
             b.row(_btn(f"⏳ Для сравнения нужно хотя бы {config.NN_MIN_SAMPLES}",
                        f"u:s:{cid}:nn"))
-        b.row(_btn("🗂 Виды спама и разметка кучками", f"u:nnc:{cid}:unknown"))
+        b.row(_btn("🗂 Кучки похожих улик", f"u:nnc:{cid}:unknown"))
         b.row(_btn("🤔 Разметить спорное", f"u:nnd:{cid}"))
         hint = await nn.suggest_threshold(cid)
         if hint:
@@ -626,6 +666,8 @@ async def _render_widget(b: InlineKeyboardBuilder, cid: int, widget: str, s) -> 
                    f"u:s:{cid}:prof"))
         b.row(_btn(f"{'✅' if s.cas_on else '🚫'} 🌐 Общий список спамеров",
                    f"u:s:{cid}:cas"))
+        b.row(_btn(f"🧪 Спам-профили: {len(await db.spam_profiles(cid))}",
+                   f"u:pf:{cid}:0"))
 
     elif widget == "cas_stats":
         from ..services import cas as cas_svc
@@ -744,13 +786,20 @@ async def view_wl(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
 
 
 _CLUSTER_SCOPES = {
-    "unknown": ("✋ ручные наказания без оценки",
-                "Это наказания, выданные руками. Бот не знает, был там спам "
-                "или личные счёты, поэтому в сравнении они не участвуют. "
-                "Разметьте кучку — и все её улики разом станут обучающими."),
-    "profile": ("📊 уже размеченные улики",
-                "Так видно, какие виды спама ходят в чат. Если бот сложил "
-                "в кучку что-то безобидное, поправьте это одним нажатием."),
+    "unknown": ("✋ без оценки",
+                "Это сообщения, за которые наказали вручную. Бот не знает, был "
+                "там спам или личные счёты, поэтому в сравнении они не "
+                "участвуют.\n\n"
+                "Бот раскладывает их на кучки по смыслу текста. Кнопка "
+                "размечает в кучке только сообщения без оценки — уже "
+                "размеченные не меняются."),
+    "profile": ("📚 что знает бот",
+                "Всё, на чём бот уже учится: спам и обычные сообщения.\n\n"
+                "Кучки собраны по смыслу текста, а не по пометкам, поэтому "
+                "это скорее темы разговоров, чем виды спама: в одной кучке "
+                "лежат и реклама, и обычные сообщения. Оптом их не "
+                "разметить — «Разобрать» открывает кучку, и оценку можно "
+                "поправить у каждого сообщения отдельно."),
 }
 
 
@@ -767,7 +816,8 @@ def _cluster_state(g: dict) -> str:
         return "ни одна улика ещё не размечена"
     parts = []
     if spam:
-        parts.append(f"⛔ спамом — {spam}")
+        share = round(spam / max(1, g.get("size", spam + ok + unknown)) * 100)
+        parts.append(f"⛔ спамом — {spam} ({share}%)")
     if ok:
         parts.append(f"🕊 нормой — {ok}")
     if unknown:
@@ -780,7 +830,8 @@ async def view_clusters(cid: int, scope: str) -> tuple[str, InlineKeyboardMarkup
     ch = await db.get_chat(cid)
     title = utils.esc(ch["title"] if ch else str(cid))
     label, hint = _CLUSTER_SCOPES.get(scope, _CLUSTER_SCOPES["unknown"])
-    lines = [f"<b>🗂 Виды спама</b> · {title}\n", hint, f"\nПоказаны: {label}", ""]
+    lines = [f"<b>🗂 Кучки похожих улик</b> · {title}\n", hint,
+             f"\nПоказаны: {label}", ""]
 
     b = InlineKeyboardBuilder()
     groups = await nn.clusters(cid, scope)
@@ -796,8 +847,14 @@ async def view_clusters(cid: int, scope: str) -> tuple[str, InlineKeyboardMarkup
         lines.append(f"<b>{i + 1}.</b> {g['size']} шт · <i>{utils.esc(words)}</i>")
         lines.append(f"<blockquote>{sample}</blockquote>")
         lines.append(f"<i>{_cluster_state(g)}</i>")
-        b.row(_btn(f"{i + 1}. ⛔ спам ({g['size']})", f"u:nnl:{cid}:{i}:spam:{scope}"),
-              _btn(f"🕊 норма ({g['size']})", f"u:nnl:{cid}:{i}:ok:{scope}"))
+        if scope == "unknown":
+            if g["unknown"]:
+                b.row(_btn(f"{i + 1}. ⛔ спамом: {g['unknown']}",
+                           f"u:nnl:{cid}:{i}:spam:{scope}"),
+                      _btn(f"🕊 нормой: {g['unknown']}",
+                           f"u:nnl:{cid}:{i}:ok:{scope}"))
+        else:
+            b.row(_btn(f"{i + 1}. 🔍 Разобрать ({g['size']})", f"u:nni:{cid}:{i}:0"))
 
     other = "profile" if scope == "unknown" else "unknown"
     b.row(_btn(f"🔀 Показать {_CLUSTER_SCOPES[other][0]}", f"u:nnc:{cid}:{other}"))
@@ -828,9 +885,81 @@ async def cb_cluster_label(cb: CallbackQuery) -> None:
         await db.add_event(cid, "nn", f"кучка размечена как {label}: {moved} улик "
                                       f"by {cb.from_user.id}")
     await cb.answer(f"Размечено: {moved}" if moved
-                    else "Разбивка устарела, пересчитал", show_alert=False)
+                    else "Размечать нечего или разбивка устарела", show_alert=False)
     text, kb = await view_clusters(cid, scope)
     await cb.message.edit_text(text, reply_markup=kb)
+
+
+CLUSTER_PAGE = 5
+_LABEL_MARK = {"spam": "⛔", "ok": "🕊", "unknown": "✋"}
+
+
+async def view_cluster_items(cid: int, index: int,
+                             page: int = 0) -> tuple[str, InlineKeyboardMarkup] | None:
+    """Одна кучка по сообщению: оценку правят точечно, а не всей кучкой."""
+    ids = nn.cluster_ids(cid, index)
+    if ids is None:
+        return None
+    rows = await db.samples_by_ids(cid, ids)
+    pages = max(1, -(-len(rows) // CLUSTER_PAGE))
+    page = max(0, min(page, pages - 1))
+    chunk = rows[page * CLUSTER_PAGE:(page + 1) * CLUSTER_PAGE]
+    spam = sum(1 for r in rows if r["label"] == "spam")
+    lines = [
+        f"<b>🔍 Кучка {index + 1}</b> · {len(rows)} шт, спамом помечено {spam}\n",
+        "⛔ — спам, 🕊 — норма. Нажмите номер с другой пометкой, чтобы поправить.",
+        f"Страница {page + 1} из {pages}\n" if pages > 1 else "",
+    ]
+    b = InlineKeyboardBuilder()
+    start = page * CLUSTER_PAGE
+    for n, r in enumerate(chunk, start + 1):
+        text = utils.esc(utils.chunk(" ".join(r["text"].split()), 140))
+        lines.append(f"{n}. {_LABEL_MARK.get(r['label'], '?')} {text}")
+        b.row(_btn(f"{n}. ⛔ спам" + (" ✓" if r["label"] == "spam" else ""),
+                   f"u:nns:{cid}:{index}:{r['id']}:spam:{page}"),
+              _btn(f"🕊 норма" + (" ✓" if r["label"] == "ok" else ""),
+                   f"u:nns:{cid}:{index}:{r['id']}:ok:{page}"))
+    if pages > 1:
+        b.row(_btn("◀", f"u:nni:{cid}:{index}:{page - 1 if page else pages - 1}"),
+              _btn(f"{page + 1}/{pages}", f"u:nni:{cid}:{index}:{page}"),
+              _btn("▶", f"u:nni:{cid}:{index}:{page + 1 if page + 1 < pages else 0}"))
+    b.row(_btn("⬅️ К кучкам", f"u:nnc:{cid}:profile"))
+    return "\n".join(lines), b.as_markup()
+
+
+@router.callback_query(F.data.startswith("u:nni:"))
+async def cb_cluster_items(cb: CallbackQuery) -> None:
+    _, _, cid, index, page = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    view = await view_cluster_items(cid, int(index), int(page))
+    if view is None:
+        await cb.answer("Разбивка устарела, откройте кучки заново.", show_alert=True)
+        return
+    await cb.message.edit_text(view[0], reply_markup=view[1])
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:nns:"))
+async def cb_cluster_item_label(cb: CallbackQuery) -> None:
+    _, _, cid, index, sid, label, page = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid) or label not in ("spam", "ok"):
+        return
+    if await db.sample_set_label(cid, int(sid), label):
+        await db.add_event(cid, "nn", f"улика #{sid} размечена как {label} "
+                                      f"by {cb.from_user.id}")
+        # счётчики кучки берём из разбивки, поэтому сбрасываем только модель,
+        # а саму разбивку оставляем: иначе после каждой правки её пришлось бы
+        # пересчитывать и номера кучек уезжали бы
+        nn._profile.pop(cid, None)
+    view = await view_cluster_items(cid, int(index), int(page))
+    if view is None:
+        await cb.answer("Разбивка устарела, откройте кучки заново.", show_alert=True)
+        return
+    await cb.message.edit_text(view[0], reply_markup=view[1])
+    await cb.answer("Поправлено")
 
 
 async def _show_wl(cb: CallbackQuery, cid: int, page: int) -> None:
@@ -1864,19 +1993,84 @@ async def view_punishments(cid: int, page: int = 0,
         lines.append("Все чисты.")
     lines.append("\nМассовые действия принимают список id или @username одним сообщением.")
 
+    # сверху короткое действие, ниже длинные списки: так же, как в панели
     b = InlineKeyboardBuilder()
+    b.row(_btn("🔎 Проверка статуса", f"u:ps:{cid}"))
+    b.row(_btn("🔓 Массовый разбан", f"u:mub:{cid}"),
+          _btn("👢 Массовый кик", f"u:mkick:{cid}"))
+    b.row(_btn("⛔ Массовый бан", f"u:mban:{cid}"))
     b.row(_btn(f"📋 Активные: {len(rows)}", f"u:pa:{cid}:0"))
     forgiven = await db.forgiven_count(cid)
     if forgiven:
         b.row(_btn(f"🕊 Прощённые: {forgiven}", f"u:fg:{cid}:0"))
-    b.row(_btn("🔓 Массовый разбан", f"u:mub:{cid}"),
-          _btn("👢 Массовый кик", f"u:mkick:{cid}"))
-    b.row(_btn("⛔ Массовый бан", f"u:mban:{cid}"))
-    b.row(_btn("🔎 Проверка статуса", f"u:ps:{cid}"))
     if full:                      # админу «наказаний» настройки не открыты
         b.row(_btn("⚙️ Настройки", f"u:s:{cid}:punish_cfg"))
     b.row(_btn("⬅️ Назад", f"u:c:{cid}"))
     return "\n".join(lines), b.as_markup()
+
+
+async def view_spam_profiles(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """База спам-профилей: что записано и кнопка убрать."""
+    rows = await db.spam_profiles(cid)
+    chunk, page, pages = _page_slice(rows, page)
+    lines = [
+        "<b>🧪 Спам-профили</b>\n",
+        "С этими профилями бот сравнивает новых людей, когда включено "
+        "«Сравнивать профили с забаненными». Сюда попадают профили, записанные "
+        "кнопкой «Спам-профиль», и те, кого бот забанил сам.",
+        "\nЗаписали по ошибке — уберите номером ниже.",
+        f"\nВсего: <b>{len(rows)}</b>"
+        + (f" · страница {page + 1} из {pages}" if pages > 1 else ""),
+        "",
+    ]
+    if not rows:
+        lines.append("Пусто.")
+    start = page * LIST_PER_PAGE
+    for i, r in enumerate(chunk, start + 1):
+        who = await db.user_handle(r["user_id"]) if r["user_id"] else "—"
+        lines.append(
+            f"{i}. <b>{utils.esc(who)}</b> · {utils.fmt_ts(r['ts'])}\n"
+            f"    <i>{utils.esc(utils.chunk(r['text'], 90))}</i>")
+    b = InlineKeyboardBuilder()
+    row = []
+    for i, r in enumerate(chunk, start + 1):
+        row.append(_btn(f"❌ {i}", f"u:pfd:{cid}:{r['id']}:{page}"))
+        if len(row) == 5:
+            b.row(*row)
+            row = []
+    if row:
+        b.row(*row)
+    _pager(b, cid, "u:pf", page, pages)
+    b.row(_btn("⬅️ Назад", f"u:s:{cid}:watch"))
+    return "\n".join(lines), b.as_markup()
+
+
+@router.callback_query(F.data.startswith("u:pf:"))
+async def cb_spam_profiles(cb: CallbackQuery) -> None:
+    _, _, cid, page = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    text, kb = await view_spam_profiles(cid, int(page))
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:pfd:"))
+async def cb_spam_profile_del(cb: CallbackQuery) -> None:
+    from ..services import nn
+    _, _, cid, rid, page = cb.data.split(":")
+    cid = int(cid)
+    if not await _guard(cb, cid):
+        return
+    row = await db.spam_profile_delete(cid, int(rid))
+    if row is not None:
+        nn.invalidate(cid)
+        await db.add_event(cid, "card", f"спам-профиль убран из базы: "
+                                        f"{row['user_id']} by {cb.from_user.id}")
+    text, kb = await view_spam_profiles(cid, int(page))
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer("Убран" if row is not None else "Его уже нет")
 
 
 async def view_forgiven(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
@@ -2188,6 +2382,86 @@ async def cb_chat(cb: CallbackQuery, state: FSMContext) -> None:
     await cb.answer()
 
 
+_IMPORT_PROMPT = ("<b>📥 Загрузка настроек из файла</b>\n\n"
+                  "Пришлите архив, который бот отдал кнопкой «📤 Выгрузить в файл». "
+                  "Перед загрузкой покажу, что в нём, и дам выбрать разделы.")
+
+
+@router.callback_query(F.data.startswith("u:exp:"))
+async def cb_export(cb: CallbackQuery, bot: Bot) -> None:
+    """Выгрузка: архив приходит сюда же, в личку, отдельным сообщением."""
+    from aiogram.types import BufferedInputFile
+    from ..services import transfer
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid, "owner"):
+        return
+    await cb.answer("Собираю файл…")
+    try:
+        data, stats = await transfer.export_chat(cid)
+    except Exception:
+        logger.warning("выгрузка настроек %s не удалась", cid, exc_info=True)
+        await cb.message.answer("Не получилось собрать файл, посмотрите «🐞 Ошибки».")
+        return
+    ch = await db.get_chat(cid)
+    inside = ", ".join(f"{k} {v}" for k, v in stats.items() if v)
+    await bot.send_document(
+        cb.from_user.id,
+        BufferedInputFile(data, filename=transfer.export_name(cid)),
+        caption=(f"📤 Настройки «{utils.esc(ch['title'] if ch else cid)}»"
+                 + (f"\n{utils.esc(inside)}" if inside else "")),
+    )
+    await db.add_event(cid, "card", f"настройки выгружены в файл by {cb.from_user.id}")
+
+
+@router.callback_query(F.data.startswith("u:imp:"))
+async def cb_import(cb: CallbackQuery, state: FSMContext) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid, "owner"):
+        return
+    await _ask(cb, state, Input.import_file, _IMPORT_PROMPT, f"u:cp:{cid}", cid=cid)
+
+
+@router.message(StateFilter(Input.import_file))
+async def import_file_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    from ..services import transfer
+    cid = (await state.get_data())["cid"]
+    # право проверяем заново: между кнопкой и файлом его могли отнять
+    if not await db.may(message.from_user.id, cid, "owner"):
+        await state.clear()
+        return
+    doc = message.document
+    if doc is None:
+        await _retry(message, bot, state,
+                     f"{_IMPORT_PROMPT}\n\n⚠️ Нужен файл, а не текст.")
+        return
+    if (doc.file_size or 0) > transfer.MAX_ARCHIVE:
+        await _retry(message, bot, state,
+                     f"{_IMPORT_PROMPT}\n\n⚠️ Файл больше 20 МБ.")
+        return
+    await _edit_menu(message, bot, state, "📥 Читаю файл…", None)
+    try:
+        buf = await bot.download(doc)
+        snap, media = transfer.parse_archive(buf.read())
+    except transfer.BadArchive as e:
+        await _retry(message, bot, state, f"{_IMPORT_PROMPT}\n\n⚠️ {utils.esc(str(e))}")
+        return
+    except Exception:
+        logger.warning("файл настроек не прочитан", exc_info=True)
+        await _retry(message, bot, state,
+                     f"{_IMPORT_PROMPT}\n\n⚠️ Не получилось скачать или прочитать файл.")
+        return
+    if not snap["groups"]:
+        await _retry(message, bot, state,
+                     f"{_IMPORT_PROMPT}\n\n⚠️ В файле нет ни одного раздела.")
+        return
+    transfer.stash(message.from_user.id, cid, snap, media)
+    picked = set(snap["groups"])
+    await state.set_state(None)               # данные оставляем: там галочки
+    await state.update_data(copy_groups=sorted(picked))
+    text, kb = await view_copy_pick(cid, FROM_FILE, picked, message.from_user.id)
+    await _edit_menu(message, bot, state, text, kb)
+
+
 @router.callback_query(F.data.startswith("u:cpn:"))
 async def cb_setup_skip(cb: CallbackQuery, state: FSMContext) -> None:
     """«Настроить с нуля» — просто помечаем чат настроенным."""
@@ -2232,18 +2506,24 @@ async def cb_copy_toggle(cb: CallbackQuery, state: FSMContext) -> None:
     from ..services import transfer
     _, _, cid, src, key = cb.data.split(":")
     cid, src = int(cid), int(src)
-    if not await _guard(cb, cid, "owner") or not await _guard(cb, src, "owner"):
+    if not await _guard(cb, cid, "owner"):
+        return
+    if src != FROM_FILE and not await _guard(cb, src, "owner"):
+        return
+    scope = _copy_scope(cb.from_user.id, cid, src)
+    if scope is None:
+        await cb.answer("Файл уже забыт — пришлите его ещё раз.", show_alert=True)
         return
     data = await state.get_data()
-    picked = set(data.get("copy_groups", transfer.ALL_GROUPS))
+    picked = set(data.get("copy_groups", scope)) & set(scope)
     if key == "__all":
-        picked = set(transfer.ALL_GROUPS)
+        picked = set(scope)
     elif key == "__none":
         picked = set()
-    elif key in transfer.GROUPS:
+    elif key in scope:
         picked.symmetric_difference_update({key})
     await state.update_data(copy_groups=sorted(picked))
-    text, kb = await view_copy_pick(cid, src, picked)
+    text, kb = await view_copy_pick(cid, src, picked, cb.from_user.id)
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer()
 
@@ -2253,7 +2533,13 @@ async def cb_copy_do(cb: CallbackQuery, state: FSMContext) -> None:
     from ..services import transfer
     _, _, cid, src = cb.data.split(":")
     cid, src = int(cid), int(src)
-    if cid == src or not await _guard(cb, cid, "owner") or not await _guard(cb, src, "owner"):
+    if cid == src or not await _guard(cb, cid, "owner"):
+        return
+    if src != FROM_FILE and not await _guard(cb, src, "owner"):
+        return
+    got = transfer.stashed(cb.from_user.id, cid) if src == FROM_FILE else None
+    if src == FROM_FILE and got is None:
+        await cb.answer("Файл уже забыт — пришлите его ещё раз.", show_alert=True)
         return
     data = await state.get_data()
     picked = set(data.get("copy_groups", transfer.ALL_GROUPS))
@@ -2263,15 +2549,26 @@ async def cb_copy_do(cb: CallbackQuery, state: FSMContext) -> None:
         return
     await cb.answer("Переношу…")
     try:
-        stats = await transfer.copy_chat(src, cid, picked)
+        if src == FROM_FILE:
+            snap, media = got
+            stats = await transfer.apply(cid, snap, picked, media.get)
+            transfer.unstash(cb.from_user.id, cid)
+        else:
+            stats = await transfer.copy_chat(src, cid, picked)
     except Exception:
         logger.warning("перенос %s -> %s не удался", src, cid, exc_info=True)
         await cb.answer("Не вышло перенести, посмотрите «🐞 Ошибки».", show_alert=True)
         return
     await db.kv_set(setup_key(cid), "1")
-    ch = await db.get_chat(src)
     moved = ", ".join(f"{k}: {v}" for k, v in stats.items() if v)
-    note = (f"✅ Настройки перенесены из «{utils.esc(ch['title'] if ch else src)}».\n"
+    if src == FROM_FILE:
+        await db.add_event(cid, "card", f"настройки загружены из файла by "
+                                        f"{cb.from_user.id}: {moved or 'пусто'}")
+        whence = "из файла"
+    else:
+        ch = await db.get_chat(src)
+        whence = f"из «{utils.esc(ch['title'] if ch else src)}»"
+    note = (f"✅ Настройки перенесены {whence}.\n"
             f"{moved or 'нечего было копировать'}.\n\n")
     text, kb = await view_chat(cid, cb.from_user.id, cb.bot)
     await cb.message.edit_text(note + text, reply_markup=kb)

@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import time
+from logging.handlers import RotatingFileHandler
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -31,7 +32,8 @@ def _setup_logging() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler(config.LOG_PATH, encoding="utf-8"),
+            RotatingFileHandler(config.LOG_PATH, maxBytes=config.LOG_MAX,
+                                backupCount=config.LOG_KEEP, encoding="utf-8"),
         ],
     )
     logging.getLogger("aiogram.dispatcher").addFilter(_DropPollingDisconnect())

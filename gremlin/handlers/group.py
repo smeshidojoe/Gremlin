@@ -13,8 +13,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .. import config, db, runtime, utils
 from ..services import (
-    adm_cache, filters, media, moderation, net, nn, raid, resolve, triggers,
-    trust, watch,
+    adm_cache, deleting, filters, media, moderation, net, nn, raid, resolve,
+    triggers, trust, watch,
 )
 
 logger = logging.getLogger("gremlin.group")
@@ -79,10 +79,7 @@ async def ignore_bot_commands(message: Message) -> None:
     Само сообщение убираем: при добавлении по ссылке Telegram сам шлёт в чат
     «/start@бот», и он висит в ленте мусором.
     """
-    try:
-        await message.delete()
-    except Exception:
-        pass          # не админ ещё или сообщение чужое — не страшно
+    await deleting.one(message.delete, message.chat.id)  # не админ ещё или сообщение чужое — не страшно
 
 
 # ---------- команды админов чата: !mute !ban ----------
@@ -106,6 +103,18 @@ def _manual_card_text(kind: str, chat_title: str | None, target, reason: str,
         lines.append(f"⏰ До: {utils.fmt_ts(until)}")
     lines.append(f"👮 Кем: {admin}")
     return "\n".join(lines) + body
+
+
+def _cmd_on(field: str):
+    """Фильтр: команда включена в «Командах чата».
+
+    Выключенная не совпадает вовсе, а не выходит молча из обработчика: так
+    сообщение идёт дальше обычным текстом — считается в статистику, проходит
+    фильтры — и никто не получает мут за «чужую команду», которой в чате нет.
+    """
+    async def check(message: Message) -> bool:
+        return bool(getattr(await db.get_settings(message.chat.id), field))
+    return check
 
 
 async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
@@ -184,10 +193,7 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
     for msg in doomed:
         if msg is None:
             continue
-        try:
-            await msg.delete()
-        except Exception:
-            pass
+        await deleting.one(msg.delete, msg.chat.id)
 
     # Ручное наказание тоже запоминаем, но помечаем «unknown»: причины у людей
     # свои, к тексту сообщения они часто отношения не имеют, и учить на этом
@@ -245,10 +251,7 @@ async def _punish_sender_chat(message: Message, bot: Bot, kind: str, reply) -> N
         was_member=False,
     )
     for msg in (reply, message):
-        try:
-            await msg.delete()
-        except Exception:
-            pass
+        await deleting.one(msg.delete, msg.chat.id)
     card = (
         f"📛 <b>Бан отправителя-канала</b> · {utils.esc(message.chat.title)}\n"
         f"📢 {utils.esc(chan.title or chan.id)} (<code>{chan.id}</code>)\n"
@@ -260,17 +263,17 @@ async def _punish_sender_chat(message: Message, bot: Bot, kind: str, reply) -> N
                        f"banchan: {chan.title} ({chan.id}) | by {message.from_user.id}")
 
 
-@router.message(F.text.regexp(r"^!(mute|мут)(\s|$)"))
+@router.message(F.text.regexp(r"(?i)^!(mute|мут)(\s|$)"), _cmd_on("cmd_mute_on"))
 async def cmd_mute(message: Message, bot: Bot) -> None:
     await _manual_punish(message, bot, "mute")
 
 
-@router.message(F.text.regexp(r"^!(kick|кик)(\s|$)"))
+@router.message(F.text.regexp(r"(?i)^!(kick|кик)(\s|$)"), _cmd_on("cmd_kick_on"))
 async def cmd_kick(message: Message, bot: Bot) -> None:
     await _manual_punish(message, bot, "kick")
 
 
-@router.message(F.text.regexp(r"^!(ban|бан)(\s|$)"))
+@router.message(F.text.regexp(r"(?i)^!(ban|бан)(\s|$)"), _cmd_on("cmd_ban_on"))
 async def cmd_ban(message: Message, bot: Bot) -> None:
     await _manual_punish(message, bot, "ban")
 
@@ -282,10 +285,7 @@ async def _misuse(message: Message, bot: Bot, s) -> None:
     """
     user = message.from_user
     scopes = await db.free_scopes(message.chat.id, user.id, user.username)
-    try:
-        await message.delete()
-    except Exception:
-        pass
+    await deleting.one(message.delete, message.chat.id)
     if not s.misuse_mute or scopes or user.id in config.ADMIN_IDS:
         return
     pid = await moderation.apply_punishment(
@@ -355,7 +355,7 @@ async def _post_rules(message: Message, chat_id: int) -> None:
             logger.warning("rules post failed in %s", chat_id, exc_info=True)
 
 
-@router.message(F.text.regexp(r"^!(warn|варн)(\s|$)"))
+@router.message(F.text.regexp(r"(?i)^!(warn|варн)(\s|$)"), _cmd_on("cmd_warn_on"))
 async def cmd_warn(message: Message, bot: Bot) -> None:
     """!warn ответом: предупреждение с накоплением, наказание — по лимиту."""
     if stale(message):
@@ -379,10 +379,7 @@ async def cmd_warn(message: Message, bot: Bot) -> None:
     count = await db.warn_add(message.chat.id, target, reason, message.from_user.id)
 
     for msg in (message.reply_to_message, message):
-        try:
-            await msg.delete()
-        except Exception:
-            pass
+        await deleting.one(msg.delete, msg.chat.id)
 
     who = utils.mention(target.id, target.full_name, target.username)
     admin = utils.mention(message.from_user.id, message.from_user.full_name,
@@ -454,7 +451,8 @@ async def _lift_target(message: Message, bot: Bot) -> tuple[int | None, str]:
     return None, ""
 
 
-@router.message(F.text.regexp(r"^!(unmute|размут|unban|разбан)(\s|$)"))
+@router.message(F.text.regexp(r"(?i)^!(unmute|размут|unban|разбан)(\s|$)"),
+                _cmd_on("cmd_lift_on"))
 async def cmd_lift(message: Message, bot: Bot) -> None:
     """!unmute / !unban — снять наказание с того, на кого ответили или кого назвали."""
     if stale(message):
@@ -492,10 +490,7 @@ async def cmd_lift(message: Message, bot: Bot) -> None:
     await db.deactivate_user_punishments(message.chat.id, uid)
     adm_cache.invalidate_member(message.chat.id, uid)
     trust.invalidate(message.chat.id, uid)
-    try:
-        await message.delete()
-    except Exception:
-        pass
+    await deleting.one(message.delete, message.chat.id)
 
     kind = "🔓 Разбан" if unban else "🔊 Размут"
     tail = "" if done else "\n<i>Наказания не было — снимать нечего.</i>"
@@ -542,10 +537,7 @@ async def _say_and_forget(bot: Bot, message: Message, text: str) -> None:
     async def clean() -> None:
         await asyncio.sleep(60)
         for mid in (sent.message_id, message.message_id):
-            try:
-                await bot.delete_message(message.chat.id, mid)
-            except Exception:
-                pass
+            await deleting.one(lambda: bot.delete_message(message.chat.id, mid), message.chat.id)
 
     runtime.spawn(clean())
 
@@ -654,7 +646,7 @@ async def cmd_report(message: Message, bot: Bot) -> None:
     await _say_and_forget(bot, message, "🚨 Жалоба отправлена админам.")
 
 
-@router.message(F.text.regexp(r"^!(dm|дм)(\s|$)"))
+@router.message(F.text.regexp(r"(?i)^!(dm|дм)(\s|$)"), _cmd_on("cmd_dm_on"))
 async def cmd_delete(message: Message, bot: Bot) -> None:
     """!dm ответом на сообщение — удалить его вместе с самой командой."""
     if stale(message):
@@ -672,15 +664,10 @@ async def cmd_delete(message: Message, bot: Bot) -> None:
     body = moderation.message_body(target_msg)     # текст сохраняем до удаления
     reason = " ".join((message.text or "").split()[1:]) or "без причины"
 
-    try:
-        await target_msg.delete()
-    except Exception:
+    if not await deleting.one(target_msg.delete, message.chat.id):
         await message.reply("Не получилось удалить — сообщение старше 48 часов или нет прав.")
         return
-    try:
-        await message.delete()                     # следом убираем саму команду
-    except Exception:
-        pass
+    await deleting.one(message.delete, message.chat.id)   # следом убираем саму команду
 
     card = _manual_card_text(
         "delete", message.chat.title, target, reason, None, message.from_user, body
@@ -740,10 +727,7 @@ async def fire_counter(bot: Bot, message: Message, s) -> None:
 
     if wait and now - store.get(key, utils.NEVER) < wait:
         # Сообщение убираем: иначе в чате копятся вызовы, на которые бот молчит.
-        try:
-            await message.delete()
-        except Exception:
-            pass          # нет прав на удаление — просто игнорируем вызов
+        await deleting.one(message.delete, message.chat.id)  # нет прав на удаление — просто игнорируем вызов
         return            # вызов не засчитываем
     store[key] = now
     count = await db.cmd_bump(row["id"])
@@ -916,6 +900,33 @@ async def fire_trigger(bot: Bot, message: Message, s) -> None:
         return  # один триггер на сообщение
 
 
+async def _own_targets(bot: Bot, chat) -> tuple[set[str], set[int]]:
+    """«Свои» цели для ссылок: этот чат, привязанный канал, сам бот и то, что
+    разрешено в вайтлисте и списке разрешённых ссылок.
+
+    Нужны правилу ссылок и нейрофильтру: одна и та же ссылка не должна быть
+    для одного разрешённой, а для другого — приметой рекламы.
+    """
+    me = await bot.me()
+    own_names: set[str] = {me.username, chat.username}
+    own_ids: set[int] = {chat.id}
+    linked_id, linked_name, _ = await adm_cache.linked_chat(bot, chat.id)
+    if linked_id:
+        own_ids.add(linked_id)
+    if linked_name:
+        own_names.add(linked_name)
+    for r in await db.wl_list(chat.id):        # разрешённые каналы — тоже свои
+        if r["user_id"] and r["scope"] in ("all", "anon", "links"):
+            own_ids.add(r["user_id"])
+    for r in await db.link_wl_list(chat.id):   # свой список разрешённых ссылок
+        if r["target_id"]:
+            own_ids.add(r["target_id"])
+        if r["username"]:
+            own_names.add(r["username"])
+    own_names.discard(None)
+    return own_names, own_ids
+
+
 async def _own_forward(bot: Bot, chat_id: int, origin_chat) -> bool:
     """Пересылка из своего: этот чат, привязанный канал или чат из списка
     разрешённых для ссылок.
@@ -948,10 +959,7 @@ async def _captcha_timeout(bot: Bot, chat_id: int, user_id: int, timeout: int, m
     if _captcha_pending.pop((chat_id, user_id), None) is None:
         return  # уже прошёл
     await db.kv_set(_CAPTCHA_KEY.format(chat_id, user_id), None)
-    try:
-        await bot.delete_message(chat_id, msg_id)
-    except Exception:
-        pass
+    await deleting.one(lambda: bot.delete_message(chat_id, msg_id), chat_id)
     try:  # кик с возможностью вернуться (ban+unban)
         await bot.ban_chat_member(chat_id, user_id)
         # пауза перед снятием: отправленный вплотную разбан иногда приходит
@@ -1041,10 +1049,7 @@ async def captcha_pass(cb: CallbackQuery, bot: Bot) -> None:
             chat_id, user_id, permissions=await moderation.unmute_perms(bot, chat_id))
     except Exception:
         logger.warning("captcha unmute failed in %s", chat_id, exc_info=True)
-    try:
-        await cb.message.delete()
-    except Exception:
-        pass
+    await deleting.one(cb.message.delete, cb.message.chat.id)
     await cb.answer("Добро пожаловать!")
     await db.add_event(chat_id, "captcha", f"прошёл капчу: {user_id}")
 
@@ -1076,10 +1081,7 @@ async def on_join(message: Message, bot: Bot) -> None:
             )
             old = _last_welcome.pop(message.chat.id, None)
             if old:
-                try:
-                    await bot.delete_message(message.chat.id, old)
-                except Exception:
-                    pass
+                await deleting.one(lambda: bot.delete_message(message.chat.id, old), message.chat.id)
             sent = await _welcome(message, s, names)
             if sent is not None:
                 _last_welcome[message.chat.id] = sent
@@ -1134,10 +1136,7 @@ async def on_join(message: Message, bot: Bot) -> None:
                 continue
             await ask_captcha(bot, message.chat, user, s)
     if s.service_join:
-        try:
-            await message.delete()
-        except Exception:
-            pass
+        await deleting.one(message.delete, message.chat.id)
 
 
 async def _welcome(message: Message, s, names: str) -> int | None:
@@ -1171,10 +1170,7 @@ async def on_leave(message: Message, bot: Bot) -> None:
         await db.add_event(message.chat.id, "leave", f"{u.full_name} ({u.id})")
     s = await db.get_settings(message.chat.id)
     if s.service_leave:
-        try:
-            await message.delete()
-        except Exception:
-            pass
+        await deleting.one(message.delete, message.chat.id)
 
 
 @router.message(
@@ -1187,10 +1183,7 @@ async def on_service_other(message: Message) -> None:
         return
     s = await db.get_settings(message.chat.id)
     if s.service_other:
-        try:
-            await message.delete()
-        except Exception:
-            pass
+        await deleting.one(message.delete, message.chat.id)
 
 
 # ---------- автомодерация (catch-all, регистрируется последним) ----------
@@ -1230,10 +1223,7 @@ async def moderate(message: Message, bot: Bot) -> None:
         )
         if not s.anon_on or sender_scopes & {"all", "anon"}:
             return
-        try:
-            await message.delete()
-        except Exception:
-            pass
+        await deleting.one(message.delete, message.chat.id)
         try:
             await bot.ban_chat_sender_chat(chat.id, message.sender_chat.id)
         except Exception:
@@ -1287,13 +1277,10 @@ async def moderate(message: Message, bot: Bot) -> None:
         return
 
     # --- медиа-фильтры (удаление без наказания) ---
-    if s.media_on and s.media_mask:
+    if config.MEDIA_FILTERS and s.media_on and s.media_mask:
         for bit, attr, _label in config.MEDIA_BITS:
             if s.media_mask & bit and getattr(message, attr, None) is not None:
-                try:
-                    await message.delete()
-                except Exception:
-                    pass
+                await deleting.one(message.delete, message.chat.id)
                 return
 
     # Текст, спрятанный в картинке или голосовом. Достаём до правил: дальше он
@@ -1365,24 +1352,11 @@ async def moderate(message: Message, bot: Bot) -> None:
             return
 
     # «свои» цели: этот чат (по нику и по t.me/c/<id>), привязанный канал, сам бот
+    own: tuple[set[str], set[int]] | None = None
     own_names, own_ids = set(), set()
     if s.links_on or s.extlinks_on:
-        me = await bot.me()
-        own_names = {me.username, chat.username}
-        own_ids = {chat.id}
-        linked_id, linked_name, _ = await adm_cache.linked_chat(bot, chat.id)
-        if linked_id:
-            own_ids.add(linked_id)
-        if linked_name:
-            own_names.add(linked_name)
-        for r in await db.wl_list(chat.id):    # разрешённые каналы — тоже свои
-            if r["user_id"] and r["scope"] in ("all", "anon", "links"):
-                own_ids.add(r["user_id"])
-        for r in await db.link_wl_list(chat.id):   # свой список разрешённых ссылок
-            if r["target_id"]:
-                own_ids.add(r["target_id"])
-            if r["username"]:
-                own_names.add(r["username"])
+        own = await _own_targets(bot, chat)
+        own_names, own_ids = own
 
     # --- ссылки на чужие тг-чаты/каналы ---
     if s.links_on and "links" not in scopes:
@@ -1482,13 +1456,8 @@ async def moderate(message: Message, bot: Bot) -> None:
         if burst_ids:
             # чистим весь залп: последнее сообщение удалит moderation.violation,
             # остальные — здесь, иначе спам остаётся висеть в чате
-            for mid in burst_ids:
-                if mid == message.message_id:
-                    continue
-                try:
-                    await bot.delete_message(chat.id, mid)
-                except Exception:
-                    pass          # старше 48 часов или уже удалено
+            await deleting.many(bot, chat.id,
+                                [mid for mid in burst_ids if mid != message.message_id])
             kind = "mute"
             if s.trust_on:
                 kind = trust.soften(kind, await trust.level(bot, chat.id, user.id, s),
@@ -1506,7 +1475,9 @@ async def moderate(message: Message, bot: Bot) -> None:
     # а сам он по-прежнему ничего не решает.
     nn_hit = False
     if s.nn_mode > 1:
-        nn_hit = await nn.shadow(chat.id, message, s, seen)
+        if own is None:
+            own = await _own_targets(bot, chat)
+        nn_hit = await nn.shadow(chat.id, message, s, seen, own=own)
 
     # --- наблюдение за профилями (специфичные правила уже отработали) ---
     if s.watch_on and "watch" not in scopes:

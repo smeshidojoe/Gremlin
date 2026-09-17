@@ -144,6 +144,12 @@ CREATE TABLE IF NOT EXISTS settings(
     service_leave   INTEGER NOT NULL DEFAULT 0,
     service_other   INTEGER NOT NULL DEFAULT 0,
     misuse_mute     INTEGER NOT NULL DEFAULT 5,
+    cmd_mute_on     INTEGER NOT NULL DEFAULT 1,
+    cmd_kick_on     INTEGER NOT NULL DEFAULT 1,
+    cmd_ban_on      INTEGER NOT NULL DEFAULT 1,
+    cmd_warn_on     INTEGER NOT NULL DEFAULT 1,
+    cmd_lift_on     INTEGER NOT NULL DEFAULT 1,
+    cmd_dm_on       INTEGER NOT NULL DEFAULT 1,
     mute_reactions  INTEGER NOT NULL DEFAULT 1,
     warns_on        INTEGER NOT NULL DEFAULT 0,
     warns_limit     INTEGER NOT NULL DEFAULT 3,
@@ -465,6 +471,13 @@ class Settings:
     service_leave: int = 0
     service_other: int = 0
     misuse_mute: int = 5
+    # команды модерации по одной: выключенная для бота не существует
+    cmd_mute_on: int = 1
+    cmd_kick_on: int = 1
+    cmd_ban_on: int = 1
+    cmd_warn_on: int = 1
+    cmd_lift_on: int = 1
+    cmd_dm_on: int = 1
     mute_reactions: int = 1
     warns_on: int = 0
     warns_limit: int = 3
@@ -575,6 +588,12 @@ _SETTINGS_MIGRATIONS = {
     "inline_spam": "INTEGER NOT NULL DEFAULT 40",
     "cmds_anywhere": "INTEGER NOT NULL DEFAULT 0",
     "misuse_mute": "INTEGER NOT NULL DEFAULT 5",
+    "cmd_mute_on": "INTEGER NOT NULL DEFAULT 1",
+    "cmd_kick_on": "INTEGER NOT NULL DEFAULT 1",
+    "cmd_ban_on": "INTEGER NOT NULL DEFAULT 1",
+    "cmd_warn_on": "INTEGER NOT NULL DEFAULT 1",
+    "cmd_lift_on": "INTEGER NOT NULL DEFAULT 1",
+    "cmd_dm_on": "INTEGER NOT NULL DEFAULT 1",
     "mute_reactions": "INTEGER NOT NULL DEFAULT 1",
     "warns_on": "INTEGER NOT NULL DEFAULT 0",
     "warns_limit": "INTEGER NOT NULL DEFAULT 3",
@@ -1933,9 +1952,16 @@ async def samples_stats(chat_id: int | None = None) -> dict:
     else:
         q += f" WHERE chat_id != {SEED_CHAT}"
     cur = await _db.execute(q + " GROUP BY origin, label", args)
-    out: dict = {"spam": 0, "ok": 0, "unknown": 0, "profile": 0, "total": 0}
+    out: dict = {"spam": 0, "ok": 0, "unknown": 0, "profile": 0, "total": 0,
+                 "faces_spam": 0, "faces_ok": 0}
     for r in await cur.fetchall():
         out["total"] += r["n"]
+        if r["origin"] == "profile":
+            # профили людей — отдельная база со своим сравнением; сложенные
+            # со «спамом» и «нормой» сообщений, они путали обе цифры
+            key = "faces_spam" if r["label"] == "spam" else "faces_ok"
+            out[key] += r["n"]
+            continue
         out[r["label"]] = out.get(r["label"], 0) + r["n"]
         if r["origin"] in PROFILE_ORIGINS and r["label"] != "unknown":
             out["profile"] += r["n"]
@@ -2101,6 +2127,44 @@ async def samples_seed(limit: int) -> list[aiosqlite.Row]:
     return rows
 
 
+# ---------- база спам-профилей ----------
+#
+# Профили лежат в той же копилке улик, что и сообщения, с origin='profile'.
+# Отдельного списка в меню у них не было: записать кнопкой можно, а увидеть и
+# убрать ошибку — нет. Спрашиваем только спам: «нормальные» профили — это
+# отметки «не трогать», их смысл в самом сравнении, не в ручной чистке.
+
+async def spam_profiles(chat_id: int) -> list[aiosqlite.Row]:
+    """Профили, записанные как спам: кнопкой на карточке или при автобане."""
+    cur = await _db.execute(
+        """SELECT id, user_id, ts, text FROM samples
+           WHERE chat_id = ? AND origin = 'profile' AND label = 'spam'
+           ORDER BY id DESC""", (chat_id,))
+    return await cur.fetchall()
+
+
+async def spam_profile_delete(chat_id: int, sample_id: int) -> aiosqlite.Row | None:
+    """Убрать одну запись. Возвращает удалённую строку, None — такой нет."""
+    cur = await _db.execute(
+        """SELECT id, user_id FROM samples WHERE id = ? AND chat_id = ?
+           AND origin = 'profile' AND label = 'spam'""", (sample_id, chat_id))
+    row = await cur.fetchone()
+    if row is None:
+        return None
+    await _db.execute("DELETE FROM samples WHERE id = ?", (sample_id,))
+    await _db.commit()
+    return row
+
+
+async def spam_profile_forget(chat_id: int, user_id: int) -> int:
+    """Убрать из базы спама все записи о человеке в этом чате. Сколько убрали."""
+    cur = await _db.execute(
+        """DELETE FROM samples WHERE chat_id = ? AND user_id = ?
+           AND origin = 'profile' AND label = 'spam'""", (chat_id, user_id))
+    await _db.commit()
+    return cur.rowcount or 0
+
+
 async def samples_of_origin(chat_id: int, origin: str,
                             limit: int = 2000) -> list[aiosqlite.Row]:
     """Улики одного вида — например, спам-профили (origin='profile')."""
@@ -2117,6 +2181,52 @@ async def samples_unknown(chat_id: int, limit: int = 2000) -> list[aiosqlite.Row
         """SELECT * FROM samples WHERE chat_id = ? AND label = 'unknown'
            ORDER BY id DESC LIMIT ?""", (chat_id, limit))
     return await cur.fetchall()
+
+
+async def samples_label_unknown(ids: list[int], label: str) -> int:
+    """Разметить из пачки только улики без оценки. Сколько разметили.
+
+    Кучку складывает смысл текста, а не пометки: рядом с тремя рекламными
+    объявлениями в ней лежат десятки обычных сообщений. Раньше кнопка
+    перезаписывала всю кучку, и одно нажатие делало обычный разговор
+    «спамом». Уже поставленную оценку здесь не трогаем никогда — точечно
+    её правят по одной.
+    """
+    if not ids:
+        return 0
+    marks = ",".join("?" * len(ids))
+    cur = await _db.execute(
+        f"""UPDATE samples SET label = ?, origin = 'card'
+            WHERE id IN ({marks}) AND label = 'unknown' AND origin != 'profile'""",
+        (label, *ids))
+    await _db.commit()
+    return cur.rowcount or 0
+
+
+async def samples_by_ids(chat_id: int, ids: list[int]) -> list[aiosqlite.Row]:
+    """Улики кучки в том порядке, в каком их отдала разбивка."""
+    if not ids:
+        return []
+    marks = ",".join("?" * len(ids))
+    cur = await _db.execute(
+        f"""SELECT id, text, label, origin, ts FROM samples
+            WHERE chat_id = ? AND id IN ({marks})""", (chat_id, *ids))
+    rows = {r["id"]: r for r in await cur.fetchall()}
+    return [rows[i] for i in ids if i in rows]
+
+
+async def sample_set_label(chat_id: int, sample_id: int, label: str) -> bool:
+    """Поправить оценку одной улики сообщения. False — такой в чате нет.
+
+    origin становится 'card': оценку поставил человек, такие при подрезке
+    копилки не удаляются. Профили людей здесь не правим — у них свой список.
+    """
+    cur = await _db.execute(
+        """UPDATE samples SET label = ?, origin = 'card'
+           WHERE id = ? AND chat_id = ? AND origin != 'profile'""",
+        (label, sample_id, chat_id))
+    await _db.commit()
+    return bool(cur.rowcount)
 
 
 async def samples_relabel_many(ids: list[int], label: str) -> int:

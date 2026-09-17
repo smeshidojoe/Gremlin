@@ -401,10 +401,8 @@ async def _profile_punish(bot, chat, user, settings, message, data, why) -> bool
 
     kind = settings.prof_punish
     if message is not None:
-        try:
-            await message.delete()
-        except Exception:
-            pass
+        from . import deleting
+        await deleting.one(message.delete, message.chat.id)
     body = moderation.message_body(message)
     pid = None
     if kind != "delete":
@@ -690,10 +688,8 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None,
     # автобан по порогу
     if ban_at and total >= ban_at:
         if message is not None:
-            try:
-                await message.delete()
-            except Exception:
-                pass
+            from . import deleting
+            await deleting.one(message.delete, message.chat.id)
         pid = await moderation.apply_punishment(
             bot, chat.id, user, "ban", 0, f"наблюдение: {why} ({total})", None
         )

@@ -14,7 +14,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .. import config, db, runtime, utils
-from ..services import adm_cache, moderation, raid
+from ..services import adm_cache, deleting, moderation, raid
 from . import group
 
 logger = logging.getLogger("gremlin.events")
@@ -457,10 +457,7 @@ async def title_changed(message: Message) -> None:
     # чистка служебного сообщения — здесь, иначе group-хендлер до него не доберётся
     s = await db.get_settings(message.chat.id)
     if s.service_other:
-        try:
-            await message.delete()
-        except Exception:
-            pass
+        await deleting.one(message.delete, message.chat.id)
 
 
 # ---------- заявки на вступление ----------

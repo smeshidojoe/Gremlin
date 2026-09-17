@@ -411,7 +411,8 @@ async def shadow_caught(chat_id: int, message, s, extra: str,
                       caught_by=feature)
 
 
-async def shadow(chat_id: int, message, s, extra: str = "") -> bool:
+async def shadow(chat_id: int, message, s, extra: str = "",
+                 own: tuple[set[str], set[int]] | None = None) -> bool:
     """Теневой прогон: вердикт пишем в файл, на модерацию не влияем.
 
     Живой модерации фильтр не касается сознательно — сперва надо посмотреть,
@@ -426,8 +427,14 @@ async def shadow(chat_id: int, message, s, extra: str = "") -> bool:
     # extra — распознанное в картинке или голосовом: для фильтра это обычный
     # текст, и сравнивать надо именно вместе с ним
     text = " ".join(filter(None, [message.text or message.caption or "", extra]))
+    # own — свои чаты: ссылки на них для оценки убираем, см. filters.strip_own_links.
+    # В журнал пишем исходный текст — так запись узнаётся по сообщению в чате
+    judged = text
+    if own is not None:
+        from .filters import strip_own_links
+        judged = strip_own_links(text, *own)
     try:
-        verdict = await check(chat_id, text)
+        verdict = await check(chat_id, judged)
     except Exception:
         logger.warning("нейрофильтр упал на сообщении в %s", chat_id, exc_info=True)
         return False
@@ -550,13 +557,23 @@ async def clusters(chat_id: int, scope: str = "unknown", k: int | None = None):
     return out
 
 
-async def label_cluster(chat_id: int, index: int, label: str) -> int:
-    """Пометить целую кучку. Возвращает, сколько улик переразметили."""
+def cluster_ids(chat_id: int, index: int) -> list[int] | None:
+    """id улик кучки из последней разбивки. None — разбивка устарела."""
     cached = _clusters.get(chat_id)
     if not cached or index >= len(cached[1]):
+        return None
+    return cached[1][index]
+
+
+async def label_cluster(chat_id: int, index: int, label: str) -> int:
+    """Разметить в кучке улики без оценки. Возвращает, сколько разметили.
+
+    Уже размеченные не трогаем: см. db.samples_label_unknown.
+    """
+    ids = cluster_ids(chat_id, index)
+    if ids is None:
         return 0
-    ids = cached[1][index]
-    moved = await db.samples_relabel_many(ids, label)
+    moved = await db.samples_label_unknown(ids, label)
     invalidate(chat_id)
     logger.info("кучка %s в чате %s размечена как %s: %d улик",
                 index, chat_id, label, moved)

@@ -49,7 +49,7 @@ def test_edits_fit_telegram_limit():
 
 
 @pytest.mark.parametrize("left,text", [(45, "45 сек"), (59, "59 сек"),
-                                       (60, "1:00"), (590, "9:50")])
+                                       (60, "60 сек"), (580, "580 сек")])
 def test_label(left, text):
     assert countdown.label(left) == text
 

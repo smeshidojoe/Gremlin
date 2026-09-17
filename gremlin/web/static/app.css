@@ -79,6 +79,8 @@ main { padding: 12px; max-width: 720px; margin: 0 auto; }
 .card h2 { font-size: 15px; margin: 0 0 8px; }
 
 .intro { color: var(--hint); font-size: 13px; line-height: 1.5; }
+.intro p { margin: 0 0 8px; }
+.intro p:last-child { margin-bottom: 0; }
 .intro i { font-style: normal; color: var(--text); opacity: .85; }
 
 .muted { color: var(--hint); font-size: 13px; }
@@ -110,6 +112,15 @@ main { padding: 12px; max-width: 720px; margin: 0 auto; }
 .tile .dot.on { background: var(--ok); }
 .tile .dot.off { background: color-mix(in srgb, var(--danger) 70%, transparent); }
 .tile small { display: block; color: var(--hint); font-size: 12px; }
+/* Список чатов лежит внутри карточки, а у плитки цвет той же карточки: её не
+   видно, и между названиями зияет пустота из отступов. Здесь плитка
+   подкрашена и плотнее — чаты читаются отдельными строками. */
+.tiles.chat-list { gap: 6px; }
+.tiles.chat-list .tile {
+  background: color-mix(in srgb, var(--hint) 8%, transparent);
+  min-height: 0;
+  padding: 10px 12px;
+}
 
 /* ---------- строки списков ---------- */
 

@@ -175,9 +175,36 @@ async def card_spam_profile(cb: CallbackQuery, bot: Bot) -> None:
         return
     await db.add_event(chat_id, "card",
                        f"спам-профиль в базу: {user_id} by {cb.from_user.id}")
+    # ошибиться кнопкой легко, а искать запись потом в списке — долго:
+    # отмена стоит там же, где нажали
+    rows = list((_without_spam(cb.message.reply_markup)
+                 or InlineKeyboardMarkup(inline_keyboard=[])).inline_keyboard)
+    rows.append([InlineKeyboardButton(text="↩️ Убрать из базы спама",
+                                      callback_data=f"k:spu:{chat_id}:{user_id}")])
     await _mark(cb, "\n🧪 <b>Профиль записан в базу спама</b>",
-                _without_spam(cb.message.reply_markup))
+                InlineKeyboardMarkup(inline_keyboard=rows))
     await cb.answer("Записан")
+
+
+@router.callback_query(F.data.startswith("k:spu:"))
+async def card_spam_profile_undo(cb: CallbackQuery, bot: Bot) -> None:
+    """Отмена «Спам-профиля»: запись уходит из базы, кнопка возвращается."""
+    from ..services import moderation, nn
+    _, _, chat_id, user_id = cb.data.split(":")
+    chat_id, user_id = int(chat_id), int(user_id)
+    if not await may_act(cb, chat_id):
+        return
+    gone = await db.spam_profile_forget(chat_id, user_id)
+    nn.invalidate(chat_id)
+    await db.add_event(chat_id, "card",
+                       f"спам-профиль убран из базы: {user_id} by {cb.from_user.id}")
+    rows = [row for row in (cb.message.reply_markup.inline_keyboard
+                            if cb.message.reply_markup else [])
+            if not any((b.callback_data or "").startswith("k:spu:") for b in row)]
+    markup = moderation.with_spam_button(
+        InlineKeyboardMarkup(inline_keyboard=rows) if rows else None, chat_id, user_id)
+    await _mark(cb, "\n↩️ <b>Профиль убран из базы спама</b>", markup)
+    await cb.answer("Убран" if gone else "Его уже нет в базе")
 
 
 async def _report_punish(cb: CallbackQuery, bot: Bot, kind: str) -> None:
@@ -195,10 +222,8 @@ async def _report_punish(cb: CallbackQuery, bot: Bot, kind: str) -> None:
         return
     s = await db.get_settings(chat_id)
     rec = _reports.get((chat_id, msg_id))
-    try:
-        await bot.delete_message(chat_id, msg_id)
-    except Exception:
-        pass          # сообщение уже удалили руками
+    from ..services import deleting
+    await deleting.one(lambda: bot.delete_message(chat_id, msg_id), chat_id)
     user = types.SimpleNamespace(id=user_id, username=None,
                                  full_name=await db.user_handle(user_id))
     pid = await moderation.apply_punishment(
@@ -262,9 +287,8 @@ async def card_report_delete(cb: CallbackQuery, bot: Bot) -> None:
     chat_id, msg_id = int(chat_id), int(msg_id)
     if not await may_act(cb, chat_id):
         return
-    try:
-        await bot.delete_message(chat_id, msg_id)
-    except Exception:
+    from ..services import deleting
+    if not await deleting.one(lambda: bot.delete_message(chat_id, msg_id), chat_id):
         await cb.answer("Не вышло: сообщение старое или нет прав.", show_alert=True)
         return
     await db.add_event(chat_id, "report",

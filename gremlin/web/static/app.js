@@ -29,6 +29,10 @@ const esc = (s) => String(s === null || s === undefined ? '' : s)
   .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
 const plain = (s) => String(s || '').replace(/<[^>]+>/g, '');
+/* Пояснение: пустая строка — новый абзац, перенос — новая строка. Без этого
+   HTML схлопывал переносы, и пояснение читалось сплошным полотном. */
+const introHtml = (text) => String(text || '').split(/\n{2,}/)
+  .map((p) => `<p>${p.replace(/\n/g, '<br>')}</p>`).join('');
 
 function num(n, one, few, many) {
   const m10 = n % 10, m100 = n % 100;
@@ -247,7 +251,7 @@ const tile = (href, label, opts = {}) => `
 const clusterState = (g) => {
   if (!g.spam && !g.ok) return 'ни одна улика ещё не размечена';
   const parts = [];
-  if (g.spam) parts.push(`⛔ спамом — ${g.spam}`);
+  if (g.spam) parts.push(`⛔ спамом — ${g.spam} (${Math.round(g.spam / g.size * 100)}%)`);
   if (g.ok) parts.push(`🕊 нормой — ${g.ok}`);
   if (g.unknown) parts.push(`✋ без оценки — ${g.unknown}`);
   return 'из них помечено: ' + parts.join(', ');
@@ -349,9 +353,9 @@ async function homeView() {
           <span>${off ? '▶' : '▼'} 👤 ${esc(g.owner)}</span>
           <span class="muted">${g.items.length} ${num(g.items.length, 'чат', 'чата', 'чатов')}</span>
         </button>
-        ${off ? '' : `<div class="tiles">${g.items.map(tileFor).join('')}</div>`}`;
+        ${off ? '' : `<div class="tiles chat-list">${g.items.map(tileFor).join('')}</div>`}`;
     }).join('')}`
-    : `<div class="tiles">${d.chats.map(tileFor).join('')}</div>`;
+    : `<div class="tiles chat-list">${d.chats.map(tileFor).join('')}</div>`;
 
   const ownerTiles = d.owner ? `
     <h2>Владельцу бота</h2>
@@ -511,7 +515,7 @@ async function sectionView(cid, sec) {
     title: plain(d.title),
     back,
     html: `
-      <div class="card"><div class="intro">${d.intro}</div></div>
+      <div class="card"><div class="intro">${introHtml(d.intro)}</div></div>
       ${fields ? `<div class="card">${fields}</div>` : ''}
       ${widgets}`,
   };
@@ -596,8 +600,11 @@ function widgetHtml(name, w, cid, d) {
           <div class="value">${w.total}</div></div>
         <div class="row"><div class="label">Годится для сравнения<small>без ручных наказаний</small></div>
           <div class="value">${w.profile}</div></div>
-        <div class="row"><div class="label">⛔ Спам</div><div class="value">${w.spam}</div></div>
-        <div class="row"><div class="label">🕊 Норма</div><div class="value">${w.ok}</div></div>
+        <div class="row"><div class="label">⛔ Спам<small>сообщения</small></div>
+          <div class="value">${w.spam}</div></div>
+        <div class="row"><div class="label">🕊 Норма<small>сообщения</small></div>
+          <div class="value">${w.ok}</div></div>
+        ${linkRow(`#/chat/${cid}/spamprofiles`, '🧪 Профили спамеров', w.faces_spam)}
         <div class="row"><div class="label">✋ Ручные наказания<small>в сравнении не участвуют</small></div>
           <div class="value">${w.unknown}</div></div>
         <div class="row"><div class="label">🧠 Модель</div>
@@ -663,6 +670,7 @@ function widgetHtml(name, w, cid, d) {
       return `<div class="card">
         ${tile(`#/chat/${cid}/s/prof`, '🪪 Проверка профиля', { dot: w.prof_on })}
         ${tile(`#/chat/${cid}/s/cas`, '🌐 Общий список спамеров', { dot: w.cas_on })}
+        ${tile(`#/chat/${cid}/spamprofiles`, '🧪 Спам-профили', { sub: `записей ${w.spam_profiles}` })}
       </div>`;
 
     case 'cas_stats':
@@ -678,14 +686,15 @@ function widgetHtml(name, w, cid, d) {
 
     case 'nn_clusters':
       return `<div class="card">
-        <h2>🗂 Виды спама</h2>
-        <div class="muted">Копилка раскладывается на кучки похожих улик. Разметив кучку
-          целиком, вы размечаете все её улики разом — вместо сотни карточек одно нажатие.</div>
+        <h2>🗂 Кучки похожих улик</h2>
+        <div class="intro">${introHtml('Бот раскладывает улики на кучки по смыслу текста — не по пометкам. Поэтому в одной кучке бывают и спам, и обычные сообщения.\n\n'
+          + '«Без оценки» — наказания, выданные вручную: кнопка размечает в кучке только их, уже размеченное не меняется.\n'
+          + '«Что знает бот» — то, на чём он учится. Оптом не размечается: откройте кучку и поправьте оценку у нужных сообщений.')}</div>
         <div class="row" style="margin-top:10px" id="cluster-tabs">
           <button class="btn ghost" data-act="nn-clusters" data-scope="unknown"
             data-tab="unknown">✋ Без оценки (${w.unknown})</button>
           <button class="btn ghost" data-act="nn-clusters" data-scope="profile"
-            data-tab="profile">📊 Размеченные (${w.profile})</button>
+            data-tab="profile">📚 Что знает бот (${w.profile})</button>
           <button class="btn ghost" data-act="nn-doubt" data-tab="doubt">🤔 Спорное</button>
         </div>
         <div id="clusters"></div>
@@ -810,6 +819,25 @@ async function wlEntryView(cid, rid) {
       </div>
       <button class="btn wide danger" style="margin-top:12px" data-act="wl-del" data-row="${e.row_id}">
         🗑 Убрать из вайтлиста</button>
+    </div>`,
+  };
+}
+
+async function spamProfilesView(cid) {
+  const d = await api(`/chat/${cid}/spamprofiles`);
+  return {
+    title: 'Спам-профили',
+    back: `#/chat/${cid}/s/watch`,
+    html: `<div class="card">
+      <div class="intro">${introHtml('С этими профилями бот сравнивает новых людей, когда включено «Сравнивать профили с забаненными».\n\n'
+        + 'Сюда попадают профили, записанные кнопкой «Спам-профиль», и те, кого бот забанил сам. Записали по ошибке — уберите.')}</div>
+    </div>
+    <div class="card">
+      <h2>Всего: ${d.items.length}</h2>
+      ${d.items.map((p) => `<div class="item">
+          <div class="body">${esc(p.who)}<small>${esc(p.when)} · ${esc(p.text)}</small></div>
+          <button class="btn small ghost" data-act="spamprofile-del" data-id="${p.id}">✕ Убрать</button>
+        </div>`).join('') || '<div class="empty">Пусто.</div>'}
     </div>`,
   };
 }
@@ -1370,7 +1398,18 @@ async function activeView(cid) {
   return {
     title: 'Наказания',
     back: `#/chat/${cid}`,
+    // порядок сверху вниз — от короткого действия к длинному списку: проверить
+    // человека, наказать пачку, посмотреть, кто уже наказан
     html: `<div class="card">${linkRow(`#/chat/${cid}/status`, '🔎 Проверка статуса', '')}</div>
+    <div class="card">
+      <h2>Массовые действия</h2>
+      <div class="intro">Список id или @username одним полем, через пробел или запятую.</div>
+      <div class="wrap" style="margin-top:10px">
+        <button class="btn ghost" data-act="mass" data-kind="unban">🔓 Разбан</button>
+        <button class="btn ghost" data-act="mass" data-kind="kick">👢 Кик</button>
+        <button class="btn danger" data-act="mass" data-kind="ban">⛔ Бан</button>
+      </div>
+    </div>
     <div class="card">
       <h2>📋 Активные (${d.items.length})</h2>
       <div>
@@ -1380,17 +1419,8 @@ async function activeView(cid) {
           </div>`).join('') || '<div class="empty">Все чисты.</div>'}
       </div>
     </div>
-    <div class="card">
-      <h2>Массовые действия</h2>
-      <div class="intro">Список id или @username одним полем, через пробел или запятую.</div>
-      <div class="wrap" style="margin-top:10px">
-        <button class="btn ghost" data-act="mass" data-kind="unban">🔓 Разбан</button>
-        <button class="btn ghost" data-act="mass" data-kind="kick">👢 Кик</button>
-        <button class="btn danger" data-act="mass" data-kind="ban">⛔ Бан</button>
-      </div>
-      <div style="margin-top:10px">${linkRow(`#/chat/${cid}/s/punish_cfg`, '⚙️ Настройки наказаний', '')}</div>
-    </div>
-    ${forgiven}`,
+    ${forgiven}
+    <div class="card">${linkRow(`#/chat/${cid}/s/punish_cfg`, '⚙️ Настройки наказаний', '')}</div>`,
   };
 }
 
@@ -1408,7 +1438,7 @@ async function gamesView(cid) {
         <div class="label"><b>${esc(g.label)}</b><small class="mono">${esc(g.how)}</small></div>
         <label class="switch"><input type="checkbox" data-game="${g.bit}" ${g.on ? 'checked' : ''}><span></span></label>
       </div>
-      <div class="intro">${esc(g.about)}</div>
+      <div class="intro">${introHtml(esc(g.about))}</div>
       ${g.by_hand ? `<div class="wrap" style="margin-top:10px">
         <button class="chip ${g.admins ? 'on' : ''}" data-act="game-who" data-bit="${g.bit}">
           ${g.admins ? '🛡 только админы' : '👥 все'}</button>
@@ -1425,6 +1455,30 @@ async function gamesView(cid) {
   };
 }
 
+/* Загруженный файл настроек ждёт подтверждения: живёт вне CACHE.copy, чтобы
+   перерисовка страницы не сбрасывала выбор разделов. */
+let IMPORTED = null;
+
+function importCard(cid) {
+  const f = IMPORTED;
+  if (!f || f.cid !== String(cid)) return '';
+  const inside = Object.entries(f.inside).map(([k, n]) => `${k} ${n}`).join(', ');
+  return `<div class="card">
+      <h2>📥 Из файла${f.title ? ` «${esc(f.title)}»` : ''}</h2>
+      <div class="intro">Настройки отмеченных разделов заменятся, списки дополнятся:
+        что уже есть в чате, останется.${inside ? ` В файле: ${esc(inside)}.` : ''}</div>
+      <div class="wrap" style="margin-top:10px">${f.groups.map((g) => {
+        const on = f.picked.has(g.key);
+        return `<button class="chip ${on ? 'on' : 'off'}" data-act="import-group" data-key="${g.key}"
+          data-label="${esc(plain(g.label))}">${on ? '✓' : '○'} ${esc(plain(g.label))}</button>`;
+      }).join('')}</div>
+      <div class="wrap" style="margin-top:12px">
+        <button class="btn" data-act="import-run">📥 Загрузить</button>
+        <button class="btn ghost" data-act="import-cancel">Отмена</button>
+      </div>
+    </div>`;
+}
+
 async function copyView(cid) {
   const d = await api(`/chat/${cid}/copy`);
   CACHE.copy = { src: null, groups: new Set(d.groups.map((g) => g.key)) };
@@ -1432,6 +1486,18 @@ async function copyView(cid) {
     title: 'Перенос настроек',
     back: `#/chat/${cid}`,
     html: `<div class="card">
+      <h2>Файл настроек</h2>
+      <div class="intro">Архив со всеми настройками этого чата, списками и медиа триггеров.
+        Бот пришлёт его в личку. Храните как резервную копию или загрузите в другой чат.</div>
+      <div class="wrap" style="margin-top:10px">
+        <button class="btn ghost" data-act="settings-export">📤 Выгрузить в файл</button>
+        <label class="btn ghost">📥 Загрузить из файла
+          <input type="file" accept=".zip,application/zip" hidden data-upload="settings"></label>
+      </div>
+    </div>
+    ${importCard(cid)}
+    <div class="card">
+      <h2>Импорт настроек из другого чата</h2>
       <div class="intro">Выберите чат-источник и разделы. Вместе с настройками едут списки:
         стоп-слова, вайтлист, разрешённые чаты и боты, триггеры с медиа, счётчики.
         Не переносятся получатель сводки и счёт вызовов.</div>
@@ -1755,6 +1821,7 @@ const ROUTES = [
   [/^chat\/(-?\d+)\/wl\/(\d+)$/, wlEntryView],
   [/^chat\/(-?\d+)\/linkwl$/, linkwlView],
   [/^chat\/(-?\d+)\/admins$/, adminsView],
+  [/^chat\/(-?\d+)\/spamprofiles$/, spamProfilesView],
   [/^chat\/(-?\d+)\/charts$/, chartsView],
   [/^chat\/(-?\d+)\/trigs$/, trigsView],
   [/^chat\/(-?\d+)\/trig\/(\d+)$/, trigView],
@@ -1854,7 +1921,7 @@ function skeletonFor(path) {
     return skelCard(skelHead + skelLine(95) + skelLine(88) + skelLine(60) + skelRows(4))
       + skelCard(skelHead + skelRows(2));
   }
-  const lists = /^(chat\/-?\d+\/(active|events|trigs|cmds|words|profwords|warned|answers|linkwl)|admins|access|seed|admin\/log)/;
+  const lists = /^(chat\/-?\d+\/(active|events|trigs|cmds|words|profwords|warned|answers|linkwl|admins|spamprofiles)|access|seed|admin\/log)/;
   if (lists.test(path)) return skelCard(skelHead + skelItems(6));
   return skelCard(skelHead + skelRows(3));
 }
@@ -2047,16 +2114,48 @@ const ACT = {
           <small>${esc(g.words.join(', ') || '—')}</small></div>
         <div class="muted" style="margin:6px 0">${esc(g.sample.slice(0, 160))}</div>
         <div class="muted" style="margin:6px 0">${clusterState(g)}</div>
-        <div class="row">
-          <button class="btn ghost danger" data-act="nn-label" data-i="${i}"
-            data-label="spam" data-scope="${scope}">⛔ Пометить спамом</button>
-          <button class="btn ghost good" data-act="nn-label" data-i="${i}"
-            data-label="ok" data-scope="${scope}">🕊 Пометить нормой</button>
+        ${scope === 'unknown' ? (g.unknown ? `<div class="wrap">
+          <button class="btn ghost danger" data-act="nn-label" data-i="${i}" data-n="${g.unknown}"
+            data-label="spam" data-scope="${scope}">⛔ Спамом: ${g.unknown} без оценки</button>
+          <button class="btn ghost good" data-act="nn-label" data-i="${i}" data-n="${g.unknown}"
+            data-label="ok" data-scope="${scope}">🕊 Нормой: ${g.unknown} без оценки</button>
+        </div>` : '') : `<div class="wrap">
+          <button class="btn ghost" data-act="nn-items" data-i="${i}">🔍 Разобрать по одному</button>
         </div>
+        <div data-items="${i}"></div>`}
       </div>`).join('');
   },
 
+  async 'nn-items'(el) {
+    const box = document.querySelector(`[data-items="${el.dataset.i}"]`);
+    const r = await api(`/chat/${curChat()}/nn/clusters/${el.dataset.i}`);
+    const mark = { spam: '⛔', ok: '🕊', unknown: '✋' };
+    box.innerHTML = r.items.map((it) => `<div class="item" data-sample="${it.id}">
+        <div class="body"><span data-mark>${mark[it.label] || '?'}</span> ${esc(it.text.slice(0, 200))}</div>
+        <div class="wrap" style="flex:none">
+          <button class="chip ${it.label === 'spam' ? 'on' : 'off'}" data-act="nn-sample"
+            data-id="${it.id}" data-label="spam">⛔</button>
+          <button class="chip ${it.label === 'ok' ? 'on' : 'off'}" data-act="nn-sample"
+            data-id="${it.id}" data-label="ok">🕊</button>
+        </div>
+      </div>`).join('') || '<div class="empty">Пусто.</div>';
+  },
+
+  async 'nn-sample'(el) {
+    await api(`/chat/${curChat()}/nn/sample/${el.dataset.id}`, { json: { label: el.dataset.label } });
+    const row = el.closest('[data-sample]');
+    row.querySelectorAll('[data-act="nn-sample"]').forEach((b) => {
+      const on = b.dataset.label === el.dataset.label;
+      b.classList.toggle('on', on);
+      b.classList.toggle('off', !on);
+    });
+    row.querySelector('[data-mark]').textContent = el.dataset.label === 'spam' ? '⛔' : '🕊';
+    toast('Поправлено');
+  },
+
   async 'nn-label'(el) {
+    const what = el.dataset.label === 'spam' ? 'спамом' : 'нормой';
+    if (!await confirmAsk(`Пометить ${what} ${el.dataset.n} сообщений без оценки?`)) return;
     const r = await api(`/chat/${curChat()}/nn/clusters`,
                         { json: { index: Number(el.dataset.i), label: el.dataset.label } });
     toast(r.moved ? `Размечено: ${r.moved}` : 'Разбивка устарела, пересчитайте');
@@ -2247,6 +2346,13 @@ const ACT = {
     render();
   },
 
+  async 'spamprofile-del'(el) {
+    if (!await confirmAsk('Убрать профиль из базы спама?')) return;
+    await api(`/chat/${curChat()}/spamprofiles/${el.dataset.id}`, { method: 'DELETE' });
+    toast('Убран');
+    render();
+  },
+
   async unforgive(el) {
     await api(`/chat/${curChat()}/forgiven/${el.dataset.id}`, { method: 'DELETE' });
     toast('Правило снова работает');
@@ -2307,6 +2413,33 @@ const ACT = {
     if (on) set.add(key); else set.delete(key);
     el.classList.toggle('on', on);
     el.textContent = (on ? '✓ ' : '○ ') + el.dataset.label;
+  },
+
+  async 'settings-export'() {
+    toast((await api(`/chat/${curChat()}/export`, { method: 'POST' })).note);
+  },
+
+  'import-group'(el) {
+    const set = IMPORTED.picked;
+    const on = !set.has(el.dataset.key);
+    if (on) set.add(el.dataset.key); else set.delete(el.dataset.key);
+    el.classList.toggle('on', on);
+    el.classList.toggle('off', !on);
+    el.textContent = (on ? '✓ ' : '○ ') + el.dataset.label;
+  },
+
+  async 'import-run'() {
+    if (!IMPORTED.picked.size) return toast('Не выбрано ни одного раздела');
+    if (!await confirmAsk('Загрузить выбранные разделы в этот чат?')) return;
+    const r = await api(`/chat/${curChat()}/import/apply`, { json: { groups: [...IMPORTED.picked] } });
+    IMPORTED = null;
+    toast(Object.entries(r.copied).filter(([, n]) => n).map(([k, n]) => `${k}: ${n}`).join(' · ') || 'Готово');
+    go(`#/chat/${curChat()}`);
+  },
+
+  'import-cancel'() {
+    IMPORTED = null;
+    render();
   },
 
   async 'copy-run'() {
@@ -2562,6 +2695,13 @@ document.addEventListener('change', async (e) => {
       const body = {};
       body[el.dataset.rl] = el.dataset.rl === 'kind' || el.dataset.rl === 'mode' ? el.value : +el.value;
       await api('/fun/roulette', { json: body });
+      render();
+    } else if (el.dataset.upload === 'settings') {
+      const fd = new FormData();
+      fd.append('file', el.files[0]);
+      el.value = '';
+      const r = await api(`/chat/${curChat()}/import`, { form: fd });
+      IMPORTED = { cid: String(curChat()), ...r, picked: new Set(r.groups.map((g) => g.key)) };
       render();
     } else if (el.dataset.upload === 'answer') {
       const caption = await ask({ title: 'Подпись к медиа', hint: 'Можно оставить пустой.', ok: 'Загрузить' });

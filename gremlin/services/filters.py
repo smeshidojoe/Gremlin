@@ -95,6 +95,20 @@ def link_allowed(link: str, usernames: set[str], chat_ids: set[int]) -> bool:
     return False
 
 
+def strip_own_links(text: str, usernames: set[str], chat_ids: set[int]) -> str:
+    """Текст без ссылок на свои чаты — для нейрофильтра.
+
+    В копилке спама почти все ссылки ведут на чужие каналы, поэтому для модели
+    «t.me/…» стало приметой рекламы сама по себе. Ссылка на пост своего же
+    канала или сообщение этого чата оценивалась как реклама на 82%. Решает не
+    модель: свои ссылки правило ссылок и так разрешает, значит и сравнивать
+    их не с чем — убираем, а остальной текст оцениваем как есть.
+    """
+    def keep_foreign(m: re.Match) -> str:
+        return "" if link_allowed(m.group(0), usernames, chat_ids) else m.group(0)
+    return " ".join(_TG_LINK_RE.sub(keep_foreign, text or "").split())
+
+
 # ---------- стоп-слова ----------
 
 # chat_id -> compiled regex | None; сбрасывается при изменении списка

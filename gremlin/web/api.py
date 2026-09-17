@@ -176,8 +176,9 @@ async def api_chat(request: web.Request) -> web.Response:
 
     # разделы верхнего уровня; подстраницы (у них back) открываются изнутри
     sections = []
+    hidden = schema.hidden_sections()
     for sec in schema.SECTIONS:
-        if sec.back:
+        if sec.back or sec.key in hidden:
             continue
         if sec.key == "digest" and digest_svc.tracked_chat() != cid:
             continue
@@ -405,7 +406,8 @@ async def _widget(cid: int, widget: str, s) -> dict:
                 "phrases": len(await db.phrases_list(cid))}
 
     if widget == "watch_subs":
-        return {"cas_on": bool(s.cas_on), "prof_on": bool(s.prof_on)}
+        return {"cas_on": bool(s.cas_on), "prof_on": bool(s.prof_on),
+                "spam_profiles": len(await db.spam_profiles(cid))}
 
     if widget == "cas_stats":
         st = await db.cas_stats()
@@ -550,6 +552,31 @@ async def api_nn_clusters(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="bad scope")
     return js({"scope": scope, "items": await nn.clusters(cid, scope),
                "model": nn.status(), "min": config.NN_MIN_SAMPLES})
+
+
+@routes.get("/api/chat/{cid}/nn/clusters/{index}")
+async def api_nn_cluster_items(request: web.Request) -> web.Response:
+    """Сообщения одной кучки — для точечной правки оценок."""
+    cid = await cid_of(request)
+    ids = nn.cluster_ids(cid, int(request.match_info["index"]))
+    if ids is None:
+        raise web.HTTPNotFound(text="Разбивка устарела, пересчитайте кучки.")
+    return js({"items": [{"id": r["id"], "text": r["text"], "label": r["label"]}
+                         for r in await db.samples_by_ids(cid, ids)]})
+
+
+@routes.post("/api/chat/{cid}/nn/sample/{sid}")
+async def api_nn_sample_label(request: web.Request) -> web.Response:
+    cid = await cid_of(request)
+    label = (await body(request)).get("label")
+    if label not in ("spam", "ok"):
+        raise web.HTTPBadRequest(text="bad label")
+    sid = int(request.match_info["sid"])
+    if not await db.sample_set_label(cid, sid, label):
+        raise web.HTTPNotFound(text="Этой улики уже нет.")
+    await db.add_event(cid, "nn", f"улика #{sid} размечена как {label} (панель)")
+    nn._profile.pop(cid, None)        # разбивку не трогаем, иначе уедут номера
+    return js({"ok": True})
 
 
 @routes.post("/api/chat/{cid}/nn/clusters")
@@ -1213,6 +1240,28 @@ async def api_forgiven(request: web.Request) -> web.Response:
     return js({"items": items})
 
 
+@routes.get("/api/chat/{cid}/spamprofiles")
+async def api_spam_profiles(request: web.Request) -> web.Response:
+    cid = await cid_of(request)
+    items = [{"id": r["id"], "user_id": r["user_id"],
+              "who": await db.user_handle(r["user_id"]) if r["user_id"] else "—",
+              "when": utils.fmt_ts(r["ts"]), "text": r["text"]}
+             for r in await db.spam_profiles(cid)]
+    return js({"items": items})
+
+
+@routes.delete("/api/chat/{cid}/spamprofiles/{rid}")
+async def api_spam_profile_del(request: web.Request) -> web.Response:
+    cid = await cid_of(request)
+    row = await db.spam_profile_delete(cid, int(request.match_info["rid"]))
+    if row is None:
+        raise web.HTTPNotFound(text="Этой записи уже нет.")
+    nn.invalidate(cid)
+    await db.add_event(cid, "card", f"спам-профиль убран из базы: "
+                                    f"{row['user_id']} by {uid_of(request)} (панель)")
+    return js({"ok": True})
+
+
 @routes.delete("/api/chat/{cid}/forgiven/{rid}")
 async def api_forgiven_del(request: web.Request) -> web.Response:
     cid = await cid_of(request, "punish")
@@ -1377,6 +1426,85 @@ async def api_copy(request: web.Request) -> web.Response:
     stats = await transfer.copy_chat(src, cid, set(groups))
     await db.kv_set(um.setup_key(cid), "1")
     flt.invalidate_words(cid)
+    return js({"copied": stats})
+
+
+# ---------- файл настроек ----------
+#
+# Скачивание прямо из мини-аппа ненадёжно: внутри Telegram у WebView свои
+# представления о загрузках, а наш API ещё и требует подпись в заголовке,
+# которую обычная ссылка не несёт. Поэтому архив бот присылает в личку —
+# туда же, куда его присылает меню.
+
+@routes.post("/api/chat/{cid}/export")
+async def api_export(request: web.Request) -> web.Response:
+    from aiogram.types import BufferedInputFile
+    cid = await cid_of(request, "owner")
+    uid = uid_of(request)
+    data, stats = await transfer.export_chat(cid)
+    ch = await db.get_chat(cid)
+    inside = ", ".join(f"{k} {v}" for k, v in stats.items() if v)
+    try:
+        await bot_of(request).send_document(
+            uid, BufferedInputFile(data, filename=transfer.export_name(cid)),
+            caption=(f"📤 Настройки «{utils.esc(ch['title'] if ch else cid)}»"
+                     + (f"\n{utils.esc(inside)}" if inside else "")))
+    except Exception:
+        logger.warning("выгрузка %s: не отправить в личку %s", cid, uid, exc_info=True)
+        raise web.HTTPBadRequest(
+            text="Не получилось прислать файл в личку. Напишите боту /start и повторите.")
+    await db.add_event(cid, "card", f"настройки выгружены в файл by {uid}")
+    return js({"note": "Файл отправлен вам в личку с ботом"})
+
+
+@routes.post("/api/chat/{cid}/import")
+async def api_import(request: web.Request) -> web.Response:
+    """Принять файл и показать, что в нём. Ничего не меняет до подтверждения."""
+    cid = await cid_of(request, "owner")
+    reader = await request.multipart()
+    raw = None
+    while True:
+        part = await reader.next()
+        if part is None:
+            break
+        if part.name == "file":
+            raw = await part.read(decode=False)
+    if not raw:
+        raise web.HTTPBadRequest(text="Файл не пришёл.")
+    try:
+        snap, media = transfer.parse_archive(bytes(raw))
+    except transfer.BadArchive as e:
+        raise web.HTTPBadRequest(text=str(e).capitalize())
+    if not snap["groups"]:
+        raise web.HTTPBadRequest(text="В файле нет ни одного раздела.")
+    transfer.stash(uid_of(request), cid, snap, media)
+    return js({
+        "title": snap.get("chat_title"),
+        "inside": transfer.describe(snap),
+        "groups": [{"key": g, "label": transfer.GROUPS[g][0]}
+                   for g in transfer.ALL_GROUPS if g in snap["groups"]],
+    })
+
+
+@routes.post("/api/chat/{cid}/import/apply")
+async def api_import_apply(request: web.Request) -> web.Response:
+    cid = await cid_of(request, "owner")
+    uid = uid_of(request)
+    got = transfer.stashed(uid, cid)
+    if got is None:
+        raise web.HTTPBadRequest(text="Файл уже забыт — загрузите его ещё раз.")
+    snap, media = got
+    groups = {g for g in ((await body(request)).get("groups") or [])
+              if g in snap["groups"]}
+    if not groups:
+        raise web.HTTPBadRequest(text="Не выбрано ни одного раздела.")
+    stats = await transfer.apply(cid, snap, groups, media.get)
+    transfer.unstash(uid, cid)
+    await db.kv_set(um.setup_key(cid), "1")
+    flt.invalidate_words(cid)
+    moved = ", ".join(f"{k}: {v}" for k, v in stats.items() if v)
+    await db.add_event(cid, "card", f"настройки загружены из файла by {uid}: "
+                                    f"{moved or 'пусто'}")
     return js({"copied": stats})
 
 

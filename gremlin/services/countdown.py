@@ -40,10 +40,11 @@ def marks(seconds: int, fine: int = FINE) -> list[int]:
 
 
 def label(left: int) -> str:
-    """«45 сек» или «9:50»: длинный таймер в минутах читается быстрее."""
-    if left < 60:
-        return f"{left} сек"
-    return f"{left // 60}:{left % 60:02d}"
+    """Сколько осталось: «45 сек», «580 сек».
+
+    Всегда секундами, без перевода в «9:40»: в сообщениях игр так привычнее.
+    """
+    return f"{left} сек"
 
 
 async def run(seconds: int, draw: Callable[[int], Awaitable[object]],

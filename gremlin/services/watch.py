@@ -330,10 +330,12 @@ def profile_sig(first_name: str | None, last_name: str | None, username: str | N
 
 
 async def profile_check(bot, chat_id: int, user, settings,
-                        data: dict | None = None) -> tuple[dict, str] | None:
+                        data: dict | None = None) -> tuple[dict, list[str]] | None:
     """Найти рекламу в описании профиля и прикреплённом канале.
 
-    Возвращает (данные профиля, причина) или None. Ищем теми же способами,
+    Возвращает (данные профиля, все находки) или None. Смотрим всё, а не до
+    первой находки: иначе спам-профиль банился «за стоп-слово 🔞», и ни в
+    карточке, ни в вердикте не было видно, что он ещё и похож на забаненных. Ищем теми же способами,
     что и в сообщениях: буквальные стоп-слова, смысловые фразы и сравнение с
     профилями, за которые в этом чате уже банили. Ничего нового не изобретается
     — меняется источник текста.
@@ -356,18 +358,19 @@ async def profile_check(bot, chat_id: int, user, settings,
     # Смысловые фразы к профилю не применяем сознательно: они пишутся под
     # сообщения, а в описании тот же смысл живёт наоборот — «не переношу
     # тему X» ловится наравне с тем, кто X продаёт.
+    found: list[str] = []
     if len(text) >= 4 and settings.prof_words:
         word = await flt.match_stopword(chat_id, text, "prof")
         if word:
-            return data, f"стоп-слово в профиле: «{word}»"
+            found.append(f"стоп-слово в профиле: «{word}»")
 
     if settings.watch_nn and len(text) >= 4:
         # сравниваем личность целиком — тем же видом строки, каким и запоминаем
         sim = await nn.face_score(chat_id, prof_svc.face_text(user, data))
         if sim is not None and sim >= config.PROFILE_SIM:
-            return data, f"профиль как у забаненных ({sim}%)"
+            found.append(f"профиль как у забаненных ({sim}%)")
 
-    return None
+    return (data, found) if found else None
 
 
 async def photo_points(bot, chat_id: int, user, settings,
@@ -450,7 +453,8 @@ def _clean_find(reason: str) -> str:
 async def _uni_shadow(bot, chat, user, settings, message, text, *,
                       p_hard, p_reasons, hard, cosmetic, m_reasons,
                       prof_pts, prof_reasons, cas_pts, nn_hit, lvl,
-                      face_sim, total, suspect, ban_at, event) -> None:
+                      face_sim, total, suspect, ban_at, event,
+                      pdata: dict | None = None, was: str | None = None) -> None:
     """Перевести улики наблюдения на общую шкалу и записать вердикт.
 
     Заново ничего не считаем и в Telegram не ходим: берём то, что наблюдение
@@ -497,6 +501,13 @@ async def _uni_shadow(bot, chat, user, settings, message, text, *,
     guest = known is False
     ctx = await vd.context(chat.id, user, message, lvl=lvl, guest=guest,
                            text=text, buttons=buttons)
+    # Реклама в профиле ведёт наружу сама: канал в профиле и есть выход.
+    # Считаем его только при улике в профиле — канал есть у многих обычных
+    # людей, и за сообщение без ссылок он отвечать не должен
+    if (not ctx["outward"] and any(s.family == "profile" for s in signals)
+            and vd.profile_outward(pdata)):
+        ctx["outward"] = True
+        ctx["outward_note"] = "выход наружу через профиль"
     # факты о человеке лежат в ctx: спрашивать их второй раз — три лишних
     # запроса к базе на каждое подозрительное сообщение
     signals += vd.reputation_signals(cas=bool(cas_pts),
@@ -504,11 +515,12 @@ async def _uni_shadow(bot, chat, user, settings, message, text, *,
     # Пишем состояние, а не отправку: карточку наблюдение при повторе
     # придерживает (RECARD_STEP), и метка «карточка» врала бы — сравнивали
     # бы вердикт с тем, чего не было.
-    was = "ничего"
-    if ban_at and total >= ban_at:
-        was = "наблюдение/ban"
-    elif total >= suspect:
-        was = "наблюдение/подозрение"
+    if was is None:
+        was = "ничего"
+        if ban_at and total >= ban_at:
+            was = "наблюдение/ban"
+        elif total >= suspect:
+            was = "наблюдение/подозрение"
     await vd.shadow(chat, user, settings, signals=signals, ctx=ctx, text=text,
                     was=was)
 
@@ -551,6 +563,7 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None,
     # новичка на входе, про того, кто в чате не состоит (комментаторы под
     # постами — как раз они), и про того, кто уже чем-то насторожил.
     prof_pts, prof_reasons = 0, []
+    pdata = None
     if settings.prof_on:
         from . import adm_cache
         # реакция — тоже повод: рекламные аккаунты часто ничего не пишут,
@@ -571,17 +584,34 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None,
             from . import profile as prof_svc
             pdata = await prof_svc.fetch(bot, user.id)
             found = await profile_check(bot, chat.id, user, settings, pdata)
+            # аватарка идёт очками всегда, даже в режиме «наказывать»:
+            # одна она ничего не доказывает, но в причине бана её видно
+            pts, why_photo = await photo_points(bot, chat.id, user, settings, pdata)
             if found is not None:
-                data, why = found
+                data, finds = found
                 if settings.prof_mode == "punish":
+                    # Вердикт пишем и тут: раньше наказание за профиль выходило
+                    # до теневой записи, и самые явные спам-аккаунты в журнал
+                    # не попадали вовсе — калибровать было не на чем
+                    if settings.uni_mode:
+                        try:
+                            await _uni_shadow(
+                                bot, chat, user, settings, message, text,
+                                p_hard=p_hard, p_reasons=p_reasons,
+                                hard=hard, cosmetic=cosmetic, m_reasons=m_reasons,
+                                prof_pts=int(settings.prof_score) + pts,
+                                prof_reasons=finds + why_photo,
+                                cas_pts=cas_pts, nn_hit=nn_hit, lvl=lvl,
+                                face_sim=None, total=0, suspect=0, ban_at=0,
+                                event=event, pdata=data,
+                                was=f"профиль/{settings.prof_punish}")
+                        except Exception:
+                            logger.debug("единая оценка не посчиталась", exc_info=True)
                     await _profile_punish(bot, chat, user, settings, message,
-                                          data, why)
+                                          data, ", ".join(finds + why_photo))
                     return
                 prof_pts = int(settings.prof_score)
-                prof_reasons = [why]
-            # аватарка идёт очками всегда, даже в режиме «наказывать»:
-            # одна она ничего не доказывает
-            pts, why_photo = await photo_points(bot, chat.id, user, settings, pdata)
+                prof_reasons = list(finds)
             prof_pts += pts
             prof_reasons += why_photo
 
@@ -667,7 +697,7 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None,
                               cas_pts=cas_pts, nn_hit=nn_hit, lvl=lvl,
                               face_sim=face_sim,
                               total=total, suspect=suspect, ban_at=ban_at,
-                              event=event)
+                              event=event, pdata=pdata)
         except Exception:
             logger.debug("единая оценка не посчиталась", exc_info=True)
 

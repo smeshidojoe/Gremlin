@@ -2710,18 +2710,32 @@ async def user_seen_chats(user_id: int, chat_ids: list[int]) -> set[int]:
     """В каких из этих чатов бот хоть что-то знает о человеке: писал, был
     наказан, получал варн или прощение, стоит в вайтлисте, попадал в
     наблюдение или в теневую оценку, упоминается в логе."""
+    return set(await user_seen_why(user_id, chat_ids))
+
+
+async def user_seen_why(user_id: int, chat_ids: list[int]) -> dict[int, set[str]]:
+    """То же, но с тем, откуда о человеке известно: имя таблицы или 'events'.
+
+    Нужно проверке статуса: чат, в котором человек не писал и не наказан, а
+    лишь поставил реакцию или упомянут в логе, без пояснения выглядел лишним.
+    """
     if not chat_ids:
-        return set()
+        return {}
     ph = ",".join("?" * len(chat_ids))
     tables = ("msg_stats", "punishments", "warns", "forgiven", "whitelist",
               "watch_profiles", "verdicts")
-    parts = [f"SELECT chat_id FROM {t} WHERE user_id = ? AND chat_id IN ({ph})"
+    parts = [f"SELECT chat_id, '{t}' FROM {t} WHERE user_id = ? AND chat_id IN ({ph})"
              for t in tables]
+    parts.append(f"SELECT chat_id, 'spam_profile' FROM samples WHERE user_id = ? "
+                 f"AND chat_id IN ({ph}) AND origin = 'profile' AND label = 'spam'")
     args: list = []
-    for _ in tables:
+    for _ in range(len(parts)):
         args += [user_id, *chat_ids]
     cur = await _db.execute(" UNION ".join(parts), args)
-    found = {r[0] for r in await cur.fetchall()}
+    why: dict[int, set[str]] = {}
+    for r in await cur.fetchall():
+        why.setdefault(r[0], set()).add(r[1])
+    found = set(why)
     # У событий id живёт только в тексте, а LIKE находит его и внутри чужих
     # чисел: у короткого id так в список попадали чужие чаты. Границы числа
     # досматриваем здесь, и только по чатам, которые ещё не нашлись
@@ -2732,9 +2746,10 @@ async def user_seen_chats(user_id: int, chat_ids: list[int]) -> set[int]:
             f"({','.join('?' * len(rest))}) AND text LIKE ?",
             (*rest, f"%{user_id}%"))
         exact = re.compile(rf"(?<!\d){user_id}(?!\d)")
-        found |= {r["chat_id"] for r in await cur.fetchall()
-                  if exact.search(r["text"] or "")}
-    return found
+        for r in await cur.fetchall():
+            if exact.search(r["text"] or ""):
+                why.setdefault(r["chat_id"], set()).add("events")
+    return why
 
 
 _NOT_ABOUT_PEOPLE = ("bot", "nn", "digest")

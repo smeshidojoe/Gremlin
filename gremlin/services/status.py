@@ -202,6 +202,17 @@ async def _about(bot: Bot, user_id: int) -> list[str]:
     return out
 
 
+# откуда бот знает о человеке, если ни сообщений, ни наказаний в чате нет
+_SEEN_ONLY = (
+    ("watch_profiles", "👁 попадал в наблюдение (реакция или профиль), карточки не было"),
+    ("verdicts", "⚖️ есть записи теневой оценки"),
+    ("punishments", "🔨 были наказания, сейчас сняты"),
+    ("warns", "⚠️ получал варны"),
+    ("forgiven", "🕊 был прощён"),
+    ("events", "📜 упоминается в журнале событий"),
+)
+
+
 async def collect(bot: Bot, user_id: int, chats, first: int | None = None) -> dict:
     """Всё о человеке по списку чатов. Текущий чат — первым."""
     chats = sorted(chats, key=lambda c: c["chat_id"] != first)
@@ -210,11 +221,18 @@ async def collect(bot: Bot, user_id: int, chats, first: int | None = None) -> di
     # имя и ник берём у Telegram: в базе они такие, какими бот видел их
     # последний раз, а человек мог давно переименоваться
     tg = next((r["user"] for r in rows if r["user"] is not None), None)
-    seen = await db.user_seen_chats(user_id, ids)
+    seen = await db.user_seen_why(user_id, ids)
     shown = []
     for r in rows:
         del r["user"]
         if r.pop("tg") or r["chat_id"] in seen:
+            got = seen.get(r["chat_id"], set())
+            if "spam_profile" in got:
+                r["lines"].append("🧪 профиль в базе спам-профилей этого чата")
+            # Строк нет, а чат в списке: человек тут не писал и не наказан.
+            # Без пояснения такой чат выглядел ошибкой — говорим, откуда он
+            if not r["lines"]:
+                r["lines"] += [text for key, text in _SEEN_ONLY if key in got]
             shown.append(r)
 
     known = await db.get_user(user_id)

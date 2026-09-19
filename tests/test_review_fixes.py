@@ -257,3 +257,26 @@ async def test_status_dates_only_from_viewer_chats(chat, monkeypatch):
     day = st._day_date(today - 5)
     # сообщение в чужом чате сегодня не должно попасть в «последнее»
     assert d["facts"] == [f"✉️ пишет в ваших чатах с {day} · последнее сообщение {day}"]
+
+
+async def test_status_explains_chat_without_messages(chat, monkeypatch):
+    """Чат, где человек не писал и не наказан, не выглядит лишним: сказано, откуда он."""
+    from gremlin.services import nn
+    monkeypatch.setattr(profile, "_cache", {})
+    uid = 8854549860
+
+    class Bot(FakeBot):
+        async def get_chat_member(self, cid, u):
+            return types.SimpleNamespace(status="left", user=None)
+
+    await db.watch_set(chat, uid, "sig", False, score=0)
+    await nn.remember_face(chat, uid, "Varya · 18+", "spam")
+    await db.add_event(chat, "card", f"спам-профиль в базу: {uid} by 1 (проверка статуса)")
+    assert (await db.user_seen_why(uid, [chat]))[chat] == {"watch_profiles", "spam_profile"}
+    d = await st.collect(Bot(), uid, [{"chat_id": chat, "title": "Мой"}])
+    assert d["chats"][0]["lines"] == ["🧪 профиль в базе спам-профилей этого чата"]
+
+    other = CHAT - 30
+    await db.add_event(other, "leave", f"Varya ({uid})")
+    d = await st.collect(Bot(), uid, [{"chat_id": other, "title": "Чужой"}])
+    assert d["chats"][0]["lines"] == ["📜 упоминается в журнале событий"]

@@ -97,3 +97,29 @@ def test_low_nsfw_thresholds_removed():
 
 async def test_photo_threshold_default_is_97(chat):
     assert (await db.get_settings(chat)).prof_photo_min == 97
+
+
+async def test_profile_ban_writes_verdict_with_all_finds(prof_chat, chat, cards,
+                                                        monkeypatch):
+    """Спам-профиль из «каментиков»: бан за профиль не миновал вердикт, в
+    причине видны все находки, а канал в профиле считается выходом наружу."""
+    import os
+
+    from gremlin.services import nn
+    from gremlin.services import verdict as vd
+
+    async def face_score(cid, face):
+        return 91
+    monkeypatch.setattr(nn, "face_score", face_score)
+    await db.set_setting(chat, "prof_members", 0)
+    await db.set_setting(chat, "watch_nn", 1)
+    s = await db.get_settings(chat)
+    bot = FakeBot()
+    await watch.check_user(bot, make_chat(), make_user(GUEST), s,
+                           Msg("Остался всего один, теперь я заберу его себе"), None)
+    assert [u for _c, u, _t in bot.banned] == [GUEST]
+    card = cards[-1]["text"]
+    assert "стоп-слово в профиле: «18+»" in card and "как у забаненных (91%)" in card
+    log = open(vd.log_path(chat), encoding="utf-8").read()
+    assert "было: профиль/ban" in log
+    assert "выход наружу через профиль" in log and "нет выхода наружу" not in log

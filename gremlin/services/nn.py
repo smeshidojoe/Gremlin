@@ -702,10 +702,15 @@ async def remember_spam_profile(bot, chat_id: int, user_id: int) -> tuple[bool, 
         return False, "Записывать нечего: имя пустое, профиль закрыт."
     stored = face[:config.SAMPLE_TEXT_LIMIT]
 
+    # Проверка статуса ищет человека по всем чатам, а база своя у каждого —
+    # без названия чата запись «терялась» в соседнем
+    row = await db.get_chat(chat_id)
+    where = f" чата «{row['title']}»" if row is not None and row["title"] else ""
+
     mine = [r for r in await db.samples_of_origin(chat_id, "profile")
             if r["user_id"] == user_id]
     if any(r["label"] == "spam" and r["text"] == stored for r in mine):
-        return False, "Этот профиль уже в базе спама."
+        return False, f"Этот профиль уже в базе спама{where}."
     # раньше его отметили нормальным («больше не трогать») — теперь передумали;
     # старая пометка иначе спорила бы с новой в каждом сравнении
     for r in mine:
@@ -713,7 +718,7 @@ async def remember_spam_profile(bot, chat_id: int, user_id: int) -> tuple[bool, 
             await db.sample_relabel(r["id"], "spam")
     await remember_face(chat_id, user_id, face, "spam")
 
-    note = "Профиль записан в базу спама: похожих бот узнает сразу."
+    note = f"Профиль записан в базу спама{where}: похожих бот узнает сразу."
     s = await db.get_settings(chat_id)
     if not s.watch_nn:
         note += (" Сравнение профилей в наблюдении сейчас выключено — "

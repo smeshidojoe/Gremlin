@@ -1357,7 +1357,7 @@ function statusHtml(cid) {
       <h2 style="margin-top:12px">⚖️ Наказания в ваших чатах</h2>
       <div class="wrap">${counts}</div>
       <div class="wrap" style="margin-top:10px">
-        <button class="btn ghost" data-act="spam-profile" data-uid="${esc(d.user_id)}">🧪 Спам-профиль</button>
+        <button class="btn ghost" data-act="spam-profile" data-uid="${esc(d.user_id)}">🧪 Спам-профиль${d.here ? ` в «${esc(d.here)}»` : ''}</button>
       </div>
     </div>
     <div class="card"><h2>💬 Чаты</h2>${chats}</div>

@@ -3860,7 +3860,13 @@ async def status_input(message: Message, state: FSMContext, bot: Bot) -> None:
     chats = await db.chats_for(message.from_user.id)
     d = await status_svc.collect(bot, uid, chats, first=cid)
     b = InlineKeyboardBuilder()
-    b.row(_btn("🧪 Спам-профиль", f"u:spp:{cid}:{uid}"))
+    # база спам-профилей своя у каждого чата, а проверка смотрит все —
+    # пишем в кнопке, куда именно ляжет запись
+    here = await db.get_chat(cid)
+    title = (here["title"] if here is not None else "") or ""
+    title = title if len(title) <= 24 else title[:23] + "…"
+    b.row(_btn(f"🧪 Спам-профиль в «{title}»" if title else "🧪 Спам-профиль",
+               f"u:spp:{cid}:{uid}"))
     b.row(_btn("🔎 Проверить другого", f"u:ps:{cid}"))
     b.row(_btn("⬅️ Назад", f"u:p:{cid}:0"))
     await _edit_menu(message, bot, state, status_svc.render(d), b.as_markup())

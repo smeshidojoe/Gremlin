@@ -136,6 +136,8 @@ def _multiplier(ctx: dict) -> tuple[float, list[str]]:
         # поэтому это сильный минус, а не потолок.
         mult *= config.UNI_NO_EXIT_MULT
         notes.append(f"нет выхода наружу ×{config.UNI_NO_EXIT_MULT}")
+    elif ctx.get("outward_note"):
+        notes.append(ctx["outward_note"])
     return mult, notes
 
 
@@ -337,6 +339,21 @@ def has_outward(text: str, buttons: list | None = None) -> bool:
     if buttons:
         return True
     return bool(_OUTWARD.search(text or ""))
+
+
+def profile_outward(data: dict | None) -> bool:
+    """Есть ли выход наружу в самом профиле: канал или контакт в описании.
+
+    У спам-аккаунта сообщение бывает совсем пустым («Остался всего один…»),
+    а реклама висит в профиле — канал и «кончи со мной» в его описании.
+    Искать выход только в сообщении значило резать такой профиль вдвое.
+    """
+    if not data:
+        return False
+    if data.get("channel_title") or data.get("channel_username"):
+        return True
+    return bool(_OUTWARD.search(" ".join([data.get("bio") or "",
+                                          data.get("channel_desc") or ""])))
 
 
 async def context(chat_id: int, user, message=None, *, lvl=None,

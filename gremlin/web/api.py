@@ -1199,7 +1199,9 @@ async def api_status(request: web.Request) -> web.Response:
     if uid is None:
         return js({"ok": False, "error": err})
     chats = await db.chats_for(uid_of(request))
-    return js({"ok": True, **await status_svc.collect(bot, uid, chats, first=cid)})
+    here = await db.get_chat(cid)
+    return js({"ok": True, "here": (here["title"] if here is not None else "") or "",
+               **await status_svc.collect(bot, uid, chats, first=cid)})
 
 
 @routes.post("/api/chat/{cid}/spamprofile")

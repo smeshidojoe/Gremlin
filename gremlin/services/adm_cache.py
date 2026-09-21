@@ -10,6 +10,8 @@ logger = logging.getLogger("gremlin.adm_cache")
 
 # chat_id -> (expires, {user_id, ...})
 _admins: dict[int, tuple[float, set[int]]] = {}
+# chat_id -> {username ботов-админов, в нижнем регистре}; попутно из того же запроса
+_admin_bots: dict[int, set[str]] = {}
 # username(lower) -> (expires, chat_type | None)
 _mentions: dict[str, tuple[float, str | None]] = {}
 
@@ -22,6 +24,8 @@ async def chat_admin_ids(bot: Bot, chat_id: int) -> set[int]:
     try:
         members = await bot.get_chat_administrators(chat_id)
         ids = {m.user.id for m in members}
+        _admin_bots[chat_id] = {m.user.username.lower() for m in members
+                                if m.user.is_bot and m.user.username}
     except Exception:
         ids = set()
     _admins[chat_id] = (now + config.ADMIN_CACHE_TTL, ids)

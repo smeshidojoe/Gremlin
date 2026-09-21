@@ -245,11 +245,11 @@ def _copy_scope(user_id: int, cid: int, src: int) -> tuple[str, ...] | None:
     """Какие разделы можно отметить. None — загруженный файл уже забыт."""
     from ..services import transfer
     if src != FROM_FILE:
-        return transfer.ALL_GROUPS
+        return transfer.shown_groups()
     got = transfer.stashed(user_id, cid)
     if got is None:
         return None
-    return tuple(g for g in transfer.ALL_GROUPS if g in got[0]["groups"])
+    return tuple(g for g in transfer.shown_groups() if g in got[0]["groups"])
 
 
 async def view_copy_pick(cid: int, src: int, picked: set[str],
@@ -1982,7 +1982,8 @@ async def view_punishments(cid: int, page: int = 0,
     ch = await db.get_chat(cid)
     counts: dict[str, int] = {}
     for r in rows:
-        counts[r["kind"]] = counts.get(r["kind"], 0) + 1
+        k = utils.shown_kind(r["kind"], r["reason"])
+        counts[k] = counts.get(k, 0) + 1
     lines = [
         f"<b>🚫 Наказания</b> · {utils.esc(ch['title'] if ch else str(cid))}\n",
         f"Активных сейчас: <b>{len(rows)}</b>",
@@ -2174,12 +2175,12 @@ async def view_active(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarku
         since = f" · выдан {utils.fmt_ts(r['created'])}" if r["created"] else ""
         # причина без «сетка · чат:» и без приписки про подмену мута: строка
         # одна, и место в ней нужно самой причине
-        why, swapped = utils.short_reason(r["reason"])
+        why, _swapped = utils.short_reason(r["reason"])
+        shown = utils.shown_kind(r["kind"], r["reason"])
         lines.append(
             f"{i}. <b>{who_link}</b> — "
-            f"{_KIND_WORD.get(r['kind'], r['kind'])} {until}{since}\n"
+            f"{_KIND_WORD.get(shown, shown)} {until}{since}\n"
             f"    <i>{utils.esc(utils.chunk(why, 70))}</i>"
-            + (" <i>· мут→бан</i>" if swapped else "")
         )
         b.row(_btn(f"{i}. 🔓 Снять: {utils.chunk(who, 24)}",
                    f"u:pu:{cid}:{r['id']}:{page}"))
@@ -2455,7 +2456,7 @@ async def import_file_input(message: Message, state: FSMContext, bot: Bot) -> No
                      f"{_IMPORT_PROMPT}\n\n⚠️ В файле нет ни одного раздела.")
         return
     transfer.stash(message.from_user.id, cid, snap, media)
-    picked = set(snap["groups"])
+    picked = set(_copy_scope(message.from_user.id, cid, FROM_FILE) or ())
     await state.set_state(None)               # данные оставляем: там галочки
     await state.update_data(copy_groups=sorted(picked))
     text, kb = await view_copy_pick(cid, FROM_FILE, picked, message.from_user.id)
@@ -2494,8 +2495,8 @@ async def cb_copy_pick(cb: CallbackQuery, state: FSMContext) -> None:
     cid, src = int(cid), int(src)
     if cid == src or not await _guard(cb, cid, "owner") or not await _guard(cb, src, "owner"):
         return
-    await state.update_data(copy_groups=list(transfer.ALL_GROUPS))
-    text, kb = await view_copy_pick(cid, src, set(transfer.ALL_GROUPS))
+    await state.update_data(copy_groups=list(transfer.shown_groups()))
+    text, kb = await view_copy_pick(cid, src, set(transfer.shown_groups()))
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer()
 
@@ -2542,7 +2543,8 @@ async def cb_copy_do(cb: CallbackQuery, state: FSMContext) -> None:
         await cb.answer("Файл уже забыт — пришлите его ещё раз.", show_alert=True)
         return
     data = await state.get_data()
-    picked = set(data.get("copy_groups", transfer.ALL_GROUPS))
+    picked = (set(data.get("copy_groups", transfer.shown_groups()))
+              & set(transfer.shown_groups()))
     await state.clear()
     if not picked:
         await cb.answer("Ничего не отмечено.", show_alert=True)

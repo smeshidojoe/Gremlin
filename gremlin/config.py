@@ -19,6 +19,10 @@ LOG_PATH = os.getenv("LOG_PATH", os.path.join(BASE_DIR, "bot.log"))
 # строк, а лежит он в бинд-маунте докера, то есть на диске хоста.
 LOG_MAX = int(os.getenv("LOG_MAX", 5 * 1024 * 1024))
 LOG_KEEP = int(os.getenv("LOG_KEEP", 3))
+# Диагностика — отдельный файл рядом с логом, только на диск (см. services/diag)
+DIAG_PATH = os.path.join(os.path.dirname(LOG_PATH) or BASE_DIR, "diag.log")
+DIAG_MAX = 2 * 1024 * 1024
+DIAG_SLOW_MS = int(os.getenv("DIAG_SLOW_MS", 2000))   # с какой длительности писать
 
 # Админы бота (доступ к /admin). Через запятую в env ADMIN_IDS.
 try:
@@ -40,9 +44,6 @@ MENTION_CACHE_TTL = 600
 
 # Сколько последних ошибок держать в памяти для админ-меню.
 ERROR_LOG_SIZE = 50
-
-# !mute без срока: мут на сутки. «Навсегда» задаётся явно — !mute 0m.
-MANUAL_MUTE_DEFAULT = int(os.getenv("MANUAL_MUTE_DEFAULT") or 1440)
 
 # Сколько варнов терпим до наказания (селектор ◀ ▶).
 WARN_LIMIT_PRESETS = (2, 3, 4, 5, 7, 10)

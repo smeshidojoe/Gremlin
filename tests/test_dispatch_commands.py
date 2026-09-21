@@ -125,3 +125,31 @@ async def test_switched_off_mute_is_ignored(chat, dispatcher):
     s = await _feed(dispatcher, "!mute 30m")
     assert "RestrictChatMember" not in s.names()
     assert (await db.active_punishments_count(CHAT)) == 0
+
+
+async def test_ban_with_term_is_temporary(chat, dispatcher):
+    """«!ban 14d спам реакциями»: срок уходил в причину, а бан выходил вечным."""
+    s = await _feed(dispatcher, "!ban 14d спам реакциями")
+    ban = next(m for n, m in s.calls if n == "BanChatMember")
+    left = ban.until_date - dt.datetime.now(dt.timezone.utc).timestamp() \
+        if isinstance(ban.until_date, (int, float)) else \
+        (ban.until_date - dt.datetime.now(dt.timezone.utc)).total_seconds()
+    assert 14 * 86400 - 120 < left <= 14 * 86400
+    row = (await db.active_punishments(CHAT))[0]
+    assert row["reason"] == "спам реакциями" and row["until_ts"]
+
+
+async def test_ban_without_term_stays_forever(chat, dispatcher):
+    s = await _feed(dispatcher, "!ban спам")
+    ban = next(m for n, m in s.calls if n == "BanChatMember")
+    assert ban.until_date is None
+
+
+async def test_mute_without_term_takes_chat_setting(chat, dispatcher):
+    """Срок !mute без срока — из настроек чата; 0 — навсегда."""
+    await db.set_setting(CHAT, "cmd_mute_min", 0)
+    s = await _feed(dispatcher, "!mute не будешь")
+    restrict = next(m for n, m in s.calls if n == "RestrictChatMember")
+    assert restrict.until_date is None
+    row = (await db.active_punishments(CHAT))[0]
+    assert row["reason"] == "не будешь" and row["until_ts"] is None

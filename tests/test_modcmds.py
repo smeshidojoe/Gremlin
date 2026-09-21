@@ -52,7 +52,8 @@ def test_every_command_handler_has_its_switch():
 
 async def test_section_everywhere(chat):
     keys = {f.key for f in next(s for s in schema.SECTIONS if s.key == "modcmds").fields}
-    assert set(CMD_FIELDS.values()) | {"misuse_mute"} == keys
+    assert set(CMD_FIELDS.values()) | {"misuse_mute", "cmd_mute_min",
+                                       "cmd_ban_min"} == keys
     # перенос настроек забирает раздел целиком
     assert set(transfer.GROUPS["modcmds"][1]) == keys
     _text, kb = await um.view_chat(CHAT, OWNER)

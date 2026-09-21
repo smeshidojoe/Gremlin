@@ -17,6 +17,7 @@ import io
 import json
 import logging
 import os
+import time
 
 from .. import config
 
@@ -31,6 +32,33 @@ _std = None
 _input = "pixel_values"
 _state: str | None = None      # None — не пробовали, "ok" | причина отказа
 _load_lock = asyncio.Lock()
+
+# Оценка по file_id аватарки. Считается около секунды в один поток, а в
+# обсуждении под постом каждое сообщение приходит от гостя, и профиль ему
+# смотрят заново: без кэша бот тратил секунду процессора на одну и ту же
+# картинку по нескольку раз в минуту. file_id меняется вместе с аватаркой,
+# так что новую картинку кэш не спрячет.
+_seen: dict[str, tuple[float, int | None]] = {}
+SEEN_TTL = 7 * 24 * 3600
+SEEN_MAX = 2000
+
+
+def cached(photo_id: str | None) -> int | None | str:
+    """Готовая оценка этой аватарки. "нет" — не считали, надо считать."""
+    if not photo_id:
+        return "нет"
+    hit = _seen.get(photo_id)
+    if hit is None or time.monotonic() - hit[0] > SEEN_TTL:
+        return "нет"
+    return hit[1]
+
+
+def remember(photo_id: str | None, value: int | None) -> None:
+    if not photo_id:
+        return
+    if len(_seen) >= SEEN_MAX:
+        _seen.clear()
+    _seen[photo_id] = (time.monotonic(), value)
 
 
 def status() -> str:
@@ -114,7 +142,9 @@ async def score(raw: bytes) -> int | None:
         logger.debug("картинка на %d байт — не смотрим", len(raw))
         return None
     try:
-        return await asyncio.to_thread(_score_sync, raw)
+        from . import diag
+        with diag.step("аватарка"):
+            return await asyncio.to_thread(_score_sync, raw)
     except Exception:
         logger.warning("классификатор не справился с картинкой", exc_info=True)
         return None

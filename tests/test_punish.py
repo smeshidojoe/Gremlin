@@ -47,12 +47,27 @@ async def test_net_spreads_the_term_not_the_swapped_ban(chat, members,
     user = make_user(4242, "Олег", "chomkaaaa")
     members["outside"].add(user.id)
     bot = FakeBot()
-    done, skipped, failed = await net.spread(bot, chat, user, "mute", WEEK,
-                                             "это не чат леши", OWNER)
-    assert (done, failed) == (1, 0)
+    done, skipped, failed, swapped = await net.spread(
+        bot, chat, user, "mute", WEEK, "это не чат леши", OWNER)
+    assert (done, failed, swapped) == (1, 0, 1)
     peer = (await db.active_punishments(PEER))[0]
     assert peer["kind"] == "ban"
     assert peer["until_ts"] is not None
+    # уже забанен там — повторный мут по сетке не заводит вторую запись
+    again = await net.spread(bot, chat, user, "mute", WEEK, "ещё раз", OWNER)
+    assert again[:2] == (0, 1)
+    assert len(await db.active_punishments(PEER)) == 1
+
+
+def test_swapped_ban_is_shown_as_mute():
+    """Мут не-участнику применён баном, но везде показывается мутом."""
+    reason = "не будешь · мут не-участнику невозможен, заменён баном"
+    assert utils.shown_kind("ban", reason) == "mute"
+    assert utils.shown_kind("ban", "спам") == "ban"
+    card = moderation.card_text("ban", "Чат", 1, "Вася", reason, "админ")
+    assert "Мут" in card and "Бан" not in card
+    assert "невозможен" not in card and utils.SWAP_NOTE in card
+    assert "навсегда" in card
 
 
 @pytest.mark.parametrize("raw,clean,swapped", [
@@ -84,6 +99,29 @@ async def test_active_list_shows_what_matters(chat):
     text, _kb = await um.view_active(chat)
     assert '<a href="https://t.me/chomkaaaa">Олег</a>' in text
     assert "это не чат леши" in text
-    assert "мут→бан" in text
+    assert "— мут до " in text and "мут→бан" not in text   # выдан мут
     assert "выдан " in text and "до " in text
     assert "сетка ·" not in text and "не-участнику" not in text
+
+
+async def test_game_mute_adds_to_running_one(chat, members):
+    """Рулетка дала 6 ч, битва — 1 ч: итог 7 ч, а не час."""
+    user = make_user(4343)
+    bot = FakeBot()
+    first, _, _ = await moderation.game_punish(bot, chat, user, "mute", 360,
+                                               "рулетка", None)
+    pid, total, stricter = await moderation.game_punish(bot, chat, user, "mute",
+                                                        60, "битва", None)
+    assert stricter is None and 419 <= total <= 420
+    left = (await db.get_punishment(pid))["until_ts"] - int(time.time())
+    assert 419 * 60 < left <= 420 * 60
+    assert not (await db.get_punishment(first))["active"]   # одна запись
+
+
+async def test_game_mute_never_shortens_forever(chat, members):
+    user = make_user(4444)
+    bot = FakeBot()
+    await moderation.punish_ex(bot, chat, user, "mute", 0, "навсегда", OWNER)
+    pid, total, stricter = await moderation.game_punish(bot, chat, user, "mute",
+                                                        60, "битва", None)
+    assert (pid, total, stricter) == (None, None, "mute")

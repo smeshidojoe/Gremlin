@@ -58,6 +58,7 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
     "punish_cfg": ("⚙️ Настройки наказаний", ("mute_reactions", "ban_wipe")),
     "modcmds": ("⌨️ Команды чата", ("cmd_mute_on", "cmd_kick_on", "cmd_ban_on",
                                    "cmd_warn_on", "cmd_lift_on", "cmd_dm_on",
+                                   "cmd_mute_min", "cmd_ban_min",
                                    "misuse_mute")),
     "cas": ("🌐 Общий список спамеров", ("cas_on", "cas_join", "cas_suspect",
                                         "cas_score")),
@@ -87,6 +88,18 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
 }
 
 ALL_GROUPS = tuple(GROUPS)
+
+
+def shown_groups() -> tuple[str, ...]:
+    """Разделы, которые можно выбрать при переносе.
+
+    Спрятанные из меню (медиа-фильтры, пока выключены) не предлагаем: иначе
+    перенос тихо включил бы то, чего человек нигде больше не видит. В файл
+    выгрузки они всё равно попадают — вдруг раздел вернут.
+    """
+    from .. import schema
+    hidden = schema.hidden_sections()
+    return tuple(g for g in ALL_GROUPS if g not in hidden)
 
 
 def _db_media(path: str | None) -> bytes | None:

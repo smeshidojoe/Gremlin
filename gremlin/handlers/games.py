@@ -127,16 +127,28 @@ async def _who(user_id: int) -> str:
                          row["username"] if row else None)
 
 
+_STRICTER = {"ban": "и так забанен", "mute": "и так в муте навсегда"}
+
+
 async def _punish(bot: Bot, chat_id: int, user_id: int, kind: str, minutes: int,
-                  reason: str) -> bool:
+                  reason: str) -> str | None:
+    """Выдать приз. Вернуть подпись для сообщения игры или None — нет прав.
+
+    Мут складывается с уже идущим (см. moderation.game_punish), и тогда в
+    подписи виден общий срок.
+    """
     from ..services import net
     user = await net.user_stub(user_id)
-    # бан в игре — приз, а не борьба со спамом: сообщения проигравшего не трогаем
-    pid = await moderation.apply_punishment(bot, chat_id, user, kind, minutes,
-                                            reason, None, wipe=False)
-    if pid is not None:
-        await db.add_event(chat_id, "manual", f"игра: {reason} — {user_id}")
-    return pid is not None
+    pid, total, stricter = await moderation.game_punish(
+        bot, chat_id, user, kind, minutes, reason, None)
+    label = prize_label(kind, minutes)
+    if stricter:
+        return f"{label}, но он {_STRICTER[stricter]}"
+    if pid is None:
+        return None
+    await db.add_event(chat_id, "manual", f"игра: {reason} — {user_id}"
+                       + (f", всего {total} мин" if total else ""))
+    return label + (f" · всего {utils.fmt_minutes(total)}" if total else "")
 
 
 async def _can_target(bot: Bot, chat_id: int, user_id: int) -> bool:
@@ -225,9 +237,9 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
         await sent.edit_text(f"🔫 {who}: {random.choice(_RUS_HIT)}\n"
                              f"<i>…но админов пуля не берёт.</i>\n{reload_note}")
         return
-    ok = await _punish(bot, message.chat.id, player.id, kind, minutes,
-                       "проиграл в русскую рулетку")
-    tail = (f"{prize_label(kind, minutes).capitalize()}." if ok
+    label = await _punish(bot, message.chat.id, player.id, kind, minutes,
+                          "проиграл в русскую рулетку")
+    tail = (f"{label[0].upper()}{label[1:]}." if label
             else "…но пистолет заклинило: у бота нет прав.")
     await sent.edit_text(f"🔫 {who}: {random.choice(_RUS_HIT)}\n{tail}\n"
                          f"{reload_note}")
@@ -314,10 +326,10 @@ async def cb_duel(cb: CallbackQuery, bot: Bot) -> None:
     else:
         s = await db.get_settings(key[0])
         kind, minutes = await prize(s, config.GAME_DUEL)
-        ok = await _punish(bot, key[0], loser, kind, minutes, "проиграл дуэль")
+        label = await _punish(bot, key[0], loser, kind, minutes, "проиграл дуэль")
         text = (f"⚔️ <b>Дуэль окончена</b>\n\n🏆 Победитель: {await _who(winner)}\n"
                 f"💀 Проиграл: {await _who(loser)}"
-                + (f" · {prize_label(kind, minutes)}" if ok
+                + (f" · {label}" if label
                    else " · но приз не вручить, у бота нет прав"))
     try:
         await cb.message.edit_text(text, reply_markup=None)
@@ -456,11 +468,10 @@ async def _battle_run(bot: Bot, key: tuple[int, int]) -> None:
     tail = f"\n\n👑 Победитель: {await _who(winner)}"
     log = [line for line in log if not line.startswith("⏳")]
     if first_out and await _can_target(bot, chat_id, first_out):
-        ok = await _punish(bot, chat_id, first_out, kind, minutes,
-                           "выбыл первым в королевской битве")
-        if ok:
-            tail += (f"\n💀 Первым пал {await _who(first_out)} — "
-                     f"{prize_label(kind, minutes)}")
+        label = await _punish(bot, chat_id, first_out, kind, minutes,
+                              "выбыл первым в королевской битве")
+        if label:
+            tail += f"\n💀 Первым пал {await _who(first_out)} — {label}"
     try:
         await bot.edit_message_text("\n".join(log[-12:]) + tail, chat_id=chat_id,
                                     message_id=msg_id, reply_markup=None)
@@ -535,7 +546,7 @@ async def cb_court(cb: CallbackQuery, bot: Bot) -> None:
     await cb.answer("Голос изменён" if was is not None else "Голос учтён")
 
 
-async def _punish_by_court(bot: Bot, chat_id: int, court: dict) -> bool:
+async def _punish_by_court(bot: Bot, chat_id: int, court: dict) -> str | None:
     s = await db.get_settings(chat_id)
     kind, minutes = await prize(s, config.GAME_COURT)
     return await _punish(bot, chat_id, court["accused"], kind, minutes,
@@ -574,19 +585,18 @@ async def _court_run(bot: Bot, key: tuple[int, int], head: str, markup) -> None:
             text = (head + f"Голосовал ровно один человек ({who_voted}), и суд "
                     f"счёл это несерьёзным. Дело закрыто.")
         elif verdict:
-            ok = await _punish_by_court(bot, chat_id, court)
+            label = await _punish_by_court(bot, chat_id, court)
             text = head + (f"Решением большинства (1 человека, {who_voted}) "
-                           f"подсудимый признан <b>виновным</b>." if ok
+                           f"подсудимый признан <b>виновным</b> — {label}."
+                           if label
                            else "🔨 Виновен, но приговор не исполнить — нет прав.")
         else:
             text = (head + f"Решением большинства (1 человека, {who_voted}) "
                     f"подсудимый <b>оправдан</b>.")
     elif guilty > innocent:
-        ok = await _punish_by_court(bot, chat_id, court)
-        s = await db.get_settings(chat_id)
-        kind, minutes = await prize(s, config.GAME_COURT)
-        text = head + (f"🔨 <b>Виновен!</b> Приговор — {prize_label(kind, minutes)}."
-                       if ok
+        label = await _punish_by_court(bot, chat_id, court)
+        text = head + (f"🔨 <b>Виновен!</b> Приговор — {label}."
+                       if label
                        else "🔨 <b>Виновен!</b> Но приговор не исполнить — нет прав.")
     else:
         text = head + "🕊 <b>Оправдан.</b> Народ на твоей стороне."

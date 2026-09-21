@@ -127,7 +127,9 @@ async def embed(texts: list[str]):
         return None
     chunks = []
     for i in range(0, len(texts), VEC_BATCH):
-        chunks.append(await asyncio.to_thread(_embed_sync, texts[i:i + VEC_BATCH]))
+        from . import diag
+        with diag.step("нейросеть"):
+            chunks.append(await asyncio.to_thread(_embed_sync, texts[i:i + VEC_BATCH]))
     return _np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
 
 

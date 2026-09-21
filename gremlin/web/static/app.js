@@ -1455,6 +1455,33 @@ async function gamesView(cid) {
   };
 }
 
+/* Разделы переноса: чип «отметить/снять все» и общий вид галочек. */
+function allChip(act, all) {
+  return `<button class="chip" data-act="${act}">${all ? '○ Снять все' : '✓ Отметить все'}</button>`;
+}
+
+function markChip(el, on) {
+  el.classList.toggle('on', on);
+  el.classList.toggle('off', !on);
+  el.textContent = (on ? '✓ ' : '○ ') + el.dataset.label;
+}
+
+function pickAll(el, act, set) {
+  const chips = [...el.parentElement.querySelectorAll(`[data-act="${act}"]`)];
+  const on = set.size < chips.length;
+  chips.forEach((c) => {
+    if (on) set.add(c.dataset.key); else set.delete(c.dataset.key);
+    markChip(c, on);
+  });
+  el.textContent = on ? '○ Снять все' : '✓ Отметить все';
+}
+
+function syncAll(el, act, set) {
+  const all = el.parentElement.querySelector(`[data-act="${act}"]`);
+  const n = el.parentElement.querySelectorAll('[data-key]').length;
+  if (all) all.textContent = set.size === n ? '○ Снять все' : '✓ Отметить все';
+}
+
 /* Загруженный файл настроек ждёт подтверждения: живёт вне CACHE.copy, чтобы
    перерисовка страницы не сбрасывала выбор разделов. */
 let IMPORTED = null;
@@ -1467,7 +1494,8 @@ function importCard(cid) {
       <h2>📥 Из файла${f.title ? ` «${esc(f.title)}»` : ''}</h2>
       <div class="intro">Настройки отмеченных разделов заменятся, списки дополнятся:
         что уже есть в чате, останется.${inside ? ` В файле: ${esc(inside)}.` : ''}</div>
-      <div class="wrap" style="margin-top:10px">${f.groups.map((g) => {
+      <div class="wrap" style="margin-top:10px">
+        ${allChip('import-all', f.picked.size === f.groups.length)}${f.groups.map((g) => {
         const on = f.picked.has(g.key);
         return `<button class="chip ${on ? 'on' : 'off'}" data-act="import-group" data-key="${g.key}"
           data-label="${esc(plain(g.label))}">${on ? '✓' : '○'} ${esc(plain(g.label))}</button>`;
@@ -1510,7 +1538,7 @@ async function copyView(cid) {
     </div>
     <div class="card">
       <h2>Что перенести</h2>
-      <div class="wrap">${d.groups.map((g) => `
+      <div class="wrap">${allChip('copy-all', true)}${d.groups.map((g) => `
         <button class="chip on" data-act="copy-group" data-key="${g.key}"
                 data-label="${esc(plain(g.label))}">✓ ${esc(plain(g.label))}</button>`).join('')}</div>
       <button class="btn wide" style="margin-top:12px" data-act="copy-run">📥 Перенести</button>
@@ -2411,9 +2439,11 @@ const ACT = {
     const key = el.dataset.key;
     const on = !set.has(key);
     if (on) set.add(key); else set.delete(key);
-    el.classList.toggle('on', on);
-    el.textContent = (on ? '✓ ' : '○ ') + el.dataset.label;
+    markChip(el, on);
+    syncAll(el, 'copy-all', set);
   },
+
+  'copy-all'(el) { pickAll(el, 'copy-group', CACHE.copy.groups); },
 
   async 'settings-export'() {
     toast((await api(`/chat/${curChat()}/export`, { method: 'POST' })).note);
@@ -2423,10 +2453,11 @@ const ACT = {
     const set = IMPORTED.picked;
     const on = !set.has(el.dataset.key);
     if (on) set.add(el.dataset.key); else set.delete(el.dataset.key);
-    el.classList.toggle('on', on);
-    el.classList.toggle('off', !on);
-    el.textContent = (on ? '✓ ' : '○ ') + el.dataset.label;
+    markChip(el, on);
+    syncAll(el, 'import-all', set);
   },
+
+  'import-all'(el) { pickAll(el, 'import-group', IMPORTED.picked); },
 
   async 'import-run'() {
     if (!IMPORTED.picked.size) return toast('Не выбрано ни одного раздела');

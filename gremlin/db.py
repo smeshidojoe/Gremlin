@@ -150,6 +150,8 @@ CREATE TABLE IF NOT EXISTS settings(
     cmd_warn_on     INTEGER NOT NULL DEFAULT 1,
     cmd_lift_on     INTEGER NOT NULL DEFAULT 1,
     cmd_dm_on       INTEGER NOT NULL DEFAULT 1,
+    cmd_mute_min    INTEGER NOT NULL DEFAULT 1440,
+    cmd_ban_min     INTEGER NOT NULL DEFAULT 0,
     mute_reactions  INTEGER NOT NULL DEFAULT 1,
     warns_on        INTEGER NOT NULL DEFAULT 0,
     warns_limit     INTEGER NOT NULL DEFAULT 3,
@@ -305,6 +307,15 @@ CREATE TABLE IF NOT EXISTS link_wl(
     target_id INTEGER,          -- id чата/канала, если удалось определить
     username  TEXT,             -- без @, в нижнем регистре
     title     TEXT
+);
+-- боты, которые точно сидят в чате: их добавили при нас или на их
+-- сообщение кто-то ответил. Упоминание такого бота — не признак спама
+CREATE TABLE IF NOT EXISTS chat_bots(
+    chat_id  INTEGER NOT NULL,
+    bot_id   INTEGER NOT NULL,
+    username TEXT,              -- без @, в нижнем регистре
+    seen     INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, bot_id)
 );
 CREATE TABLE IF NOT EXISTS inline_wl(
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -478,6 +489,9 @@ class Settings:
     cmd_warn_on: int = 1
     cmd_lift_on: int = 1
     cmd_dm_on: int = 1
+    # срок !mute и !ban, если в команде его не написали; 0 — навсегда
+    cmd_mute_min: int = 1440
+    cmd_ban_min: int = 0
     mute_reactions: int = 1
     warns_on: int = 0
     warns_limit: int = 3
@@ -594,6 +608,8 @@ _SETTINGS_MIGRATIONS = {
     "cmd_warn_on": "INTEGER NOT NULL DEFAULT 1",
     "cmd_lift_on": "INTEGER NOT NULL DEFAULT 1",
     "cmd_dm_on": "INTEGER NOT NULL DEFAULT 1",
+    "cmd_mute_min": "INTEGER NOT NULL DEFAULT 1440",
+    "cmd_ban_min": "INTEGER NOT NULL DEFAULT 0",
     "mute_reactions": "INTEGER NOT NULL DEFAULT 1",
     "warns_on": "INTEGER NOT NULL DEFAULT 0",
     "warns_limit": "INTEGER NOT NULL DEFAULT 3",
@@ -993,7 +1009,7 @@ async def set_chat_active(chat_id: int, active: bool) -> None:
 # всё, что привязано к чату: при повышении группы до супергруппы Telegram
 # меняет ей id, и без переноса чат для бота превращается в чужой
 _CHAT_TABLES = ("settings", "triggers", "chat_cmds", "watch_profiles", "whitelist",
-                "link_wl", "inline_wl", "words", "punishments", "warns",
+                "link_wl", "inline_wl", "chat_bots", "words", "punishments", "warns",
                 "samples", "events", "msg_stats", "phrases")
 
 
@@ -1543,6 +1559,30 @@ async def inline_wl_list(chat_id: int) -> list[aiosqlite.Row]:
     return await cur.fetchall()
 
 
+async def chat_bot_add(chat_id: int, bot_id: int, username: str | None) -> None:
+    await _db.execute(
+        """INSERT INTO chat_bots (chat_id, bot_id, username, seen) VALUES (?, ?, ?, ?)
+           ON CONFLICT(chat_id, bot_id) DO UPDATE SET
+             username = COALESCE(excluded.username, chat_bots.username),
+             seen = excluded.seen""",
+        (chat_id, bot_id, (username or "").lower() or None, int(time.time())),
+    )
+    await _db.commit()
+
+
+async def chat_bot_remove(chat_id: int, bot_id: int) -> None:
+    await _db.execute("DELETE FROM chat_bots WHERE chat_id = ? AND bot_id = ?",
+                      (chat_id, bot_id))
+    await _db.commit()
+
+
+async def chat_bot_names(chat_id: int) -> set[str]:
+    cur = await _db.execute(
+        "SELECT username FROM chat_bots WHERE chat_id = ? AND username IS NOT NULL",
+        (chat_id,))
+    return {r["username"] for r in await cur.fetchall()}
+
+
 async def inline_wl_allowed(chat_id: int, username: str | None, bot_id: int | None) -> bool:
     """Этому инлайн-боту в этом чате можно."""
     cur = await _db.execute(
@@ -1675,6 +1715,7 @@ async def get_punishment(pid: int) -> aiosqlite.Row | None:
 
 
 NET_TERMS_KEY = "mig_net_terms"
+FOREVER_MUTE_KEY = "mig_forever_mute_431797189"
 VEC_LOWER_KEY = "mig_vec_lower"
 NSFW_RAISE_KEY = "mig_nsfw_97"
 # чаты, заведённые после первой правки, снова получали старые значения из
@@ -2690,10 +2731,10 @@ async def user_status_counts(user_id: int, chat_ids: list[int]) -> dict:
             f" WHERE user_id = ? AND chat_id IN ({ph})", (user_id, *chat_ids))
         out["first_day"], out["last_day"] = tuple(await cur.fetchone())
         cur = await _db.execute(
-            f"""SELECT kind, COUNT(*) AS n FROM punishments
+            f"""SELECT {_SHOWN_KIND} AS kind, COUNT(*) AS n FROM punishments
                 WHERE user_id = ? AND chat_id IN ({ph})
                   AND COALESCE(reason, '') NOT LIKE 'сетка · %'
-                GROUP BY kind""", (user_id, *chat_ids))
+                GROUP BY 1""", (user_id, *chat_ids))
         out["kinds"] = {r["kind"]: r["n"] for r in await cur.fetchall()}
         for key, table in (("warns", "warns"), ("forgiven", "forgiven")):
             cur = await _db.execute(
@@ -2776,6 +2817,12 @@ async def user_events(user_id: int, chat_ids: list[int], limit: int = 8) -> list
     return out[:limit]
 
 
+# Подменённый бан (мут не-участнику) в счётчиках — мут: его и выдавали.
+# Признак — приписка в причине, её ставит moderation.punish_ex
+_SHOWN_KIND = ("CASE WHEN kind = 'ban' AND reason LIKE '%мут не-участнику невозможен%'"
+               " THEN 'mute' ELSE kind END")
+
+
 async def user_chat_facts(chat_id: int, user_id: int) -> dict:
     """Что бот сам знает о человеке в одном чате: сколько писал и что висит."""
     cur = await _db.execute(
@@ -2826,8 +2873,8 @@ async def chart_series(chat_id: int, days: int) -> dict:
               for d in range(first, last + 1)]
 
     cur = await _db.execute(
-        """SELECT kind, COUNT(*) AS c FROM punishments
-           WHERE chat_id = ? AND created >= ? GROUP BY kind""", (chat_id, since))
+        f"""SELECT {_SHOWN_KIND} AS kind, COUNT(*) AS c FROM punishments
+           WHERE chat_id = ? AND created >= ? GROUP BY 1""", (chat_id, since))
     kinds = {r["kind"]: r["c"] for r in await cur.fetchall()}
 
     # причины не разбираем здесь: правило из причины достаёт moderation, а

@@ -310,12 +310,18 @@ async def _finish(bot: Bot, chat_id: int, msg_id: int, winner: int, cfg: dict,
     user = type("U", (), {"id": winner,
                           "username": row["username"] if row else None,
                           "full_name": (row["first_name"] if row else None) or str(winner)})()
-    pid = await moderation.apply_punishment(
-        bot, chat_id, user, cfg["kind"], cfg["minutes"], "победа в бан-рулетке", by_id,
-        wipe=False,          # рулетка — прикол, переписку победителя не трогаем
-    )
+    # мут складывается с уже идущим; переписку победителя не трогаем
+    pid, total, stricter = await moderation.game_punish(
+        bot, chat_id, user, cfg["kind"], cfg["minutes"], "победа в бан-рулетке",
+        by_id)
     dur = utils.fmt_minutes(cfg["minutes"]) if cfg["kind"] == "mute" else "навсегда"
-    if pid is None:
+    if total:
+        dur += f" · всего {utils.fmt_minutes(total)}"
+    if stricter:
+        text = (f"🎯 <b>Бан-рулетка</b>\n\n🎉 Победитель: {who}\n"
+                f"🎁 Приз: <b>{KIND_LABEL[cfg['kind']]}</b> · {dur}, но он "
+                + ("и так забанен." if stricter == "ban" else "и так в муте навсегда."))
+    elif pid is None:
         text = (f"🎯 <b>Бан-рулетка</b>\n\n🎉 Победитель: {who}\n"
                 f"…но приз вручить не вышло — у бота не хватило прав. Повезло!")
     else:

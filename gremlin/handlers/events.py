@@ -1,5 +1,6 @@
 """События: бот добавлен/удалён, ручные баны админов, смена названия."""
 import asyncio
+import json
 import logging
 import time
 
@@ -9,7 +10,7 @@ from aiogram.filters import (
 )
 from aiogram.types import (
     CallbackQuery, ChatJoinRequest, ChatMemberUpdated, InlineKeyboardButton,
-    Message, MessageReactionUpdated,
+    LinkPreviewOptions, Message, MessageReactionUpdated,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -273,10 +274,22 @@ async def member_updated(update: ChatMemberUpdated, bot: Bot) -> None:
     # считал участником того, кого сам же выгнал.
     adm_cache.invalidate_admins(chat.id)
     adm_cache.invalidate_member(chat.id, target.id)
+    if target.is_bot and target.id != bot.id:
+        from ..services import watch
+        if new.status in ("member", "administrator"):
+            await watch.note_bot(chat.id, target)
+        elif new.status in ("left", "kicked"):
+            await watch.forget_bot(chat.id, target.id)
 
     actor = update.from_user
     if actor is None or actor.id == bot.id:
         return  # свои действия уже закарточены в moderation
+    if _joined(old, new):
+        # Приняли прямо в Telegram, мимо кнопок, — или человек вошёл по
+        # ссылке. Бэклог тут не помеха: кнопки на карточке в любом случае лишние
+        await _sub_close(bot, chat.id, target.id,
+                         "✅ <b>Принят в Telegram</b>" if update.via_join_request
+                         else "✅ <b>Вступил сам</b>")
     if group.stale(update):
         return  # событие из бэклога — карточку слать поздно
     if new.status in ("member", "administrator", "creator"):
@@ -691,6 +704,50 @@ async def _sub_dm(bot: Bot, chat, user, user_chat_id: int | None,
         return False
 
 
+def _in_chat(m) -> bool:
+    return m.status in ("member", "administrator", "creator") or (
+        m.status == "restricted" and getattr(m, "is_member", False))
+
+
+def _joined(old, new) -> bool:
+    return _in_chat(new) and not _in_chat(old)
+
+
+def _sub_key(chat_id: int, user_id: int) -> str:
+    return f"subcard:{chat_id}:{user_id}"
+
+
+async def _sub_close(bot: Bot, chat_id: int, user_id: int, note: str,
+                     skip: set | None = None) -> None:
+    """Закрыть карточки заявки: итог и без кнопок.
+
+    Зовётся, когда заявку решили мимо кнопок, и после кнопки — для карточек
+    от повторных заявок (skip — те, что правит сама кнопка). Где лежат
+    карточки, помним в базе, а не в памяти: заявка может висеть днями, и
+    перезапуск бота не должен оставлять живые кнопки. Отказ в Telegram сюда
+    не попадёт — о нём Telegram боту ничего не сообщает.
+    """
+    key = _sub_key(chat_id, user_id)
+    raw = await db.kv_get(key)
+    if not raw:
+        return
+    await db.kv_set(key, None)
+    for target, msg_id, body in json.loads(raw):
+        if skip and (target, msg_id) in skip:
+            continue
+        text = body + "\n\n" + note
+        try:
+            await bot.edit_message_text(
+                text, chat_id=target, message_id=msg_id, reply_markup=None,
+                link_preview_options=LinkPreviewOptions(is_disabled=True))
+        except Exception:
+            logger.debug("карточку заявки %s не поправить", key, exc_info=True)
+        else:
+            moderation.remember_card(target, msg_id, text, None)
+    if skip is None:
+        await db.add_event(chat_id, "sub", f"заявка решена мимо кнопок: {user_id}")
+
+
 async def _sub_ask_card(bot: Bot, chat, user, s) -> None:
     """Карточка «решайте сами»: кто просится и три кнопки.
 
@@ -720,8 +777,15 @@ async def _sub_ask_card(bot: Bot, chat, user, s) -> None:
                                callback_data=f"sub:no:{chat.id}:{user.id}"))
     b.row(InlineKeyboardButton(text="⛔ Забанить",
                                callback_data=f"sub:ban:{chat.id}:{user.id}"))
-    await moderation.send_card(bot, chat.id, config.BIT_SUB, "\n".join(lines),
-                               markup=b.as_markup())
+    text = "\n".join(lines)
+    sent = await moderation.send_card(bot, chat.id, config.BIT_SUB, text,
+                                      markup=b.as_markup())
+    if sent:
+        # повторная заявка шлёт новую карточку — старые тоже закроем потом
+        key = _sub_key(chat.id, user.id)
+        cards = json.loads(await db.kv_get(key) or "[]")
+        cards += [[target, msg_id, text] for target, msg_id in sent]
+        await db.kv_set(key, json.dumps(cards[-10:], ensure_ascii=False))
 
 
 @router.callback_query(F.data.startswith("sub:ok:"))
@@ -735,7 +799,8 @@ async def sub_take(cb: CallbackQuery, bot: Bot) -> None:
     try:
         await bot.approve_chat_join_request(cid, uid)
     except Exception as e:
-        await cb.answer(f"Не вышло: {e}", show_alert=True)
+        if not await _sub_gone(cb, bot, cid, uid, e):
+            await cb.answer(f"Не вышло: {e}", show_alert=True)
         return
     adm_cache.invalidate_member(cid, uid)
     await db.add_event(cid, "sub", f"впущен админом из карточки: {uid}")
@@ -753,7 +818,8 @@ async def sub_drop(cb: CallbackQuery, bot: Bot) -> None:
     try:
         await bot.decline_chat_join_request(cid, uid)
     except Exception as e:
-        await cb.answer(f"Не вышло: {e}", show_alert=True)
+        if not await _sub_gone(cb, bot, cid, uid, e):
+            await cb.answer(f"Не вышло: {e}", show_alert=True)
         return
     await db.add_event(cid, "sub", f"заявка отклонена админом: {uid}")
     await _sub_done(cb, "🚫 <b>Отказано</b>")
@@ -787,6 +853,27 @@ async def sub_ban(cb: CallbackQuery, bot: Bot) -> None:
     await _sub_done(cb, "⛔ <b>Забанен</b>")
 
 
+async def _sub_gone(cb: CallbackQuery, bot: Bot, cid: int, uid: int,
+                   err: Exception) -> bool:
+    """Заявки уже нет: её решили в Telegram или человек сам её отозвал.
+
+    Отказ в Telegram боту не виден, поэтому узнаём о нём только здесь, по
+    ответу на нажатие. Вместо непонятной ошибки закрываем карточку.
+    """
+    if not any(s in str(err) for s in ("HIDE_REQUESTER_MISSING",
+                                       "USER_ALREADY_PARTICIPANT")):
+        return False
+    adm_cache.invalidate_member(cid, uid)
+    try:
+        inside = _in_chat(await bot.get_chat_member(cid, uid))
+    except Exception:
+        inside = False
+    await db.add_event(cid, "sub", f"заявки уже нет: {uid}")
+    await _sub_done(cb, "✅ <b>Принят в Telegram</b>" if inside else
+                    "🗑 <b>Заявки уже нет</b> — решили в Telegram или человек её отозвал")
+    return True
+
+
 async def _user_stub(uid: int):
     from ..services import net
     return await net.user_stub(uid)
@@ -800,6 +887,10 @@ async def _sub_done(cb: CallbackQuery, note: str) -> None:
     «решить» второй раз. Карточки наказаний так умеют давно — теперь и эта.
     """
     from ..services import moderation
+    # прочие карточки той же заявки (от повторных) тоже закрываем
+    _, _, cid, uid = cb.data.split(":")
+    await _sub_close(cb.bot, int(cid), int(uid), note,
+                     skip={(cb.message.chat.id, cb.message.message_id)})
     text = cb.message.html_text + "\n\n" + note
     try:
         await cb.message.edit_text(text, reply_markup=None)

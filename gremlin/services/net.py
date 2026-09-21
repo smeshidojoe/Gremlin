@@ -49,17 +49,28 @@ async def _skip(bot: Bot, chat_id: int, user_id: int) -> str | None:
     return None
 
 
+# Повтором считаем то, что не мягче просимого: при активном бане мут
+# не нужен, а при активном муте бан — нужен, он строже
+_ALREADY = {"mute": ("mute", "ban"), "ban": ("ban",)}
+
+
 async def spread(bot: Bot, src_chat: int, user, kind: str, mute_min: int,
-                 reason: str, by_id: int | None) -> tuple[int, int, int]:
-    """Разослать наказание по сетке. Вернуть (сделано, пропущено, ошибок)."""
+                 reason: str, by_id: int | None,
+                 ban_min: int = 0) -> tuple[int, int, int, int]:
+    """Разослать наказание по сетке. Вернуть (сделано, пропущено, ошибок, из
+    них мутов, ставших банами).
+
+    Мут в каждом чате решается заново: участнику — мут, не-участнику — бан на
+    тот же срок. Что вышло в исходном чате, соседей не касается.
+    """
     peers = await enabled(src_chat, kind)
     if not peers:
-        return 0, 0, 0
+        return 0, 0, 0, 0
     src = await db.get_chat(src_chat)
     src_title = (src["title"] if src else str(src_chat)) or str(src_chat)
     note = f"сетка · {src_title}: {reason}"
 
-    done = skipped = failed = 0
+    done = skipped = failed = swapped = 0
     for peer in peers:
         cid = peer["chat_id"]
         await asyncio.sleep(config.NET_DELAY)
@@ -67,28 +78,35 @@ async def spread(bot: Bot, src_chat: int, user, kind: str, mute_min: int,
             if await _skip(bot, cid, user.id):
                 skipped += 1
                 continue
-            if await db.active_punishment_of(cid, user.id, kind) is not None:
-                skipped += 1          # уже наказан там же и тем же — не дублируем
+            if any([await db.active_punishment_of(cid, user.id, k) is not None
+                    for k in _ALREADY.get(kind, (kind,))]):
+                skipped += 1          # уже наказан там не мягче — не дублируем
                 continue
             from . import moderation
             # в чужих чатах сетки человек мог ничего и не писать — убирать
             # там за ним нечего, и лезть в их переписку мы не будем
             pid = await moderation.apply_punishment(
-                bot, cid, user, kind, mute_min, note, by_id, wipe=False
+                bot, cid, user, kind, mute_min, note, by_id, wipe=False,
+                ban_min=ban_min,
             )
             if pid is None:
                 failed += 1
                 continue
             done += 1
+            # в журнал — то, что выдали (мут), даже если Telegram применил
+            # его баном; сколько таких, видно только в bot.log
+            row = await db.get_punishment(pid)
+            if row is not None and row["kind"] != kind:
+                swapped += 1
             await db.add_event(cid, "manual",
                                f"{kind} по сетке: {user.id} — из {src_title}")
         except Exception:
             failed += 1
             logger.warning("сетка: не вышло наказать %s в %s", user.id, cid,
                            exc_info=True)
-    logger.info("сетка %s: %s -> сделано %s, пропущено %s, ошибок %s",
-                kind, src_chat, done, skipped, failed)
-    return done, skipped, failed
+    logger.info("сетка %s: %s -> сделано %s (банами вместо мута %s), пропущено %s, "
+                "ошибок %s", kind, src_chat, done, swapped, skipped, failed)
+    return done, skipped, failed, swapped
 
 
 async def lift(bot: Bot, src_chat: int, user_id: int) -> tuple[int, int]:
@@ -196,14 +214,21 @@ async def warn_and_note(bot: Bot, sent: list, src_chat: int, user, reason: str,
         await moderation.append_to_cards(bot, sent, line)
 
 
+def _in(n: int) -> str:
+    return f"{n} {utils.plural(n, 'чате', 'чатах', 'чатах')}"
+
+
 def summary(kind: str, done: int, skipped: int = 0, failed: int = 0) -> str:
-    """Строка-приписка к карточке в логе исходного чата."""
+    """Строка-приписка к карточке в логе исходного чата.
+
+    Мут пишем мутом и там, где Telegram применил его баном: выдан мут.
+    """
     if not done and not failed:
         return ""
-    word = _VERB.get(kind, kind)
-    parts = [f"{word} ещё в {done} {utils.plural(done, 'чате', 'чатах', 'чатах')}"
-             if kind != "lift" else f"снято ещё в {done} "
-             f"{utils.plural(done, 'чате', 'чатах', 'чатах')}"]
+    if kind == "lift":
+        parts = [f"снято ещё в {_in(done)}"]
+    else:
+        parts = [f"{_VERB.get(kind, kind)} ещё в {_in(done)}"]
     if skipped:
         parts.append(f"{skipped} пропущено")
     if failed:
@@ -212,10 +237,12 @@ def summary(kind: str, done: int, skipped: int = 0, failed: int = 0) -> str:
 
 
 async def spread_and_note(bot: Bot, sent: list, src_chat: int, user, kind: str,
-                          mute_min: int, reason: str, by_id: int | None) -> None:
+                          mute_min: int, reason: str, by_id: int | None,
+                          ban_min: int = 0) -> None:
     """Разослать и дописать итог в уже отправленную карточку."""
-    done, skipped, failed = await spread(bot, src_chat, user, kind, mute_min,
-                                         reason, by_id)
+    done, skipped, failed, _swapped = await spread(bot, src_chat, user, kind,
+                                                   mute_min, reason, by_id,
+                                                   ban_min=ban_min)
     line = summary(kind, done, skipped, failed)
     if line and sent:
         from . import moderation

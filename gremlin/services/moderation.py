@@ -239,6 +239,9 @@ def message_body(message, with_link: bool = False) -> str:
 def card_text(kind: str, chat_title: str | None, user_id: int, who: str,
               reason: str, by: str, until: int | None = None, body: str = "") -> str:
     """Единая структура карточки для всех событий."""
+    reason, swapped = utils.split_swap(reason)
+    if swapped:
+        kind = "mute"              # выдан мут; бан — только способ его применить
     lines = [
         f"{KIND_EMOJI.get(kind, '•')} <b>{KIND_LABEL.get(kind, kind)}</b> · {utils.esc(chat_title)}",
         f"👤 {who} (<code>{user_id}</code>)",
@@ -248,6 +251,8 @@ def card_text(kind: str, chat_title: str | None, user_id: int, who: str,
     # превращается в бан на тот же срок, и это должно быть видно
     if kind == "mute" or until:
         lines.append(f"⏰ До: {utils.fmt_ts(until)}")
+    if swapped:
+        lines.append(utils.SWAP_NOTE)
     lines.append(f"👮 Кем: {by}")
     return "\n".join(lines) + body
 
@@ -325,7 +330,7 @@ async def wipe_recent(bot: Bot, chat_id: int, user_id: int, keep: int) -> int:
 
 async def punish_ex(bot: Bot, chat_id: int, user: User, kind: str, mute_min: int,
                     reason: str, by_id: int | None,
-                    wipe: bool = True) -> tuple[int | None, str | None]:
+                    wipe: bool = True, ban_min: int = 0) -> tuple[int | None, str | None]:
     """То же, что apply_punishment, но возвращает и текст ошибки Telegram.
 
     Нужен там, где ответ видит живой админ: «не получилось» без причины
@@ -335,6 +340,10 @@ async def punish_ex(bot: Bot, chat_id: int, user: User, kind: str, mute_min: int
     в игре бан это приз, а не борьба со спамом, и сносить проигравшему живую
     переписку незачем; в сетке бан расходится по чужим чатам, где человек мог
     ничего плохого и не писать.
+
+    ban_min — срок бана в минутах, 0 — навсегда. Отдельно от mute_min: правила
+    передают сюда свой «срок мута» и при наказании «бан», и читать его как срок
+    бана значило бы тихо сделать их баны временными.
     """
     if kind == "delete":
         return None, None
@@ -358,6 +367,8 @@ async def punish_ex(bot: Bot, chat_id: int, user: User, kind: str, mute_min: int
     # и Telegram снимет бан ровно тогда, когда закончился бы мут. Просили
     # сутки тишины — значит сутки, а не «навсегда» из-за технической детали.
     until = utils.until_ts(mute_min) if kind == "mute" or swapped else None
+    if kind == "ban" and not swapped and ban_min:
+        until = utils.until_ts(ban_min)           # !ban 14d — бан на срок
     try:
         if kind == "mute":
             s = await db.get_settings(chat_id)
@@ -419,15 +430,50 @@ async def kick(bot: Bot, chat_id: int, user: User,
 
 async def apply_punishment(bot: Bot, chat_id: int, user: User, kind: str,
                            mute_min: int, reason: str, by_id: int | None,
-                           wipe: bool = True) -> int | None:
+                           wipe: bool = True, ban_min: int = 0) -> int | None:
     """Применить mute/ban к юзеру, записать в базу. Вернуть id наказания (None если delete).
 
     Тонкая обёртка над punish_ex: текст ошибки нужен не всем, а расходиться
     в поведении две копии одного кода рано или поздно начнут.
     """
     pid, _ = await punish_ex(bot, chat_id, user, kind, mute_min, reason, by_id,
-                             wipe=wipe)
+                             wipe=wipe, ban_min=ban_min)
     return pid
+
+
+async def game_punish(bot: Bot, chat_id: int, user, kind: str, minutes: int,
+                      reason: str, by_id: int | None
+                      ) -> tuple[int | None, int | None, str | None]:
+    """Наказание от прикола: мут добавляется к уже идущему, а не перебивает его.
+
+    У Telegram на человека один срок ограничения, и новый мут просто заменял
+    старый: шесть часов от рулетки превращались в час от битвы. Теперь срок
+    игры (какой стоит в её настройке) прибавляется к остатку. Мут навсегда
+    или бан игра не трогает вовсе — сократить их она не вправе.
+
+    Вернуть (id наказания, общий срок в минутах — если сложили с прошлым,
+    чем уже наказан строже — 'ban'/'mute', если игра ничего не выдала).
+    Переписку не трогаем: наказание в игре — приз, а не борьба со спамом.
+    """
+    if kind != "mute":
+        pid = await apply_punishment(bot, chat_id, user, kind, minutes, reason,
+                                     by_id, wipe=False)
+        return pid, None, None
+    if await db.active_punishment_of(chat_id, user.id, "ban") is not None:
+        return None, None, "ban"
+    old = await db.active_punishment_of(chat_id, user.id, "mute")
+    total = None
+    if old is not None:
+        if old["until_ts"] is None:
+            return None, None, "mute"
+        left = old["until_ts"] - int(time.time())
+        if left > 0 and minutes:
+            total = minutes + -(-left // 60)
+    pid = await apply_punishment(bot, chat_id, user, "mute", total or minutes,
+                                 reason, by_id, wipe=False)
+    if pid is not None and old is not None:
+        await db.deactivate_punishment(old["id"])   # одна запись на общий срок
+    return pid, total, None
 
 
 async def lift_punishment(bot: Bot, pid: int,
@@ -886,7 +932,8 @@ async def _uni_shadow(bot: Bot, chat, user, s, message, feature_label: str,
     text = " ".join(filter(None, [message.text or message.caption or "",
                                   seen_text]))
     kind = _UNI_FAMILY.get(feature_label)
-    hard, cosmetic, why = watch_svc.message_parts(text)
+    hard, cosmetic, why = watch_svc.message_parts(
+        text, await watch_svc.known_bots(bot, chat.id, text))
     buttons = button_urls(message)
     outward = vd.has_outward(text, buttons)
     weight = (await flt.stopword_weight(chat.id, detail, "msg")
@@ -947,7 +994,7 @@ async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
         # что случилось на самом деле, а не то, что задумывалось
         row = await db.get_punishment(pid)
         if row is not None:
-            applied = row["kind"]
+            applied = utils.shown_kind(row["kind"], row["reason"])
             reason = row["reason"]
             until_ts = row["until_ts"]
 

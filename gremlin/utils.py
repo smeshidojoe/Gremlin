@@ -220,6 +220,35 @@ def short_reason(reason: str | None) -> tuple[str, bool]:
     return text.strip() or "—", swapped
 
 
+# Тихая строка там, где разбирают конкретный случай: карточка и проверка.
+# Без неё «почему он не может вступить, у него же мут» не разгадать
+SWAP_NOTE = "ℹ️ в чате не состоит — Telegram применил бан"
+
+
+def split_swap(reason: str | None) -> tuple[str, bool]:
+    """Причина без приписки о подмене мута баном -> (текст, была ли подмена).
+
+    В отличие от short_reason «сетка · чат:» не трогает: карточке он нужен.
+    """
+    text = reason or ""
+    if _SWAP_TAIL.search(text):
+        return _SWAP_TAIL.sub("", text), True
+    return text, False
+
+
+def shown_kind(kind: str, reason: str | None) -> str:
+    """Какое наказание показывать людям — то, что выдали, а не то, чем его
+    смог применить Telegram.
+
+    Мут не-участнику Telegram не даёт, и бот ставит бан на тот же срок. Но
+    админ просил мут, и везде — в карточках, списках, проверке и счётчиках —
+    это мут. Бан остаётся только в механике: снятие делает разбан.
+    """
+    if kind == "ban" and split_swap(reason)[1]:
+        return "mute"
+    return kind
+
+
 def name_link(user_id: int, name: str | None, username: str | None = None) -> str:
     """Имя человека ссылкой на его профиль.
 

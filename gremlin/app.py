@@ -37,6 +37,8 @@ def _setup_logging() -> None:
         ],
     )
     logging.getLogger("aiogram.dispatcher").addFilter(_DropPollingDisconnect())
+    from .services import diag
+    diag.setup()
 
 
 async def _on_error(event: ErrorEvent) -> None:
@@ -99,6 +101,36 @@ async def _fix_net_terms(bot: Bot) -> None:
                     fixed, lifted)
 
 
+async def _fix_forever_mute(bot: Bot) -> None:
+    """Разово: @AMD_Ryzen_5_Pro_2500U должен был получить бессрочный мут.
+
+    20.09 ему дали «!mute не будешь» без срока, и мут вышел суточным (тогда
+    срок по умолчанию был один на всех), а по сетке ещё и с двойной
+    припиской. Гасим обе записи и выдаём заново навсегда: в каждом чате бот
+    сам решит, мут это будет или бан, — смотря, состоит ли человек там.
+    Карточек в лог не шлём, только строка в журнал событий.
+    """
+    if await db.kv_get(db.FOREVER_MUTE_KEY):
+        return
+    from .services import adm_cache, net
+    uid = 431797189
+    user = await net.user_stub(uid)
+    for pid in (233, 234):
+        p = await db.get_punishment(pid)
+        if p is None or p["user_id"] != uid:
+            continue
+        cid = p["chat_id"]
+        reason = (p["reason"] or "").split(" · мут не-участнику")[0] or "без причины"
+        await db.deactivate_punishment(pid)
+        adm_cache.invalidate_member(cid, uid)
+        new, err = await moderation.punish_ex(bot, cid, user, "mute", 0, reason,
+                                              p["by_id"], wipe=False)
+        await db.add_event(cid, "manual",
+                           f"разовая правка: {user.full_name} ({uid}) — бессрочно"
+                           + (f", не вышло: {err}" if new is None else ""))
+    await db.kv_set(db.FOREVER_MUTE_KEY, "1")
+
+
 async def main() -> None:
     _setup_logging()
     if not config.BOT_TOKEN:
@@ -113,6 +145,9 @@ async def main() -> None:
     runtime.set_bot(bot)      # меню спрашивает Telegram без bot в руках
     dp = Dispatcher()
 
+    from .services import diag
+    bot.session.middleware(diag.api_timer)
+    dp.update.outer_middleware(diag.SlowUpdates())
     dp.message.middleware(TrackingMiddleware())
     dp.callback_query.middleware(TrackingMiddleware())
     dp.errors.register(_on_error)
@@ -252,6 +287,10 @@ async def main() -> None:
         await _fix_net_terms(bot)
     except Exception:
         logger.warning("сроки у копий по сетке не починились", exc_info=True)
+    try:
+        await _fix_forever_mute(bot)
+    except Exception:
+        logger.warning("разовый бессрочный мут не выдан", exc_info=True)
     # разовый переезд медиа в папки по чатам: до первой отправки заготовки
     try:
         await triggers.migrate_layout()

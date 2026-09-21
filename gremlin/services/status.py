@@ -173,9 +173,15 @@ async def _chat(bot: Bot, chat, uid: int) -> dict:
     if watch is not None and watch["flagged"]:
         lines.append(f"👁 была карточка наблюдения ({watch['card_score'] or 0} очков)")
     for p in facts["active"]:
-        why, _swapped = utils.short_reason(p["reason"])
-        lines.append(f"🔨 в базе: {_KIND_WORD.get(p['kind'], p['kind'])} "
+        why, swapped = utils.short_reason(p["reason"])
+        shown = utils.shown_kind(p["kind"], p["reason"])
+        if swapped and tg_kind == "ban":
+            # Telegram видит бан, а выдавали мут — так и пишем, с тихой строкой
+            out["state"] = f"🔇 мут {_term(_until(m))}"
+        lines.append(f"🔨 в базе: {_KIND_WORD.get(shown, shown)} "
                      f"{_term(p['until_ts'])} — {utils.chunk(why, 80)}")
+        if swapped:
+            lines.append(utils.SWAP_NOTE)
         # в базе висит, а Telegram не видит: сняли руками в обход бота или
         # наказание не применилось. Кнопка «Снять» в списке тогда ничего не снимет
         if m is not None and p["kind"] in ("ban", "mute") and tg_kind != p["kind"]:

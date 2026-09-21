@@ -47,5 +47,17 @@ _tasks: set[asyncio.Task] = set()
 def spawn(coro) -> asyncio.Task:
     task = asyncio.create_task(coro)
     _tasks.add(task)
-    task.add_done_callback(_tasks.discard)
+    task.add_done_callback(_done)
     return task
+
+
+def _done(task: asyncio.Task) -> None:
+    """Ошибка в фоновой задаче раньше пропадала молча — теперь попадает в лог."""
+    _tasks.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        import logging
+        logging.getLogger("gremlin.runtime").error(
+            "фоновая задача упала: %s", task.get_coro().__qualname__, exc_info=exc)

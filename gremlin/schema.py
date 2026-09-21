@@ -473,7 +473,7 @@ SECTIONS: list[Section] = [
         "срок (<code>30m</code>, <code>2h</code>, <code>3d</code>) и причину. Без "
         "срока — на сутки.\n"
         "• <code>!kick</code> — выгнать из чата. Вернуться можно сразу.\n"
-        "• <code>!ban</code> — забанить навсегда.\n"
+        "• <code>!ban</code> — забанить. Срок можно указать: <code>!ban 14d</code>.\n"
         "• <code>!warn</code> — выдать предупреждение. Когда наберётся лимит из "
         "раздела «Варны», бот накажет сам. Работает, только если варны включены.\n"
         "• <code>!unmute</code>, <code>!unban</code> — снять мут или бан.\n"
@@ -482,6 +482,8 @@ SECTIONS: list[Section] = [
         "\n"
         "Выключенную команду бот не замечает и никого за неё не мутит.\n"
         "\n"
+        "• «Срок !mute» и «Срок !ban» — на сколько наказывать, если в команде "
+        "срок не написали. Написанный срок всегда важнее.\n"
         "• «Мут за чужие команды» — если команду напишет не админ, бот удалит её "
         "и даст мут на выбранное время.\n"
         "\n"
@@ -493,6 +495,8 @@ SECTIONS: list[Section] = [
             Field("cmd_warn_on", "toggle", "!warn"),
             Field("cmd_lift_on", "toggle", "!unmute и !unban"),
             Field("cmd_dm_on", "toggle", "!dm"),
+            Field("cmd_mute_min", "cycle", "Срок !mute", _MUTE, fmt="minutes"),
+            Field("cmd_ban_min", "cycle", "Срок !ban", _MUTE, fmt="minutes"),
             Field("misuse_mute", "cycle", "Мут за чужие команды",
                   list(config.MISUSE_MUTE_PRESETS), config.MISUSE_MUTE_LABELS),
         ],

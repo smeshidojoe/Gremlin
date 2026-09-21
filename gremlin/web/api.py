@@ -99,8 +99,8 @@ def _strip_tags(text: str | None) -> str:
 
 def _short_reason(reason: str | None) -> str:
     """Причина для списка: без «сетка · чат:» и приписки про подмену мута."""
-    why, swapped = utils.short_reason(_strip_tags(reason))
-    return why + (" · мут→бан" if swapped else "")
+    why, _swapped = utils.short_reason(_strip_tags(reason))
+    return why
 
 
 # ---------- главная ----------
@@ -1182,7 +1182,10 @@ async def api_active(request: web.Request) -> web.Response:
             "username": r["username"],
             "link": (f"https://t.me/{r['username']}" if r["username"]
                      else f"tg://user?id={r['user_id']}"),
-            "kind": r["kind"], "kind_label": um._KIND_WORD.get(r["kind"], r["kind"]),
+            # выданное, а не применённое: мут не-участнику Telegram ставит баном
+            "kind": utils.shown_kind(r["kind"], r["reason"]),
+            "kind_label": um._KIND_WORD.get(utils.shown_kind(r["kind"], r["reason"]),
+                                            r["kind"]),
             "until": "навсегда" if not r["until_ts"] else utils.fmt_ts(r["until_ts"]),
             "since": utils.fmt_ts(r["created"]) if r["created"] else None,
             "reason": _short_reason(r["reason"]),
@@ -1227,7 +1230,7 @@ async def api_forgiven(request: web.Request) -> web.Response:
     cid = await cid_of(request, "punish")
     items = []
     for r in await db.forgiven_list(cid):
-        why, swapped = utils.short_reason(r["reason"])
+        why, _swapped = utils.short_reason(r["reason"])
         items.append({
             "id": r["id"], "user_id": r["user_id"],
             "who": r["name"] or (f"@{r['username']}" if r["username"]
@@ -1237,7 +1240,7 @@ async def api_forgiven(request: web.Request) -> web.Response:
             "scope": r["scope"],
             "scope_label": config.WL_SCOPE_LABELS.get(r["scope"], r["scope"]),
             "since": utils.fmt_ts(r["created"]),
-            "reason": why + (" · мут→бан" if swapped else ""),
+            "reason": why,
         })
     return js({"items": items})
 
@@ -1411,7 +1414,8 @@ async def api_copy_sources(request: web.Request) -> web.Response:
     return js({
         "chats": [{"chat_id": c["chat_id"], "title": c["title"] or str(c["chat_id"])}
                   for c in others],
-        "groups": [{"key": k, "label": transfer.GROUPS[k][0]} for k in transfer.ALL_GROUPS],
+        "groups": [{"key": k, "label": transfer.GROUPS[k][0]}
+                   for k in transfer.shown_groups()],
     })
 
 
@@ -1420,7 +1424,7 @@ async def api_copy(request: web.Request) -> web.Response:
     cid = await cid_of(request, "owner")
     data = await body(request)
     src = int(data.get("src") or 0)
-    groups = [g for g in (data.get("groups") or []) if g in transfer.GROUPS]
+    groups = [g for g in (data.get("groups") or []) if g in transfer.shown_groups()]
     if not await auth.owns(uid_of(request), src, "owner"):
         raise web.HTTPForbidden(text="Чужой чат-источник.")
     if not groups:
@@ -1484,7 +1488,7 @@ async def api_import(request: web.Request) -> web.Response:
         "title": snap.get("chat_title"),
         "inside": transfer.describe(snap),
         "groups": [{"key": g, "label": transfer.GROUPS[g][0]}
-                   for g in transfer.ALL_GROUPS if g in snap["groups"]],
+                   for g in transfer.shown_groups() if g in snap["groups"]],
     })
 
 
@@ -1497,7 +1501,7 @@ async def api_import_apply(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="Файл уже забыт — загрузите его ещё раз.")
     snap, media = got
     groups = {g for g in ((await body(request)).get("groups") or [])
-              if g in snap["groups"]}
+              if g in snap["groups"] and g in transfer.shown_groups()}
     if not groups:
         raise web.HTTPBadRequest(text="Не выбрано ни одного раздела.")
     stats = await transfer.apply(cid, snap, groups, media.get)

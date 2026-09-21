@@ -67,10 +67,45 @@ def set_self(username: str | None) -> None:
     SELF_USERNAME = (username or "").lower()
 
 
-def _drop_self(text: str) -> str:
-    if not SELF_USERNAME:
-        return text
-    return re.sub(rf"@{re.escape(SELF_USERNAME)}\b", " ", text, flags=re.IGNORECASE)
+def _drop_self(text: str, known=()) -> str:
+    """Убрать упоминания самого Гремлина и ботов, которые сидят в чате."""
+    for name in filter(None, (SELF_USERNAME, *known)):
+        text = re.sub(rf"@{re.escape(name)}\b", " ", text, flags=re.IGNORECASE)
+    return text
+
+
+# (чат, бот), уже записанные в базу: ответы на сообщения одного бота идут
+# потоком, и писать в базу на каждый незачем
+_noted: set[tuple[int, int]] = set()
+
+
+async def note_bot(chat_id: int, user) -> None:
+    """Запомнить бота, который точно есть в чате."""
+    from .. import db
+    if (chat_id, user.id) in _noted:
+        return
+    await db.chat_bot_add(chat_id, user.id, user.username)
+    _noted.add((chat_id, user.id))
+
+
+async def forget_bot(chat_id: int, bot_id: int) -> None:
+    from .. import db
+    _noted.discard((chat_id, bot_id))
+    await db.chat_bot_remove(chat_id, bot_id)
+
+
+async def known_bots(bot, chat_id: int, text: str) -> set[str]:
+    """Юзернеймы ботов чата — только если в тексте вообще упомянут бот.
+
+    Инлайн-ботов сюда не берём ни по via_bot, ни по белому списку инлайна:
+    спамеры как раз ими и ходят.
+    """
+    if not text or not _BOT_MENTION.search(text):
+        return set()
+    from .. import db
+    from . import adm_cache
+    await adm_cache.chat_admin_ids(bot, chat_id)
+    return await db.chat_bot_names(chat_id) | adm_cache._admin_bots.get(chat_id, set())
 
 # кириллица и латиница внутри одного слова = гомоглифы
 _HOMOGLYPH_WORD = re.compile(r"\w*(?:[а-яё][a-z]|[a-z][а-яё])\w*", re.IGNORECASE)
@@ -212,7 +247,7 @@ def score_profile(first_name: str | None, last_name: str | None,
     return hard + cosmetic, reasons
 
 
-def message_parts(text: str) -> tuple[int, int, list[str]]:
+def message_parts(text: str, known=()) -> tuple[int, int, list[str]]:
     """Разобрать текст на (тревожные очки, косметика, причины).
 
     Тревожные (telegra.ph, невидимки, сокращатели) и усилитель за кривопись
@@ -224,7 +259,8 @@ def message_parts(text: str) -> tuple[int, int, list[str]]:
     hard, reasons = 0, []
     if not text:
         return 0, 0, []
-    text = _drop_self(text)      # «@GremlinModBot, привет» — это к нам, не спам
+    # «@GremlinModBot, привет» — это к нам, не спам; свои боты чата — тоже
+    text = _drop_self(text, known)
     if _TELEGRAPH.search(text):
         hard += 45; reasons.append("telegra.ph-ссылка")
     if _INVISIBLE.search(_visible_part(text)):
@@ -388,10 +424,16 @@ async def photo_points(bot, chat_id: int, user, settings,
     from . import profile as prof_svc
     if data is None:
         data = await prof_svc.fetch(bot, user.id)
-    raw = await prof_svc.photo_bytes(bot, data)
-    if not raw:
-        return 0, []
-    got = await nsfw.score(raw)
+    photo_id = (data or {}).get("photo_id")
+    got = nsfw.cached(photo_id)
+    if got == "нет":
+        # считаем только незнакомую картинку: и скачивание, и сама модель
+        # стоят дорого, а аватарка у человека одна на все его сообщения
+        raw = await prof_svc.photo_bytes(bot, data)
+        if not raw:
+            return 0, []
+        got = await nsfw.score(raw)
+        nsfw.remember(photo_id, got)
     if got is None or got < settings.prof_photo_min:
         return 0, []
     return int(settings.prof_photo_score), [f"откровенная аватарка ({got}%)"]
@@ -551,7 +593,8 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None,
     text = ""
     if message is not None:
         text = message.text or message.caption or ""
-        hard, cosmetic, m_reasons = message_parts(text)
+        hard, cosmetic, m_reasons = message_parts(
+            text, await known_bots(bot, chat.id, text))
 
     # CAS на входе в чат: профиль у спамера обычно самый обычный, и всё
     # остальное здесь молчит — спрашиваем список до того, как он что-то написал

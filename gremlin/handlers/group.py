@@ -92,6 +92,9 @@ def _manual_card_text(kind: str, chat_title: str | None, target, reason: str,
                       until: int | None, by, body: str = "") -> str:
     who = utils.mention(target.id, target.full_name, target.username)
     admin = utils.mention(by.id, by.full_name, by.username)
+    reason, swapped = utils.split_swap(reason)
+    if swapped:
+        kind = "mute"              # выдан мут; бан — только способ его применить
     lines = [
         f"{moderation.KIND_EMOJI[kind]} <b>{moderation.KIND_LABEL[kind]}</b> · {utils.esc(chat_title)}",
         f"👤 {who} (<code>{target.id}</code>)",
@@ -101,6 +104,8 @@ def _manual_card_text(kind: str, chat_title: str | None, target, reason: str,
     # превращается в бан на тот же срок, и это должно быть видно
     if kind == "mute" or until:
         lines.append(f"⏰ До: {utils.fmt_ts(until)}")
+    if swapped:
+        lines.append(utils.SWAP_NOTE)
     lines.append(f"👮 Кем: {admin}")
     return "\n".join(lines) + body
 
@@ -151,15 +156,24 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
         await message.reply("Этого юзера наказать нельзя.")
         return
 
-    mute_min = config.MANUAL_MUTE_DEFAULT      # срок не указали — сутки
+    # срок не указали — берём из настроек чата (0 — навсегда)
+    s = await db.get_settings(message.chat.id)
+    mute_min = s.cmd_mute_min
+    ban_min = s.cmd_ban_min
     if kind == "kick":
         mute_min = 0                           # кик мгновенный, срока у него нет
-    if kind == "mute" and parts:
+    # Срок понимают и мут, и бан. Раньше «!ban 14d спам» уходил в причину
+    # целиком, а бан выходил вечным вместо двух недель
+    if kind in ("mute", "ban") and parts:
         parsed = utils.parse_duration(parts[0])
         if parsed is not None:
-            mute_min = parsed
+            if kind == "mute":
+                mute_min = parsed
+            else:
+                ban_min = parsed
             parts = parts[1:]
     reason = " ".join(parts) or "без причины"
+    asked_reason = reason        # для сетки: карточка ниже получит приписки
     # текст берём до удаления — он уходит в карточку
     body = moderation.message_body(message.reply_to_message)  # None -> пусто
 
@@ -169,7 +183,7 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
     else:
         pid, err = await moderation.punish_ex(
             bot, message.chat.id, target, kind, mute_min, reason,
-            message.from_user.id)
+            message.from_user.id, ban_min=ban_min)
     if pid is None:
         await message.reply(f"Не получилось: {utils.esc(err or 'Telegram отказал')}.")
         return
@@ -184,6 +198,8 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
     row = await db.get_punishment(pid)
     if row is not None:
         kind, reason, until = row["kind"], row["reason"], row["until_ts"]
+        # а называем его тем, что просили: мут. Кнопка «Размутить» снимет бан
+        kind = utils.shown_kind(kind, reason)
 
     # В чат ничего не пишем: наказание и так видно в лог-чате, а сообщение
     # нарушителя вместе с командой убираем, чтобы лента осталась чистой.
@@ -198,7 +214,6 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
     # Ручное наказание тоже запоминаем, но помечаем «unknown»: причины у людей
     # свои, к тексту сообщения они часто отношения не имеют, и учить на этом
     # модель — верный способ научить её ерунде.
-    s = await db.get_settings(message.chat.id)
     if s.nn_mode and message.reply_to_message is not None:
         await db.sample_add(
             message.chat.id, target.id, "manual", "unknown",
@@ -223,9 +238,12 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
     if kind != "kick":
         # кик по сетке не расходится: выгнать человека из шести чатов за то,
         # что он мешал в одном, — не то, о чём просили
+        # Причину — как её написали: в чужом чате свою приписку про замену
+        # мута баном бот поставит сам, если там она случится. Раньше уходила
+        # уже дописанная, и в сетке приписка стояла дважды
         runtime.spawn(net.spread_and_note(
-            bot, sent, message.chat.id, target, net_kind, mute_min, reason,
-            message.from_user.id,
+            bot, sent, message.chat.id, target, net_kind, mute_min, asked_reason,
+            message.from_user.id, ban_min=ban_min,
         ))
     await db.add_event(
         message.chat.id, "manual",
@@ -344,15 +362,24 @@ async def _post_rules(message: Message, chat_id: int) -> None:
     Заготовок может быть несколько — берём случайную тем же механизмом, что
     и у триггеров. Пауза нужна, чтобы комментарий не улетел раньше треда.
     """
+    from ..services import diag
     await asyncio.sleep(RULES_DELAY)
     ans = await db.ans_pick("rules", chat_id)
     if ans is None:
+        diag.note("правила: пост %s в %s — заготовок нет", message.message_id, chat_id)
         return
+    start = time.monotonic()
     try:
-        await triggers.send_answer(message, ans)
+        sent = await triggers.send_answer(message, ans)
     except Exception as e:
+        diag.note("правила: пост %s в %s — Telegram отказал: %s",
+                  message.message_id, chat_id, e)
         if not utils.msg_gone(e):
             logger.warning("rules post failed in %s", chat_id, exc_info=True)
+        return
+    diag.note("правила: пост %s в %s — %s за %.1f с", message.message_id, chat_id,
+              "отправлено" if sent is not None else "не отправлено (пост уже удалён)",
+              time.monotonic() - start)
 
 
 @router.message(F.text.regexp(r"(?i)^!(warn|варн)(\s|$)"), _cmd_on("cmd_warn_on"))
@@ -1118,6 +1145,8 @@ async def on_join(message: Message, bot: Bot) -> None:
                     runtime.spawn(net.spread_and_note(
                         bot, sent, message.chat.id, user, "ban", 0,
                         "чужой бот добавлен не-админом", None))
+                else:
+                    await watch.note_bot(message.chat.id, user)
                 continue
             # профиль новичка-человека
             if not user.is_bot and user.id not in admins and user.id not in config.ADMIN_IDS:
@@ -1204,6 +1233,13 @@ async def moderate(message: Message, bot: Bot) -> None:
         # запоминаем id — если автора забанят, за ним надо будет убрать
         moderation.remember_message(chat.id, user.id, message.message_id)
 
+    if getattr(message, "is_automatic_forward", False) and message.edit_date is None:
+        # одна строка на пост: если бот промолчал, видно, дошёл ли пост вообще
+        from ..services import diag
+        diag.note("пост пришёл: %s в %s · тред %s · альбом %s · опоздание %.0f с",
+                  message.message_id, chat.id, message.message_thread_id,
+                  message.media_group_id or "—", time.time() - (ts_of(message) or time.time()))
+
     # а вот модерировать задним числом не надо — админы уже всё разрулили
     if stale(message):
         return
@@ -1214,8 +1250,13 @@ async def moderate(message: Message, bot: Bot) -> None:
     if message.sender_chat is not None:
         # анонимный админ этого же чата — ок; автопересылка из привязанного канала — ок
         if message.sender_chat.id == chat.id or message.is_automatic_forward:
-            if message.is_automatic_forward and s.rules_on and _rules_needed(message):
-                runtime.spawn(_post_rules(message, chat.id))
+            if message.is_automatic_forward and s.rules_on:
+                if _rules_needed(message):
+                    runtime.spawn(_post_rules(message, chat.id))
+                elif message.edit_date is None:
+                    from ..services import diag
+                    diag.note("правила: пост %s в %s — уже отвечали (часть альбома)",
+                              message.message_id, chat.id)
             return
         anon_body = moderation.message_body(message)   # текст берём до удаления
         sender_scopes = await db.wl_scopes_for(
@@ -1247,6 +1288,11 @@ async def moderate(message: Message, bot: Bot) -> None:
 
     if user is None or user.is_bot and user.id == bot.id:
         return
+
+    # ответили боту — значит, он сидит в чате, и звать его по имени не спам
+    replied = message.reply_to_message.from_user if message.reply_to_message else None
+    if replied is not None and replied.is_bot and replied.id != bot.id:
+        await watch.note_bot(chat.id, replied)
 
     # Ниже — только модерация, и от неё освобождены владелец бота, админы чата
     # и вайтлист. Но триггеры — развлекательная часть, они должны работать

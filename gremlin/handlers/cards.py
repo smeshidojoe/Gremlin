@@ -112,7 +112,8 @@ async def card_lift(cb: CallbackQuery, bot: Bot) -> None:
         p["chat_id"] if p else None, "card",
         f"снято наказание #{pid} юзером {cb.from_user.id}",
     )
-    await cb.answer("Разбанен")
+    shown = utils.shown_kind(p["kind"], p["reason"]) if p is not None else "ban"
+    await cb.answer("Размучен" if shown == "mute" else "Разбанен")
 
 
 def _forgive_kb(pid: int, scope: str):

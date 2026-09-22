@@ -81,6 +81,11 @@ async def bot_added(update: ChatMemberUpdated, bot: Bot) -> None:
         who = (
             utils.mention(adder.id, adder.full_name, adder.username) if adder else "неизвестно"
         )
+        if adder is not None and not adder.is_bot:
+            # звал бота к себе — единственный след о таком человеке, больше
+            # он нигде не остаётся: чат мы не регистрируем и уходим
+            await db.knock_chat(adder.id, adder.username, adder.full_name,
+                                chat.title)
         left = True
         try:
             await bot.leave_chat(chat.id)

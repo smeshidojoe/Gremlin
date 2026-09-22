@@ -1810,6 +1810,44 @@ async def api_access_del(request: web.Request) -> web.Response:
     return js({"ok": True})
 
 
+@routes.get("/api/knocks")
+async def api_knocks(request: web.Request) -> web.Response:
+    owner_only(request)
+    items = []
+    for r in await db.knock_list():
+        items.append({
+            "user_id": r["user_id"],
+            "username": r["username"],
+            "who": await db.user_label(r["user_id"], r["username"],
+                                       fallback=r["name"]),
+            "first": utils.rel_time(r["first_ts"]),
+            "last": utils.rel_time(r["last_ts"]),
+            "dm": r["dm_cnt"],
+            "adds": r["add_cnt"],
+            "chat": r["last_chat"],
+            # допуск могли дать уже после отказа — показываем нынешнее
+            "granted": await db.access_allowed(r["user_id"], r["username"]),
+        })
+    return js({"items": items})
+
+
+@routes.post("/api/knocks/{uid}/access")
+async def api_knock_grant(request: web.Request) -> web.Response:
+    owner_only(request)
+    uid = int(request.match_info["uid"])
+    row = await db.knock_get(uid)
+    await db.access_add(uid, row["username"] if row else None,
+                        row["name"] if row else None)
+    return js({"ok": True})
+
+
+@routes.delete("/api/knocks/{uid}")
+async def api_knock_del(request: web.Request) -> web.Response:
+    owner_only(request)
+    await db.knock_remove(int(request.match_info["uid"]))
+    return js({"ok": True})
+
+
 @routes.post("/api/global-log")
 async def api_global_log(request: web.Request) -> web.Response:
     owner_only(request)

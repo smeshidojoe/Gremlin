@@ -401,6 +401,20 @@ CREATE TABLE IF NOT EXISTS users(
     last_seen  INTEGER,
     banned     INTEGER NOT NULL DEFAULT 0
 );
+-- Кто приходил к боту в личку или звал его к себе в чат. Строка на человека,
+-- а не на сообщение: важно, кто заглядывал и чем кончилось. В users такие
+-- не попадают — проверка доступа отсекает чужого раньше записи.
+CREATE TABLE IF NOT EXISTS knocks(
+    user_id   INTEGER PRIMARY KEY,
+    username  TEXT,
+    name      TEXT,
+    first_ts  INTEGER NOT NULL,
+    last_ts   INTEGER NOT NULL,
+    dm_cnt    INTEGER NOT NULL DEFAULT 0,   -- сколько раз писал в личку
+    add_cnt   INTEGER NOT NULL DEFAULT 0,   -- сколько раз звал бота в свой чат
+    last_chat TEXT,                         -- куда звал в последний раз
+    allowed   INTEGER NOT NULL DEFAULT 0    -- пустил ли его бот в последний раз
+);
 CREATE TABLE IF NOT EXISTS kv(
     k TEXT PRIMARY KEY,
     v TEXT
@@ -3068,6 +3082,65 @@ async def access_allowed(user_id: int, username: str | None) -> bool:
     cur = await _db.execute("SELECT 1 FROM chat_admins WHERE user_id = ?",
                             (user_id,))
     return await cur.fetchone() is not None
+
+
+# ---------- кто стучался к боту ----------
+#
+# Личку бот раньше не помнил вовсе, и вопрос «сколько народу его вообще
+# открывало» упирался в пустоту: тех, кому отказали, нигде не оставалось.
+# Имя и ник храним свои — человека может не быть ни в users, ни в чатах.
+
+async def knock_dm(user_id: int, username: str | None, name: str | None,
+                   allowed: bool) -> None:
+    """Отметить приход в личку. allowed — пустил ли его бот в этот раз."""
+    now = _now()
+    await _db.execute(
+        """INSERT INTO knocks (user_id, username, name, first_ts, last_ts,
+                               dm_cnt, allowed)
+           VALUES (?, ?, ?, ?, ?, 1, ?)
+           ON CONFLICT(user_id) DO UPDATE SET
+             username = COALESCE(excluded.username, knocks.username),
+             name = COALESCE(excluded.name, knocks.name),
+             last_ts = excluded.last_ts,
+             dm_cnt = knocks.dm_cnt + 1,
+             allowed = excluded.allowed""",
+        (user_id, (username or None), name, now, now, int(allowed)),
+    )
+    await _db.commit()
+
+
+async def knock_chat(user_id: int, username: str | None, name: str | None,
+                     title: str | None) -> None:
+    """Отметить попытку позвать бота в чужой чат — оттуда бот уходит сам."""
+    now = _now()
+    await _db.execute(
+        """INSERT INTO knocks (user_id, username, name, first_ts, last_ts,
+                               add_cnt, last_chat)
+           VALUES (?, ?, ?, ?, ?, 1, ?)
+           ON CONFLICT(user_id) DO UPDATE SET
+             username = COALESCE(excluded.username, knocks.username),
+             name = COALESCE(excluded.name, knocks.name),
+             last_ts = excluded.last_ts,
+             add_cnt = knocks.add_cnt + 1,
+             last_chat = excluded.last_chat""",
+        (user_id, (username or None), name, now, now, title),
+    )
+    await _db.commit()
+
+
+async def knock_list() -> list[aiosqlite.Row]:
+    cur = await _db.execute("SELECT * FROM knocks ORDER BY last_ts DESC")
+    return await cur.fetchall()
+
+
+async def knock_get(user_id: int) -> aiosqlite.Row | None:
+    cur = await _db.execute("SELECT * FROM knocks WHERE user_id = ?", (user_id,))
+    return await cur.fetchone()
+
+
+async def knock_remove(user_id: int) -> None:
+    await _db.execute("DELETE FROM knocks WHERE user_id = ?", (user_id,))
+    await _db.commit()
 
 
 # ---------- kv (глобальные настройки админа) ----------

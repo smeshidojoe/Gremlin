@@ -361,6 +361,7 @@ async function homeView() {
     <h2>Владельцу бота</h2>
     <div class="tiles">
       ${tile('#/access', '👥 Доступ к боту')}
+      ${tile('#/knocks', '🚪 Постучались')}
       ${tile('#/seed', '🌱 Стартовый набор')}
       ${tile('#/roulette', '🎯 Бан-рулетка')}
       ${tile('#/admin/log', '📜 Лог событий')}
@@ -1681,6 +1682,36 @@ async function accessView() {
   };
 }
 
+// Кто приходил в личку и кто звал бота к себе в чат. Тех, кому бот отказал,
+// раньше не оставалось нигде, и спросить «сколько народу им интересовалось»
+// было не у кого. Записи копятся с того дня, как бот этому научился.
+async function knocksView() {
+  const d = await api('/knocks');
+  const note = (r) => {
+    const bits = [];
+    if (r.dm) bits.push(`в личку ${r.dm}×`);
+    if (r.adds) bits.push(`звал в чат ${r.adds}×${r.chat ? ` («${r.chat}»)` : ''}`);
+    bits.push(r.last);
+    if (r.granted) bits.push('допущен');
+    return bits.join(' · ');
+  };
+  return {
+    title: 'Постучались',
+    back: '#/',
+    html: `<div class="card">
+      <div class="intro">Кто открывал бота в личке или звал его к себе в чат.</div>
+      <div style="margin-top:10px">
+        ${d.items.map((r) => `<div class="item">
+          <div class="body">${esc(r.who)}<small>${esc(note(r))}</small>
+            <small class="mono">${r.user_id}</small></div>
+          ${r.granted ? '' : `<button class="x" data-act="knock-grant" data-id="${r.user_id}">➕</button>`}
+          <button class="x" data-act="knock-del" data-id="${r.user_id}">✕</button></div>`).join('')
+          || '<div class="empty">Пока никто.</div>'}
+      </div>
+    </div>`,
+  };
+}
+
 // Стартовый набор общий на весь бот: удалили пример — он пропал у всех
 // чатов сразу. Чужая «норма» из чата про Linux в чате про рыбалку только
 // мешает, поэтому смысл страницы — быстро найти лишнее и выкинуть.
@@ -1837,6 +1868,7 @@ const ROUTES = [
   [/^nets$/, netsView],
   [/^net\/(\d+)$/, netView],
   [/^access$/, accessView],
+  [/^knocks$/, knocksView],
   [/^seed$/, seedView],
   [/^roulette$/, rouletteView],
   [/^admin\/log$/, adminLogView],
@@ -1949,7 +1981,7 @@ function skeletonFor(path) {
     return skelCard(skelHead + skelLine(95) + skelLine(88) + skelLine(60) + skelRows(4))
       + skelCard(skelHead + skelRows(2));
   }
-  const lists = /^(chat\/-?\d+\/(active|events|trigs|cmds|words|profwords|warned|answers|linkwl|admins|spamprofiles)|access|seed|admin\/log)/;
+  const lists = /^(chat\/-?\d+\/(active|events|trigs|cmds|words|profwords|warned|answers|linkwl|admins|spamprofiles)|access|knocks|seed|admin\/log)/;
   if (lists.test(path)) return skelCard(skelHead + skelItems(6));
   return skelCard(skelHead + skelRows(3));
 }
@@ -2535,6 +2567,16 @@ const ACT = {
   },
 
   /* --- доступ --- */
+  async 'knock-grant'(el) {
+    await api(`/knocks/${el.dataset.id}/access`, { method: 'POST' });
+    render();
+  },
+
+  async 'knock-del'(el) {
+    await api(`/knocks/${el.dataset.id}`, { method: 'DELETE' });
+    render();
+  },
+
   async 'access-add'() {
     const v = await ask({ title: 'Доступ к боту', hint: 'id или @username.' });
     if (!v) return;

@@ -842,7 +842,7 @@ async def sub_ban(cb: CallbackQuery, bot: Bot) -> None:
         await bot.decline_chat_join_request(cid, uid)
     except Exception:
         logger.info("заявка %s в %s уже не висит", uid, cid, exc_info=True)
-    stub = await _user_stub(uid)
+    stub = await _user_stub(uid, bot, cid)
     pid, err = await moderation.punish_ex(bot, cid, stub, "ban", 0,
                                           "заявка на вступление", cb.from_user.id,
                                           wipe=False)
@@ -874,9 +874,9 @@ async def _sub_gone(cb: CallbackQuery, bot: Bot, cid: int, uid: int,
     return True
 
 
-async def _user_stub(uid: int):
+async def _user_stub(uid: int, bot: Bot | None = None, cid: int | None = None):
     from ..services import net
-    return await net.user_stub(uid)
+    return await net.user_stub(uid, bot, cid)
 
 
 async def _sub_done(cb: CallbackQuery, note: str) -> None:

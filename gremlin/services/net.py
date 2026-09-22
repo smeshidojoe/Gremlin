@@ -149,13 +149,31 @@ async def lift(bot: Bot, src_chat: int, user_id: int) -> tuple[int, int]:
     return done, failed
 
 
-async def user_stub(user_id: int):
-    """Заглушка юзера по id — для мест, где под рукой только число."""
+async def user_stub(user_id: int, bot: Bot | None = None,
+                    chat_id: int | None = None, *, username: str | None = None,
+                    name: str | None = None):
+    """Заглушка юзера по id — для мест, где под рукой только число.
+
+    Своя база знает только тех, кто писал при боте. Кого в ней нет (назвали
+    командой по @нику, пришёл заявкой), спрашиваем у Telegram через чат —
+    иначе в карточке вместо имени и ника голый id. username и name —
+    подсказки от вызывающего, когда он их уже знает.
+    """
     row = await db.get_user(user_id)
+    uname = row["username"] if row else None
+    full = row["first_name"] if row else None
+    if not (uname and full) and bot is not None and chat_id is not None:
+        try:
+            u = (await bot.get_chat_member(chat_id, user_id)).user
+            uname, full = uname or u.username, full or u.full_name
+        except Exception:
+            logger.debug("имя %s не узнать", user_id, exc_info=True)
+    uname = uname or (username or "").lstrip("@") or None
     return SimpleNamespace(
         id=user_id,
-        username=row["username"] if row else None,
-        full_name=(row["first_name"] if row else None) or str(user_id),
+        username=uname,
+        # без имени лучше ник, чем тот же id второй раз
+        full_name=full or name or (f"@{uname}" if uname else str(user_id)),
     )
 
 

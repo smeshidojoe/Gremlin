@@ -5,6 +5,7 @@ import logging
 import random
 import re
 import time
+from types import SimpleNamespace
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
@@ -144,13 +145,12 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
         target = reply.from_user
     else:
         # без реплая цель можно назвать: !mute @vasya 30 или !ban 12345 спам
-        uid, _who = await _lift_target(message, bot)
-        if uid is None or uid < 0:
+        target = await _named_target(message, bot)
+        if target is None or target.id < 0:
             await message.reply(
                 "Кого наказать? Ответьте на сообщение или укажите @ник или id."
             )
             return
-        target = await net.user_stub(uid)
         parts = parts[1:]                       # первым словом шла цель
     if target.id == bot.id or await _is_chat_admin(bot, message.chat.id, target.id):
         await message.reply("Этого юзера наказать нельзя.")
@@ -460,22 +460,51 @@ async def cmd_warn(message: Message, bot: Bot) -> None:
     )
 
 
+async def _named_target(message: Message, bot: Bot):
+    """Цель, названная в команде: @ник, id или упоминание без ника.
+
+    Вернуть заглушку юзера с именем и ником или None. Раньше бралась голая
+    заглушка по id, и того, кто при боте не писал, карточка показывала
+    числом, хотя ник был прямо в команде.
+    """
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        return None
+    token = parts[1]
+    # упоминание человека без ника: Telegram кладёт его прямо в сущность
+    for ent in message.entities or ():
+        if ent.type == "text_mention" and ent.user and ent.offset == len(parts[0]) + 1:
+            u = ent.user
+            return await net.user_stub(u.id, bot, message.chat.id,
+                                       username=u.username, name=u.full_name)
+    if token.lstrip("-").isdigit():
+        uid = int(token)
+        if uid < 0:
+            return SimpleNamespace(id=uid, username=None, full_name=str(uid))
+        return await net.user_stub(uid, bot, message.chat.id)
+    if token.startswith("@") and len(token) > 3:
+        uid, name = await resolve.by_username(bot, token)
+        if uid is None:
+            return None
+        if uid < 0:
+            return SimpleNamespace(id=uid, username=token.lstrip("@"),
+                                   full_name=name or token)
+        return await net.user_stub(uid, bot, message.chat.id,
+                                   username=token, name=name)
+    return None
+
+
 async def _lift_target(message: Message, bot: Bot) -> tuple[int | None, str]:
     """Кого снимать: реплай, @ник или id из команды. Вернуть (id, подпись)."""
     if message.reply_to_message and message.reply_to_message.from_user:
         u = message.reply_to_message.from_user
         return u.id, utils.mention(u.id, u.full_name, u.username)
-    parts = (message.text or "").split()
-    if len(parts) < 2:
+    t = await _named_target(message, bot)
+    if t is None:
         return None, ""
-    token = parts[1]
-    if token.lstrip("-").isdigit():
-        uid = int(token)
-        return uid, f"<code>{uid}</code>"
-    if token.startswith("@") and len(token) > 3:
-        uid, name = await resolve.by_username(bot, token)
-        return uid, utils.esc(name or token)
-    return None, ""
+    if t.id < 0:
+        return t.id, utils.esc(t.full_name)
+    return t.id, utils.mention(t.id, t.full_name, t.username)
 
 
 @router.message(F.text.regexp(r"(?i)^!(unmute|размут|unban|разбан)(\s|$)"),

@@ -1888,7 +1888,7 @@ async def net_import_run(bot: Bot, net_id: int, by_id: int | None) -> tuple[int,
                 seen.setdefault(p["user_id"], p["reason"] or "бан в сетке")
     done = failed = 0
     for uid, reason in list(seen.items())[:MASS_LIMIT]:
-        user = await netsvc.user_stub(uid)
+        user = await netsvc.user_stub(uid, bot, chats[0]["chat_id"] if chats else None)
         for c in chats:
             if await db.active_punishment_of(c["chat_id"], uid, "ban") is not None:
                 continue

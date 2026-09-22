@@ -225,8 +225,8 @@ async def _report_punish(cb: CallbackQuery, bot: Bot, kind: str) -> None:
     rec = _reports.get((chat_id, msg_id))
     from ..services import deleting
     await deleting.one(lambda: bot.delete_message(chat_id, msg_id), chat_id)
-    user = types.SimpleNamespace(id=user_id, username=None,
-                                 full_name=await db.user_handle(user_id))
+    from ..services import net
+    user = await net.user_stub(user_id, bot, chat_id)
     pid = await moderation.apply_punishment(
         bot, chat_id, user, kind, s.report_mute_min if kind == "mute" else 0,
         "по жалобе участников", cb.from_user.id)

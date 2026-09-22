@@ -138,7 +138,7 @@ async def _punish(bot: Bot, chat_id: int, user_id: int, kind: str, minutes: int,
     подписи виден общий срок.
     """
     from ..services import net
-    user = await net.user_stub(user_id)
+    user = await net.user_stub(user_id, bot, chat_id)
     pid, total, stricter = await moderation.game_punish(
         bot, chat_id, user, kind, minutes, reason, None)
     label = prize_label(kind, minutes)

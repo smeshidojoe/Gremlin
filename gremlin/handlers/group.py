@@ -1336,22 +1336,33 @@ async def moderate(message: Message, bot: Bot) -> None:
     if s.ocr_on or s.asr_on:
         seen = await media.extract(bot, message, s)
 
-    # --- инлайн-боты (via_bot) ---
-    if (s.inline_on and message.via_bot is not None and "inline" not in scopes
-            and not await db.inline_wl_allowed(
-                chat.id, message.via_bot.username, message.via_bot.id)):
+    # --- инлайн-боты (via_bot) и прочие посты «из бота» ---
+    # Кнопки со ссылками человек сам поставить не может: такой пост отправил
+    # бот, инлайн-бот или его переслали. Спамеры перешли с инлайна на посты
+    # прямо от бот-аккаунта, без via_bot, — ловим их тем же правилом.
+    from_bot = None if message.via_bot is not None else await _bot_source(
+        message, user, chat.id)
+    src_name, src_id = ((message.via_bot.username, message.via_bot.id)
+                        if message.via_bot is not None
+                        else (from_bot[1], from_bot[2]) if from_bot else (None, None))
+    if (s.inline_on and (message.via_bot is not None or from_bot)
+            and "inline" not in scopes
+            and not (src_id and await db.inline_wl_allowed(chat.id, src_name, src_id))):
         kind, mute_min = s.inline_punish, s.inline_mute_min
         if s.trust_on:
             kind = trust.soften(kind, await trust.level(bot, chat.id, user.id, s),
                                 s, config.TRUST_S_INLINE)
-        detail = f"@{message.via_bot.username}"
+        if message.via_bot is not None:
+            detail = f"@{src_name}"
+        else:
+            detail = f"@{src_name} — {from_bot[0]}" if src_name else from_bot[0]
         # Гифка через @gif и рекламная простыня с кнопками на telegra.ph — разные
         # вещи, а правило одно. Поэтому за спам-содержимое наказание ужесточаем.
         if s.inline_spam:
             score, why = watch.score_content(
                 " ".join(filter(None, [message.text or message.caption or "", seen])),
                 moderation.button_urls(message),
-                self_bot=message.via_bot.username,
+                self_bot=src_name,
             )
             if score >= s.inline_spam:
                 kind, mute_min = "ban", 0
@@ -1545,3 +1556,22 @@ async def moderate(message: Message, bot: Bot) -> None:
     await fire_trigger(bot, message, s)
     await fire_paste(bot, message, s)
     await fire_counter(bot, message, s)
+
+
+async def _bot_source(message, user, chat_id: int):
+    """Пост с кнопками-ссылками без via_bot: откуда он.
+
+    Вернуть (подпись, ник бота, id бота) или None, если кнопок нет или автор —
+    свой бот чата (добавлен в чат, ему отвечали). Админов сюда не доносит:
+    их модерация не трогает выше по коду.
+    """
+    from ..services import moderation
+    if not moderation.button_urls(message):
+        return None
+    if message.forward_origin is not None:
+        return ("пересылка с кнопками", None, None)
+    if user.is_bot:
+        if await db.chat_bot_has(chat_id, user.id):
+            return None
+        return ("бот-аккаунт", user.username, user.id)
+    return ("кнопки без инлайн-бота", None, None)

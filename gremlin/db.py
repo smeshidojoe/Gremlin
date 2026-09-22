@@ -1583,6 +1583,12 @@ async def chat_bot_names(chat_id: int) -> set[str]:
     return {r["username"] for r in await cur.fetchall()}
 
 
+async def chat_bot_has(chat_id: int, bot_id: int) -> bool:
+    cur = await _db.execute(
+        "SELECT 1 FROM chat_bots WHERE chat_id = ? AND bot_id = ?", (chat_id, bot_id))
+    return await cur.fetchone() is not None
+
+
 async def inline_wl_allowed(chat_id: int, username: str | None, bot_id: int | None) -> bool:
     """Этому инлайн-боту в этом чате можно."""
     cur = await _db.execute(

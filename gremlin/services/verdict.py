@@ -417,7 +417,8 @@ async def shadow(chat, user, settings, *, signals, ctx, text: str = "",
         f"[{stamp}] {v.line()}",
         f"    было: {was or 'ничего'} · автор {user.id}"
         + (f" · доверие {ctx.get('trust')}" if ctx.get("trust") is not None else "")
-        + (" · не в чате" if ctx.get("guest") else ""),
+        + (" · не в чате" if ctx.get("guest") else "")
+        + (" · бот" if getattr(user, "is_bot", False) else " · человек"),
     ]
     for s in v.signals:
         mark = "?" if s.guess else "!"

@@ -175,11 +175,15 @@ PROFILE_FORM = (
 def parse_profile(raw: str) -> tuple[str, list[str]]:
     """Разобрать форму профиля -> (строка для набора, что распознали).
 
-    Строку вида «Имя: Анна | 18+» кладём как «Имя: Анна | 18+», пустые поля
-    выбрасываем. Строку без двоеточия берём как есть: не заставлять же
-    подписывать каждую мелочь.
+    Строку собираем тем же видом, каким бот проверяет живой профиль:
+    «Анна @anna · о себе · канал · описание канала» — без подписей полей и в
+    одном порядке, как бы форму ни заполнили. С подписями пример в наборе
+    выглядел иначе, чем проверяемый профиль, и сходство выходило ниже
+    настоящего. Пустые поля выбрасываем. Строку без двоеточия берём как есть,
+    в конец: не заставлять же подписывать каждую мелочь.
     """
-    parts, seen = [], []
+    from ..services import profile as prof_svc
+    fields, free, seen = {}, [], []
     for line in raw.split("\n"):
         line = line.strip()
         if not line:
@@ -190,12 +194,12 @@ def parse_profile(raw: str) -> tuple[str, list[str]]:
             if name:
                 val = val.strip()
                 if val:
-                    parts.append(f"{name}: {val}")
+                    fields[name] = val
                     seen.append(name)
                 continue
-        parts.append(line)
+        free.append(line)
         seen.append("свободная строка")
-    return " · ".join(parts), seen
+    return prof_svc.face_of_fields(fields, free), seen
 
 
 def _origin(message: Message) -> tuple[int | None, str]:
@@ -223,13 +227,25 @@ def _origin(message: Message) -> tuple[int | None, str]:
     return None, ""
 
 
-async def _profile_of(user_id: int | None) -> str:
-    """Описание профиля автора, если его удалось спросить."""
-    if not user_id or _main_bot is None:
-        return ""
+async def _face_of(message: Message) -> tuple[str, bool]:
+    """Профиль автора пересланного -> (строка для набора, удалось ли спросить).
+
+    Строка — тем же видом, каким бот проверяет живой профиль: имя @ник · о
+    себе · канал. Раньше брали одно описание, и у «Green VPN 🌿», где вся
+    реклама в имени, в набор не попадало ничего. Скрытый автор — одно имя:
+    больше Telegram о нём не говорит.
+    """
     from ..services import profile as prof_svc
-    data = await prof_svc.fetch(_main_bot, user_id)
-    return prof_svc.text_of(data)
+    origin = getattr(message, "forward_origin", None)
+    kind = getattr(origin, "type", None)
+    kind = getattr(kind, "value", kind)
+    if kind == "user":
+        u = origin.sender_user
+        data = await prof_svc.fetch(_main_bot, u.id) if _main_bot else None
+        return prof_svc.face_text(u, data), bool(data)
+    if kind == "hidden_user":
+        return getattr(origin, "sender_user_name", "") or "", True
+    return "", True
 
 
 def _remember(msg_id: int, text: str, prof: str) -> None:
@@ -244,7 +260,7 @@ async def collect(message: Message) -> None:
     raw = message.text or message.caption or ""
     forwarded = getattr(message, "forward_origin", None) is not None
     uid, who = _origin(message)
-    prof = await _profile_of(uid)
+    prof, asked = await _face_of(message)
 
     # Присланное руками — это то, что выбрано режимом. Пересылку разбираем
     # как есть: там видно, где сообщение, а где профиль его автора.
@@ -274,8 +290,8 @@ async def collect(message: Message) -> None:
         lines.append(f"<i>Поля: {utils.esc(', '.join(seen))}</i>")
     if not text and not seen:
         lines.append("<i>Текста сообщения нет — запомню только профиль.</i>")
-    if not prof and uid:
-        lines.append("<i>Профиль спросить не вышло.</i>")
+    if not asked and uid:
+        lines.append("<i>Профиль спросить не вышло — запомню имя и ник.</i>")
     lines += ["", "Что это?"]
 
     b = InlineKeyboardBuilder()

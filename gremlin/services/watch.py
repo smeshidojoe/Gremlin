@@ -380,7 +380,6 @@ async def profile_check(bot, chat_id: int, user, settings,
     аккаунтов в описании вообще ничего не пишет, и фото — единственное, за что
     можно зацепиться.
     """
-    from .. import config
     from . import filters as flt
     from . import nn
     from . import profile as prof_svc
@@ -389,22 +388,26 @@ async def profile_check(bot, chat_id: int, user, settings,
         data = await prof_svc.fetch(bot, user.id)
     if not data:
         return None
-    text = prof_svc.text_of(data)
+    # Имя и ник — такая же часть рекламы, как описание: «Green VPN 🌿» с
+    # безобидным «о себе» проходил мимо, хотя слово vpn в списке было.
+    face = prof_svc.face_text(user, data)
 
     # Смысловые фразы к профилю не применяем сознательно: они пишутся под
     # сообщения, а в описании тот же смысл живёт наоборот — «не переношу
     # тему X» ловится наравне с тем, кто X продаёт.
     found: list[str] = []
-    if len(text) >= 4 and settings.prof_words:
-        word = await flt.match_stopword(chat_id, text, "prof")
+    if len(face) >= 4 and settings.prof_words:
+        word = await flt.match_stopword(chat_id, face, "prof")
         if word:
             found.append(f"стоп-слово в профиле: «{word}»")
 
-    if settings.watch_nn and len(text) >= 4:
+    # По всей строке, а не по описанию: у «Алина Доход с телефона» описания
+    # нет вовсе, реклама вся в имени — и сравнение с базой раньше не шло.
+    if settings.watch_nn and len(face) >= 4:
         # сравниваем личность целиком — тем же видом строки, каким и запоминаем
-        sim = await nn.face_score(chat_id, prof_svc.face_text(user, data))
-        if sim is not None and sim >= config.PROFILE_SIM:
-            found.append(f"профиль как у забаненных ({sim}%)")
+        got = await nn.face_score(chat_id, face)
+        if nn.face_hit(got):
+            found.append(f"профиль как у забаненных ({nn.face_note(got)})")
 
     return (data, found) if found else None
 
@@ -696,11 +699,11 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None,
         from . import nn
         face = (f"{user.full_name} @{user.username}" if user.username
                 else user.full_name)
-        sim = await nn.face_score(chat.id, face)
-        if sim is not None and sim >= config.PROFILE_SIM:
-            face_sim = sim
+        got = await nn.face_score(chat.id, face)
+        if nn.face_hit(got):
+            face_sim = got[0]
             total += config.PROFILE_POINTS
-            reasons.append(f"имя как у забаненных профилей ({sim}%)")
+            reasons.append(f"имя как у забаненных профилей ({nn.face_note(got)})")
     # CAS при подозрении: спрашиваем, только когда что-то уже набежало или
     # нейрофильтр показал на сообщение. Спрашивать про каждого — и лишний
     # запрос наружу, и чужому сервису знать всех подряд незачем.

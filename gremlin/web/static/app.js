@@ -831,12 +831,14 @@ async function spamProfilesView(cid) {
     back: `#/chat/${cid}/s/watch`,
     html: `<div class="card">
       <div class="intro">${introHtml('С этими профилями бот сравнивает новых людей, когда включено «Сравнивать профили с забаненными».\n\n'
-        + 'Сюда попадают профили, записанные кнопкой «Спам-профиль», и те, кого бот забанил сам. Записали по ошибке — уберите.')}</div>
+        + 'Сюда попадают профили, записанные кнопкой «Спам-профиль», и те, кого бот забанил сам. Записали по ошибке — уберите.\n\n'
+        + '«В набор» кладёт профиль в стартовый набор: он общий, и по нему бот сравнивает во всех чатах, а не только в этом.')}</div>
     </div>
     <div class="card">
       <h2>Всего: ${d.items.length}</h2>
       ${d.items.map((p) => `<div class="item">
           <div class="body">${esc(p.who)}<small>${esc(p.when)} · ${esc(p.text)}</small></div>
+          ${d.owner ? `<button class="btn small ghost" data-act="spamprofile-seed" data-id="${p.id}">➕ В набор</button>` : ''}
           <button class="btn small ghost" data-act="spamprofile-del" data-id="${p.id}">✕ Убрать</button>
         </div>`).join('') || '<div class="empty">Пусто.</div>'}
     </div>`,
@@ -2404,6 +2406,12 @@ const ACT = {
     if (!r.ok) { toast(r.error); return; }
     CACHE.status = { cid: curChat(), data: r };
     render();
+  },
+
+  async 'spamprofile-seed'(el) {
+    const r = await api(`/chat/${curChat()}/spamprofiles/${el.dataset.id}/seed`,
+                        { method: 'POST' });
+    toast(r.added ? 'Скопирован в набор' : 'Такой в наборе уже есть');
   },
 
   async 'spamprofile-del'(el) {

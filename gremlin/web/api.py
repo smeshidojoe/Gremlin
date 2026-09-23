@@ -1252,7 +1252,8 @@ async def api_spam_profiles(request: web.Request) -> web.Response:
               "who": await db.user_handle(r["user_id"]) if r["user_id"] else "—",
               "when": utils.fmt_ts(r["ts"]), "text": r["text"]}
              for r in await db.spam_profiles(cid)]
-    return js({"items": items})
+    # копия в общий набор — дело хозяина бота: набор один на все чаты
+    return js({"items": items, "owner": is_owner(request)})
 
 
 @routes.delete("/api/chat/{cid}/spamprofiles/{rid}")
@@ -1265,6 +1266,23 @@ async def api_spam_profile_del(request: web.Request) -> web.Response:
     await db.add_event(cid, "card", f"спам-профиль убран из базы: "
                                     f"{row['user_id']} by {uid_of(request)} (панель)")
     return js({"ok": True})
+
+
+@routes.post("/api/chat/{cid}/spamprofiles/{rid}/seed")
+async def api_spam_profile_seed(request: web.Request) -> web.Response:
+    """Скопировать профиль в стартовый набор — чтобы ловился во всех чатах."""
+    cid = await cid_of(request)
+    owner_only(request)
+    row = await db.spam_profile_get(cid, int(request.match_info["rid"]))
+    if row is None:
+        raise web.HTTPNotFound(text="Этой записи уже нет.")
+    added = await db.seed_add(row["text"], "spam", "prof")
+    if added:
+        await db.seed_commit()
+        nn.invalidate()          # набор подмешан всем чатам сразу
+        await db.add_event(cid, "nn", f"профиль в стартовый набор: "
+                                      f"{row['user_id']} by {uid_of(request)} (панель)")
+    return js({"ok": True, "added": added})
 
 
 @routes.delete("/api/chat/{cid}/forgiven/{rid}")

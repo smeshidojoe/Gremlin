@@ -2153,17 +2153,17 @@ async def seed_clear() -> int:
     return cur.rowcount or 0
 
 
-async def samples_seed_faces(limit: int) -> list[aiosqlite.Row]:
-    """Чужие примеры спам-профилей: подмешиваются к своим при сравнении.
+async def samples_seed_faces(limit: int, label: str = "spam") -> list[aiosqlite.Row]:
+    """Профили из стартового набора: подмешиваются к своим при сравнении.
 
     В отличие от текстового набора не отключаются никогда: рекламные профили
-    похожи между собой в любом чате, и своя норма тут ничего не уточняет.
-    Берём только спам — «нормальных профилей» никто не собирает.
+    похожи между собой в любом чате, и живые люди тоже. label='ok' — норма:
+    с ней сравнивают, чтобы не принять живого человека за похожий спам.
     """
     cur = await _db.execute(
         """SELECT * FROM samples WHERE chat_id = ? AND origin = ?
-             AND label = 'spam' ORDER BY id LIMIT ?""",
-        (SEED_CHAT, SEED_ORIGINS["prof"], limit))
+             AND label = ? ORDER BY id LIMIT ?""",
+        (SEED_CHAT, SEED_ORIGINS["prof"], label, limit))
     return await cur.fetchall()
 
 
@@ -2202,6 +2202,14 @@ async def spam_profiles(chat_id: int) -> list[aiosqlite.Row]:
            WHERE chat_id = ? AND origin = 'profile' AND label = 'spam'
            ORDER BY id DESC""", (chat_id,))
     return await cur.fetchall()
+
+
+async def spam_profile_get(chat_id: int, sample_id: int) -> aiosqlite.Row | None:
+    """Одна запись спам-профиля — для копирования в стартовый набор."""
+    cur = await _db.execute(
+        """SELECT id, user_id, text FROM samples WHERE id = ? AND chat_id = ?
+           AND origin = 'profile' AND label = 'spam'""", (sample_id, chat_id))
+    return await cur.fetchone()
 
 
 async def spam_profile_delete(chat_id: int, sample_id: int) -> aiosqlite.Row | None:
@@ -3499,6 +3507,69 @@ async def fix_profile_samples() -> int:
     await kv_set("mig_profile_samples", "1")
     await _db.commit()
     return cur.rowcount or 0
+
+
+# Чего не хватало в списках профилей: рекламный аккаунт зовёт в свой канал
+# «за промокодом на скидку», а живому человеку писать это о себе незачем.
+PROMO_PROF_WORDS = (("промокод", "stem"), ("скидк", "stem"))
+
+
+async def add_promo_prof_words() -> int:
+    """Разово дописать промо-слова в списки профилей. Сколько добавили.
+
+    Только туда, где список уже есть: заводить его этой правкой значило бы
+    включить проверку профиля там, где её не просили.
+    """
+    if await kv_get("mig_promo_prof_words"):
+        return 0
+    total = 0
+    for row in await all_chats(active_only=False):
+        cid = row["chat_id"]
+        if not await words_list(cid, "prof"):
+            continue
+        for word, mode in PROMO_PROF_WORDS:
+            if await words_add(cid, word, mode, "prof"):
+                total += 1
+    await kv_set("mig_promo_prof_words", "1")
+    return total
+
+
+async def reshape_seed_profiles() -> tuple[int, int]:
+    """Разово переписать старые записи формы в наборе к виду живой проверки.
+
+    Раньше форма сборщика ложилась с подписями: «Имя: Анна · Ник: @anna · …»,
+    а бот сравнивал строку «Анна @anna · …» — подписи съедали сходство.
+    (сколько переписали, сколько убрали): убираем запись, если после переписки
+    она совпала с уже лежащей рядом с той же пометкой — это один профиль,
+    заведённый дважды, формой и пересылкой.
+    """
+    if await kv_get("mig_seedprof_shape"):
+        return 0, 0
+    from .services import profile as prof_svc
+    origin = SEED_ORIGINS["prof"]
+    cur = await _db.execute(
+        "SELECT id, label, text FROM samples WHERE chat_id = ? AND origin = ? ORDER BY id",
+        (SEED_CHAT, origin))
+    fixed = dropped = 0
+    for r in await cur.fetchall():
+        new = prof_svc.unlabel(r["text"])
+        if new is None:
+            continue
+        new = " ".join(new.split())[:config.SAMPLE_TEXT_LIMIT]
+        if new == r["text"] or len(new) < 10:
+            continue
+        twin = await (await _db.execute(
+            """SELECT label FROM samples WHERE chat_id = ? AND origin = ?
+               AND text = ? AND id != ?""", (SEED_CHAT, origin, new, r["id"]))).fetchone()
+        if twin is not None and twin["label"] == r["label"]:
+            await _db.execute("DELETE FROM samples WHERE id = ?", (r["id"],))
+            dropped += 1
+        else:
+            await _db.execute("UPDATE samples SET text = ? WHERE id = ?", (new, r["id"]))
+            fixed += 1
+    await _db.commit()
+    await kv_set("mig_seedprof_shape", "1")
+    return fixed, dropped
 
 
 async def seed_words_to_profiles() -> int:

@@ -251,6 +251,13 @@ async def main() -> None:
         words = await db.seed_words_to_profiles()
         if words:
             logger.info("слов перенесено в списки профилей: %d", words)
+        promo = await db.add_promo_prof_words()
+        if promo:
+            logger.info("промо-слов добавлено в списки профилей: %d", promo)
+        fixed, dropped = await db.reshape_seed_profiles()
+        if fixed or dropped:
+            logger.info("профили набора: переписано %d, дублей убрано %d",
+                        fixed, dropped)
     except Exception:
         logger.warning("разовые правки профилей не прошли", exc_info=True)
     # разовый пересчёт векторов: КАПС ломал сравнение, правило поменялось

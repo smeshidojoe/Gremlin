@@ -1262,12 +1262,18 @@ async def moderate(message: Message, bot: Bot) -> None:
         # запоминаем id — если автора забанят, за ним надо будет убрать
         moderation.remember_message(chat.id, user.id, message.message_id)
 
-    if getattr(message, "is_automatic_forward", False) and message.edit_date is None:
-        # одна строка на пост: если бот промолчал, видно, дошёл ли пост вообще
+    if message.sender_chat is not None and message.edit_date is None:
+        # Строка на любое сообщение от имени канала, а не только на
+        # автопересылку. Раньше писали одну автопересылку, и когда пост до
+        # бота не доехал, «не пришёл вовсе» было не отличить от «пришёл, но
+        # без флага автопересылки» — а ведут они себя по-разному.
         from ..services import diag
-        diag.note("пост пришёл: %s в %s · тред %s · альбом %s · опоздание %.0f с",
-                  message.message_id, chat.id, message.message_thread_id,
-                  message.media_group_id or "—", time.time() - (ts_of(message) or time.time()))
+        auto = getattr(message, "is_automatic_forward", False)
+        diag.note("%s: %s в %s · от %s · тред %s · альбом %s · опоздание %.0f с",
+                  "пост пришёл" if auto else "от имени канала",
+                  message.message_id, chat.id, message.sender_chat.id,
+                  message.message_thread_id, message.media_group_id or "—",
+                  time.time() - (ts_of(message) or time.time()))
 
     # а вот модерировать задним числом не надо — админы уже всё разрулили
     if stale(message):

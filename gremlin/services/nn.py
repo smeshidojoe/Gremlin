@@ -41,7 +41,7 @@ _clusters: dict[int, tuple] = {}
 _phrases: dict[int, tuple] = {}
 # последние сообщения чата для поиска всплесков: chat_id -> deque[(ts, uid, вектор)]
 _recent: dict[int, deque] = {}
-# спам-профили: chat_id -> (когда собраны, матрица, [тексты])
+# профили для сравнения: chat_id -> (когда собраны, матрица спама, матрица нормы)
 _faces: dict[int, tuple] = {}
 
 
@@ -728,11 +728,16 @@ async def remember_spam_profile(bot, chat_id: int, user_id: int) -> tuple[bool, 
     return True, note
 
 
-async def face_score(chat_id: int, name: str) -> int | None:
-    """Насколько имя похоже на профили, за которые уже банили (в процентах).
+async def face_score(chat_id: int, name: str) -> tuple[int, int | None] | None:
+    """Насколько профиль похож на спам-профили и на нормальные (в процентах).
 
     «Анна | 18+ ЛС» и «Кристина ❤️ пиши в лс» для эвристик разные, для модели —
-    одно и то же. None — сравнивать не с чем.
+    одно и то же. Отдаём (спам, норма): норма — None, если её не собрали.
+    None целиком — сравнивать не с чем.
+
+    Норму сравниваем затем, что спам-профиль и живой человек со «18+» в
+    названии канала для модели соседи. Одного сходства со спамом мало — надо,
+    чтобы на спам профиль был похож сильнее, чем на тех, кого пометили нормой.
     """
     name = " ".join((name or "").split())
     if len(name) < 4 or not await ensure():
@@ -740,22 +745,38 @@ async def face_score(chat_id: int, name: str) -> int | None:
     cached = _faces.get(chat_id)
     now = time.monotonic()
     if not cached or now - cached[0] > PROFILE_TTL:
-        rows = [r for r in await db.samples_of_origin(chat_id, "profile")
-                if r["label"] == "spam"]
-        # Общий набор спам-профилей подмешиваем всегда, а не «пока чат молодой»,
-        # как у текстовых улик. Причина простая: рекламные профили одинаковые
-        # везде, своей нормы у профиля не бывает, и уточнять тут нечего.
-        rows = list(rows) + list(await db.samples_seed_faces(config.NN_FACE_SEED))
-        if len(rows) < 5:            # на трёх примерах сравнивать нечего
-            _faces[chat_id] = (now, None, [])
+        own = await db.samples_of_origin(chat_id, "profile")
+        # Общий набор подмешиваем всегда, а не «пока чат молодой», как у
+        # текстовых улик: рекламные профили одинаковые везде, и живые люди
+        # тоже — своей нормы у профиля в отдельном чате не бывает.
+        spam = ([r["text"] for r in own if r["label"] == "spam"]
+                + [r["text"] for r in await db.samples_seed_faces(config.NN_FACE_SEED)])
+        ok = ([r["text"] for r in own if r["label"] == "ok"]
+              + [r["text"] for r in await db.samples_seed_faces(config.NN_FACE_SEED, "ok")])
+        if len(spam) < 5:            # на трёх примерах сравнивать нечего
+            _faces[chat_id] = (now, None, None)
             return None
-        vecs = await embed([r["text"] for r in rows])
-        _faces[chat_id] = (now, vecs, [r["text"] for r in rows])
+        _faces[chat_id] = (now, await embed(spam), await embed(ok) if ok else None)
         cached = _faces[chat_id]
     if cached[1] is None:
         return None
     vec = (await embed([name]))[0]
-    return int(round(100 * float((cached[1] @ vec).max())))
+    pct = lambda m: int(round(100 * float((m @ vec).max())))   # noqa: E731
+    return pct(cached[1]), (pct(cached[2]) if cached[2] is not None else None)
+
+
+def face_hit(got: tuple[int, int | None] | None) -> bool:
+    """Попадание: похож на спам не меньше порога и сильнее, чем на норму."""
+    if got is None:
+        return False
+    spam, ok = got
+    return spam >= config.PROFILE_SIM and (ok is None or spam > ok)
+
+
+def face_note(got: tuple[int, int | None]) -> str:
+    """Проценты для карточки: «72%» или «72%, норма 68%»."""
+    spam, ok = got
+    return f"{spam}%" if ok is None else f"{spam}%, норма {ok}%"
 
 
 async def suggest_threshold(chat_id: int) -> int | None:

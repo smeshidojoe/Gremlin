@@ -116,11 +116,52 @@ def face_text(user, data: dict | None) -> str:
     иначе в копилке лежали бы одни голые имена, а спрашивали бы мы описаниями,
     и сравнение работало бы вполсилы.
     """
-    who = getattr(user, "full_name", "") or ""
-    uname = getattr(user, "username", None)
-    head = f"{who} @{uname}" if uname else who
+    return face_join(getattr(user, "full_name", "") or "",
+                     getattr(user, "username", None), data)
+
+
+def face_join(name: str, username: str | None, data: dict | None) -> str:
+    """Та же строка личности, но из готовых частей — для набора сборщика.
+
+    Вид у неё должен быть ровно тот, каким бот проверяет живой профиль: иначе
+    пример в наборе и проверяемый профиль отличаются оформлением, и сходство
+    выходит ниже настоящего.
+    """
+    username = (username or "").strip().lstrip("@")
+    name = (name or "").strip()
+    head = f"{name} @{username}".strip() if username else name
     tail = text_of(data)
-    return f"{head} · {tail}" if tail else head
+    if head and tail:
+        return f"{head} · {tail}"
+    return head or tail
+
+
+# Поля формы профиля в сборщике — в том порядке, в каком они идут в строке.
+FACE_FIELDS = ("Имя", "Ник", "О себе", "Канал", "Описание канала")
+
+
+def face_of_fields(fields: dict, extra: list[str] | tuple = ()) -> str:
+    """Строка личности из полей формы: {"Имя": …, "Ник": …, …} + свободные строки."""
+    data = {"bio": fields.get("О себе", ""),
+            "channel_title": fields.get("Канал", ""),
+            "channel_desc": fields.get("Описание канала", "")}
+    head = face_join(fields.get("Имя", ""), fields.get("Ник"), data)
+    return " · ".join(p for p in (head, *extra) if p)
+
+
+def unlabel(text: str) -> str | None:
+    """Старая запись формы «Имя: Анна · Ник: @anna · …» -> «Анна @anna · …».
+
+    None — это не старая запись формы, переделывать нечего.
+    """
+    fields, free = {}, []
+    for part in (text or "").split(" · "):
+        key, sep, val = part.partition(": ")
+        if sep and key in FACE_FIELDS:
+            fields[key] = val.strip()
+        else:
+            free.append(part)
+    return face_of_fields(fields, free) if fields else None
 
 
 def describe(data: dict | None) -> str:

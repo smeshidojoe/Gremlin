@@ -109,7 +109,7 @@ async def test_profile_ban_writes_verdict_with_all_finds(prof_chat, chat, cards,
     from gremlin.services import verdict as vd
 
     async def face_score(cid, face):
-        return 91
+        return 91, None
     monkeypatch.setattr(nn, "face_score", face_score)
     await db.set_setting(chat, "prof_members", 0)
     await db.set_setting(chat, "watch_nn", 1)

@@ -832,13 +832,12 @@ async function spamProfilesView(cid) {
     html: `<div class="card">
       <div class="intro">${introHtml('С этими профилями бот сравнивает новых людей, когда включено «Сравнивать профили с забаненными».\n\n'
         + 'Сюда попадают профили, записанные кнопкой «Спам-профиль», и те, кого бот забанил сам. Записали по ошибке — уберите.\n\n'
-        + '«В набор» кладёт профиль в стартовый набор: он общий, и по нему бот сравнивает во всех чатах, а не только в этом.')}</div>
+        + 'База общая: профиль, записанный здесь, бот узнаёт во всех чатах.')}</div>
     </div>
     <div class="card">
       <h2>Всего: ${d.items.length}</h2>
       ${d.items.map((p) => `<div class="item">
           <div class="body">${esc(p.who)}<small>${esc(p.when)} · ${esc(p.text)}</small></div>
-          ${d.owner ? `<button class="btn small ghost" data-act="spamprofile-seed" data-id="${p.id}">➕ В набор</button>` : ''}
           <button class="btn small ghost" data-act="spamprofile-del" data-id="${p.id}">✕ Убрать</button>
         </div>`).join('') || '<div class="empty">Пусто.</div>'}
     </div>`,
@@ -1733,18 +1732,19 @@ async function seedView() {
     title: 'Стартовый набор',
     back: '#/',
     html: `<div class="card">
-      <div class="intro">Чужие примеры, с которых начинает молодой чат. Два вида,
-        и они не смешиваются: сообщение сравнивается с сообщениями, профиль
-        с профилями.<br><br>
-        Набор общий: удалили пример здесь — он пропал у всех чатов сразу.</div>
+      <div class="intro">Примеры из сборщика. Вместе с тем, что размечено в
+        чатах, это одна копилка: по ней учится нейрофильтр и сравниваются
+        профили во всех чатах сразу. Два вида, и они не смешиваются: сообщение
+        сравнивается с сообщениями, профиль с профилями.<br><br>
+        Удалили пример здесь — он пропал у всех чатов сразу.</div>
       <div class="row"><div class="label">📨 Сообщения
-        <small>в работе ${Math.min(d.in_work, d.msg_stats.total)}, поровну того и
-        другого, и только пока чат не набрал своих ${d.until}</small></div>
+        <small>вся копилка: ⛔ ${d.pool.msg.spam} · 🕊 ${d.pool.msg.ok},
+        разметил человек ${d.pool.msg.human}, бот ${d.pool.msg.bot}</small></div>
         <div class="value">⛔ ${d.msg_stats.spam} · 🕊 ${d.msg_stats.ok}</div></div>
       <div class="row"><div class="label">🪪 Профили
-        <small>в работе ${Math.min(d.face_seed, d.prof_stats.spam)}, не отключаются:
-        рекламный профиль одинаков в любом чате</small></div>
-        <div class="value">⛔ ${d.prof_stats.spam}</div></div>
+        <small>вся копилка: ⛔ ${d.pool.prof.spam} · 🕊 ${d.pool.prof.ok},
+        разметил человек ${d.pool.prof.human}, бот ${d.pool.prof.bot}</small></div>
+        <div class="value">⛔ ${d.prof_stats.spam} · 🕊 ${d.prof_stats.ok}</div></div>
       <div class="row"><div class="label">🧮 Посчитано векторов</div>
         <div class="value">${d.vecs}</div></div>
     </div>
@@ -2406,12 +2406,6 @@ const ACT = {
     if (!r.ok) { toast(r.error); return; }
     CACHE.status = { cid: curChat(), data: r };
     render();
-  },
-
-  async 'spamprofile-seed'(el) {
-    const r = await api(`/chat/${curChat()}/spamprofiles/${el.dataset.id}/seed`,
-                        { method: 'POST' });
-    toast(r.added ? 'Скопирован в набор' : 'Такой в наборе уже есть');
   },
 
   async 'spamprofile-del'(el) {

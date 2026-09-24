@@ -33,9 +33,10 @@ async def test_reshape_old_form_rows(database):
     await db.seed_commit()
 
     assert await db.reshape_seed_profiles() == (1, 1)
-    texts = {r["text"] for r in await db.samples_seed_faces(99, "spam")}
+    pool = await db.samples_pool("prof")
+    texts = {r["text"] for r in pool if r["label"] == "spam"}
     assert texts == {"Helen Smith @helen · Кончи со мной 🔞"}     # дубль ушёл
-    texts = {r["text"] for r in await db.samples_seed_faces(99, "ok")}
+    texts = {r["text"] for r in pool if r["label"] == "ok"}
     assert texts == {"Олеся @malloware · резидент", "🥴🥴🥴 · НЕподземелье Meev (18+)"}
     assert await db.reshape_seed_profiles() == (0, 0)             # второй раз молчит
 

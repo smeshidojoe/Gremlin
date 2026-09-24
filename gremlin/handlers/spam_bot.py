@@ -3,8 +3,9 @@
 Зачем отдельный бот. Научить нейрофильтр спаму, который он пропустил, до сих
 пор было нечем: ручные наказания в обучение не идут (причины у людей свои),
 а «разметить спорное» работает только с тем, что бот уже собрал сам. Здесь
-владелец пересылает найденный спам, размечает кнопками, и он попадает в общий
-стартовый набор — тот, с которого начинает каждый молодой чат.
+владелец пересылает найденный спам, размечает кнопками, и он попадает в общую
+копилку — ту, по которой учится нейрофильтр и сравниваются профили во всех
+чатах сразу.
 
 Почему в том же процессе, а не отдельным контейнером: база одна, и писать в
 неё должен один процесс. Два писателя в SQLite через докеровский том мы уже
@@ -17,12 +18,24 @@
 
 Отвечает бот только владельцу. Остальным молчит: это не публичный сервис,
 а рабочий инструмент, и объясняться с посторонними ему незачем.
+
+Что хранится. Случай — это сообщение и профиль его автора, у каждого своя
+метка: спам со взломанного аккаунта — спам, а профиль у аккаунта обычный.
+Раньше одна кнопка ставила одну метку обоим, и в набор профилей попадали
+безликие «Cornell Trevino» с пометкой «спам». Кроме строки для модели
+пишутся и исходные поля (db.samples.data): текст, распознанное с картинки,
+ссылки, кнопки, поля профиля по отдельности. Выгрузка /экспорт отдаёт их
+случаями в JSONL — один формат для любой модели.
 """
+import datetime as dt
+import io
+import json
 import logging
+import types
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .. import config, db, utils
@@ -31,8 +44,8 @@ logger = logging.getLogger("gremlin.spam_bot")
 
 router = Router()
 
-# разобранное, ждущее разметки: id сообщения бота -> (текст, что за профиль)
-_pending: dict[int, tuple[str, str]] = {}
+# разобранное, ждущее разметки: id сообщения бота -> случай (см. _case)
+_pending: dict[int, dict] = {}
 PENDING_MAX = 500
 
 # Что именно собираем прямо сейчас. Влияет только на присланный руками текст:
@@ -45,6 +58,20 @@ MODE_LABEL = {"msg": "📨 сообщения", "prof": "🪪 профили"}
 # основной бот: у сборщика нет общих чатов с людьми, и профиль спросить может
 # только он. Ставится при запуске.
 _main_bot: Bot | None = None
+
+# Распознавание медиа — то же, что в чатах: обучение должно видеть тот же
+# текст, что и проверка. В чате модель читает подпись вместе с распознанным
+# с картинки, а сборщик раньше клал одну подпись, и картинка со спамом учила
+# модель на пустой строке. Настроек чата у сборщика нет — включено всё.
+_MEDIA = types.SimpleNamespace(ocr_on=1, ocr_langs="rus+eng", asr_on=1,
+                               asr_max_sec=db.Settings.asr_max_sec)
+
+# какие вложения бывают — для поля media
+MEDIA_KINDS = ("photo", "video", "animation", "voice", "video_note", "audio",
+               "document", "sticker")
+
+# выгрузку больше этого Telegram боту не отдаст на скачивание
+IMPORT_MAX_BYTES = 20 * 1024 * 1024
 
 
 def set_main_bot(bot: Bot) -> None:
@@ -66,17 +93,22 @@ async def stranger_clicks(cb: CallbackQuery) -> None:
 HELP = (
     "<b>🧪 Сборщик спама</b>\n\n"
     "Пересылайте сюда спам — по одному или пачкой. На каждое сообщение "
-    "покажу, что из него удалось вытащить, и спрошу кнопками, спам это или "
-    "обычная речь.\n\n"
-    "Размеченное уходит в общий стартовый набор: с него начинает каждый "
-    "новый чат, пока не накопит свои примеры.\n\n"
+    "покажу, что из него удалось вытащить, и спрошу кнопками:\n"
+    "⛔ <b>Всё спам</b> — и сообщение, и профиль автора;\n"
+    "💬 <b>Спам только текст</b> — профиль обычный, его не записываю;\n"
+    "🪪 <b>Спам только профиль</b> — сообщение обычное, реклама в профиле;\n"
+    "🕊 <b>Всё норма</b>.\n\n"
+    "Размеченное уходит в общую копилку: по ней учится нейрофильтр и "
+    "сравниваются профили во всех чатах.\n\n"
     "Можно и просто прислать текст — он пойдёт в набор тем видом, который "
     "выбран режимом.\n"
     "Обычная речь нужна не меньше спама: без неё фильтру не с чем сравнивать.\n\n"
     "<b>Профиль руками</b> — команда /профиль: пришлёт пустую форму, "
     "заполняете что знаете, лишние строки удаляете.\n\n"
     "/режим — сообщения или профили\n"
-    "/стат — сколько уже собрано."
+    "/стат — сколько уже собрано\n"
+    "/экспорт — выгрузить копилку файлом JSONL. Такой же файл, присланный "
+    "сюда, загружается обратно."
 )
 
 
@@ -138,18 +170,31 @@ async def cmd_start(message: Message) -> None:
 async def cmd_stat(message: Message) -> None:
     msg = await db.seed_stats("msg")
     prof = await db.seed_stats("prof")
+    pool = await db.pool_stats()
     await message.answer(
-        f"<b>🌱 Стартовый набор</b>\n\n"
-        f"<b>📨 Сообщения</b>\n"
-        f"⛔ Спам: <b>{msg['spam']}</b> · 🕊 Норма: <b>{msg['ok']}</b>\n"
-        f"В работе {config.NN_SEED_LIMIT} — поровну того и другого, и только "
-        f"пока чат не набрал своих {config.NN_SEED_UNTIL}.\n\n"
-        f"<b>🪪 Профили</b>\n"
-        f"⛔ Спам: <b>{prof['spam']}</b>\n"
-        f"В работе {config.NN_FACE_SEED}, не отключаются: рекламный профиль "
-        f"одинаков в любом чате.\n\n"
+        f"<b>🌱 Собрано здесь</b>\n"
+        f"📨 Сообщения: ⛔ <b>{msg['spam']}</b> · 🕊 <b>{msg['ok']}</b>\n"
+        f"🪪 Профили: ⛔ <b>{prof['spam']}</b> · 🕊 <b>{prof['ok']}</b>\n\n"
+        f"<b>🗃 Вся копилка</b> — это плюс размеченное в чатах, учит все чаты сразу\n"
+        f"📨 Сообщения: ⛔ {pool['msg']['spam']} · 🕊 {pool['msg']['ok']}\n"
+        f"🪪 Профили: ⛔ {pool['prof']['spam']} · 🕊 {pool['prof']['ok']}\n"
+        f"Разметил человек: {pool['msg']['human'] + pool['prof']['human']}, "
+        f"решил бот сам: {pool['msg']['bot'] + pool['prof']['bot']}\n\n"
         f"Сейчас собираю: {MODE_LABEL[_mode]} (/режим)\n"
         f"Смотреть и чистить набор удобнее в панели основного бота.")
+
+
+@router.message(Command("export", "экспорт"))
+async def cmd_export(message: Message) -> None:
+    """Копилка случаями в JSONL: одна строка — сообщение и профиль автора."""
+    records = await db.pool_export()
+    buf = io.StringIO()
+    for rec in records:
+        buf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    name = f"gremlin-{dt.date.today().isoformat()}.jsonl"
+    await message.answer_document(
+        BufferedInputFile(buf.getvalue().encode("utf-8"), filename=name),
+        caption=f"Случаев: {len(records)}. Пришлите такой файл сюда — загружу обратно.")
 
 
 # Поля профиля: что человек пишет слева от двоеточия -> как назовём внутри.
@@ -172,15 +217,11 @@ PROFILE_FORM = (
 )
 
 
-def parse_profile(raw: str) -> tuple[str, list[str]]:
-    """Разобрать форму профиля -> (строка для набора, что распознали).
+def read_form(raw: str) -> tuple[dict, list[str], list[str]]:
+    """Разобрать форму профиля -> (поля копилки, свободные строки, что распознали).
 
-    Строку собираем тем же видом, каким бот проверяет живой профиль:
-    «Анна @anna · о себе · канал · описание канала» — без подписей полей и в
-    одном порядке, как бы форму ни заполнили. С подписями пример в наборе
-    выглядел иначе, чем проверяемый профиль, и сходство выходило ниже
-    настоящего. Пустые поля выбрасываем. Строку без двоеточия берём как есть,
-    в конец: не заставлять же подписывать каждую мелочь.
+    Пустые поля выбрасываем. Строку без двоеточия берём как есть, в конец:
+    не заставлять же подписывать каждую мелочь.
     """
     from ..services import profile as prof_svc
     fields, free, seen = {}, [], []
@@ -199,7 +240,27 @@ def parse_profile(raw: str) -> tuple[str, list[str]]:
                 continue
         free.append(line)
         seen.append("свободная строка")
-    return prof_svc.face_of_fields(fields, free), seen
+    return prof_svc.form_to_data(fields, free), free, seen
+
+
+def parse_profile(raw: str) -> tuple[str, list[str]]:
+    """Разобрать форму профиля -> (строка для набора, что распознали).
+
+    Строку собираем тем же видом, каким бот проверяет живой профиль:
+    «Анна @anna · о себе · канал · описание канала» — без подписей полей и в
+    одном порядке, как бы форму ни заполнили. С подписями пример в наборе
+    выглядел иначе, чем проверяемый профиль, и сходство выходило ниже
+    настоящего.
+    """
+    from ..services import profile as prof_svc
+    data, _free, seen = read_form(raw)
+    return prof_svc.face_of_data(data), seen
+
+
+def _forward_kind(message: Message) -> str | None:
+    origin = getattr(message, "forward_origin", None)
+    kind = getattr(origin, "type", None)
+    return getattr(kind, "value", kind)
 
 
 def _origin(message: Message) -> tuple[int | None, str]:
@@ -209,10 +270,7 @@ def _origin(message: Message) -> tuple[int | None, str]:
     строкой, и достать профиль тогда неоткуда.
     """
     origin = getattr(message, "forward_origin", None)
-    if origin is None:
-        return None, ""
-    kind = getattr(origin, "type", None)
-    kind = getattr(kind, "value", kind)
+    kind = _forward_kind(message)
     if kind == "user":
         u = origin.sender_user
         name = u.full_name + (f" @{u.username}" if u.username else "")
@@ -227,49 +285,156 @@ def _origin(message: Message) -> tuple[int | None, str]:
     return None, ""
 
 
-async def _face_of(message: Message) -> tuple[str, bool]:
-    """Профиль автора пересланного -> (строка для набора, удалось ли спросить).
+async def _face_of(message: Message) -> tuple[str, dict, bool]:
+    """Профиль автора пересланного -> (строка, поля, удалось ли спросить).
 
     Строка — тем же видом, каким бот проверяет живой профиль: имя @ник · о
-    себе · канал. Раньше брали одно описание, и у «Green VPN 🌿», где вся
-    реклама в имени, в набор не попадало ничего. Скрытый автор — одно имя:
-    больше Telegram о нём не говорит.
+    себе · канал. От скрытого автора Telegram отдаёт одно имя — его не пишем
+    вовсе: сигнала в голом имени нет, а с пометкой «спам» оно учит модель,
+    что спамер всякий, кого зовут по-английски.
     """
     from ..services import profile as prof_svc
-    origin = getattr(message, "forward_origin", None)
-    kind = getattr(origin, "type", None)
-    kind = getattr(kind, "value", kind)
-    if kind == "user":
-        u = origin.sender_user
-        data = await prof_svc.fetch(_main_bot, u.id) if _main_bot else None
-        return prof_svc.face_text(u, data), bool(data)
-    if kind == "hidden_user":
-        return getattr(origin, "sender_user_name", "") or "", True
-    return "", True
+    if _forward_kind(message) != "user":
+        return "", {}, True
+    u = message.forward_origin.sender_user
+    data = await prof_svc.fetch(_main_bot, u.id) if _main_bot else None
+    return prof_svc.face_text(u, data), prof_svc.fields_of(u, data), bool(data)
 
 
-def _remember(msg_id: int, text: str, prof: str) -> None:
+def _buttons(message: Message) -> list[str]:
+    """Кнопки под сообщением как есть: «подпись → ссылка»."""
+    rows = getattr(getattr(message, "reply_markup", None), "inline_keyboard", None) or []
+    out = []
+    for row in rows:
+        for b in row:
+            label = getattr(b, "text", "") or "кнопка"
+            url = getattr(b, "url", None)
+            out.append(f"{label} → {url}" if url else label)
+    return out
+
+
+def _links(message: Message, seen: str) -> list[str]:
+    """Все ссылки: из текста, спрятанные под словами и с кнопок. Без повторов."""
+    from ..services import filters, moderation
+    got = (filters.find_tg_links(message, seen) + filters.find_ext_links(message, seen)
+           + moderation.button_urls(message))
+    return list(dict.fromkeys(got))
+
+
+async def _case(message: Message, bot: Bot) -> dict:
+    """Разобрать присланное в случай: сообщение и профиль автора по отдельности.
+
+    text — строка для модели сообщений, ровно такая, какую проверка видит в
+    чате: подпись вместе с распознанным с картинки или голосового.
+    """
+    from ..services import media
+    raw = message.text or message.caption or ""
+    forwarded = _forward_kind(message) is not None
+    uid, who = _origin(message)
+    case = {"uid": uid, "who": who, "text": "", "msg": {}, "prof": "", "prof_data": {},
+            "asked": True, "seen": []}
+
+    if not forwarded and _mode == "prof":
+        from ..services import profile as prof_svc
+        data, _free, case["seen"] = read_form(raw)
+        case["prof"], case["prof_data"] = prof_svc.face_of_data(data), data
+        return case
+
+    seen = ""
+    kind = next((k for k in MEDIA_KINDS if getattr(message, k, None)), None)
+    if kind:
+        try:
+            seen = await media.extract(bot, message, _MEDIA)
+        except Exception:
+            logger.warning("сборщик: медиа не распозналось", exc_info=True)
+    case["text"] = " ".join(" ".join(filter(None, [raw, seen])).split())
+    case["msg"] = {"text": raw, "media": kind, "media_text": seen,
+                   "links": _links(message, seen), "buttons": _buttons(message),
+                   "forward": _forward_kind(message)}
+    case["prof"], case["prof_data"], case["asked"] = await _face_of(message)
+    return case
+
+
+def _remember(msg_id: int, case: dict) -> None:
     if len(_pending) > PENDING_MAX:
         _pending.clear()          # разметку бросили на полпути, не жалко
-    _pending[msg_id] = (text, prof)
+    _pending[msg_id] = case
+
+
+def _kb(case: dict):
+    """Кнопки разметки. Обе части есть — четыре варианта, одна — два."""
+    b = InlineKeyboardBuilder()
+    if len(case["text"]) >= 10 and len(case["prof"]) >= 10:
+        b.row(_btn("⛔ Всё спам", "s:all"), _btn("💬 Спам только текст", "s:msg"))
+        b.row(_btn("🪪 Спам только профиль", "s:prof"), _btn("🕊 Всё норма", "s:ok"))
+    else:
+        b.row(_btn("⛔ Спам", "s:all"), _btn("🕊 Норма", "s:ok"))
+    b.row(_btn("⏭ Пропустить", "s:skip"))
+    return b.as_markup()
+
+
+@router.message(F.document.file_name.func(
+    lambda n: bool(n) and n.lower().endswith(".jsonl")))
+async def load_jsonl(message: Message, bot: Bot) -> None:
+    """Загрузить выгрузку обратно: тот же формат, что отдаёт /экспорт."""
+    doc = message.document
+    if (doc.file_size or 0) > IMPORT_MAX_BYTES:
+        await message.reply("Файл больше 20 МБ — Telegram не даст боту его скачать.")
+        return
+    buf = await bot.download(doc)
+    added = skipped = bad = 0
+    for line in buf.read().decode("utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            bad += 1
+            continue
+        parts = sum(1 for k in ("message", "profile")
+                    if (rec.get(k) or {}).get("label") in ("spam", "ok"))
+        got = await load_case(rec, message.from_user.id)
+        added += got
+        skipped += parts - got
+    await db.seed_commit()
+    if added:
+        from ..services import nn
+        nn.invalidate()
+    await db.add_event(None, "nn", f"сборщик: загружено {added} by {message.from_user.id}")
+    await message.reply(f"Загружено: <b>{added}</b>. Уже было или без метки: {skipped}."
+                        + (f" Нечитаемых строк: {bad}." if bad else ""))
+
+
+async def load_case(rec: dict, by: int | None) -> int:
+    """Один случай выгрузки -> записи в копилке. Сколько записей добавилось.
+
+    Строку для модели собираем заново из полей, если они есть: тем же видом,
+    что и проверка в чате. У старых записей полей нет — берём готовую строку.
+    """
+    from ..services import profile as prof_svc
+    ids = []
+    msg, prof = rec.get("message") or {}, rec.get("profile") or {}
+    if msg.get("label") in ("spam", "ok"):
+        text = " ".join(filter(None, [msg.get("text"), msg.get("media_text")]))
+        data = {k: v for k, v in msg.items() if k != "label"}
+        ids.append(await db.seed_add(text, msg["label"], "msg", data=data,
+                                     labeled_by=rec.get("by") or by))
+    if prof.get("label") in ("spam", "ok"):
+        data = {k: v for k, v in prof.items() if k not in ("label", "text")}
+        text = prof_svc.face_of_data(data) if data.get("name") or data.get("bio") \
+            else prof.get("text", "")
+        ids.append(await db.seed_add(text, prof["label"], "prof",
+                                     user_id=rec.get("user_id"), data=data or None,
+                                     labeled_by=rec.get("by") or by))
+    await db.sample_link(ids)
+    return sum(1 for i in ids if i)
 
 
 @router.message()
-async def collect(message: Message) -> None:
+async def collect(message: Message, bot: Bot) -> None:
     """Разобрать присланное и спросить, спам это или норма."""
-    raw = message.text or message.caption or ""
-    forwarded = getattr(message, "forward_origin", None) is not None
-    uid, who = _origin(message)
-    prof, asked = await _face_of(message)
-
-    # Присланное руками — это то, что выбрано режимом. Пересылку разбираем
-    # как есть: там видно, где сообщение, а где профиль его автора.
-    seen: list[str] = []
-    if not forwarded and _mode == "prof":
-        prof, seen = parse_profile(raw)
-        text = ""
-    else:
-        text = " ".join(raw.split())
+    case = await _case(message, bot)
+    text, prof = case["text"], case["prof"]
 
     if len(text) < 10 and len(prof) < 10:
         hint = ("\nФорма профиля — /профиль." if _mode == "prof" else "")
@@ -278,27 +443,31 @@ async def collect(message: Message) -> None:
             "Для набора нужен текст длиннее десяти символов." + hint)
         return
 
+    uid, who = case["uid"], case["who"]
     lines = ["<b>Разобрал:</b>", ""]
     if who:
         lines.append(f"👤 Автор: {utils.esc(who)}"
                      + (f" (<code>{uid}</code>)" if uid else " · профиль скрыт"))
     if text:
         lines.append(f"💬 {utils.esc(utils.chunk(text, 400))}")
+    if case["msg"].get("media_text"):
+        lines.append("<i>Текст с картинки или голосового — вместе с подписью.</i>")
+    if case["msg"].get("links"):
+        lines.append(f"🔗 Ссылок: {len(case['msg']['links'])}")
     if prof:
         lines.append(f"📝 Профиль: {utils.esc(utils.chunk(prof, 300))}")
-    if seen:
-        lines.append(f"<i>Поля: {utils.esc(', '.join(seen))}</i>")
-    if not text and not seen:
+    if case["seen"]:
+        lines.append(f"<i>Поля: {utils.esc(', '.join(case['seen']))}</i>")
+    if not text and not case["seen"]:
         lines.append("<i>Текста сообщения нет — запомню только профиль.</i>")
-    if not asked and uid:
+    if not prof and who and not uid:
+        lines.append("<i>Автор скрыт: одно имя без профиля не записываю.</i>")
+    if not case["asked"] and uid:
         lines.append("<i>Профиль спросить не вышло — запомню имя и ник.</i>")
     lines += ["", "Что это?"]
 
-    b = InlineKeyboardBuilder()
-    b.row(_btn("⛔ Спам", "s:spam"), _btn("🕊 Норма", "s:ok"))
-    b.row(_btn("⏭ Пропустить", "s:skip"))
-    sent = await message.reply("\n".join(lines), reply_markup=b.as_markup())
-    _remember(sent.message_id, text, prof)
+    sent = await message.reply("\n".join(lines), reply_markup=_kb(case))
+    _remember(sent.message_id, case)
 
 
 def _btn(text: str, data: str):
@@ -306,41 +475,49 @@ def _btn(text: str, data: str):
     return InlineKeyboardButton(text=text, callback_data=data)
 
 
+# кнопка -> (метка сообщения, метка профиля); None — эту часть не пишем
+MARKS = {"all": ("spam", "spam"), "msg": ("spam", None),
+         "prof": ("ok", "spam"), "ok": ("ok", "ok")}
+MARK_TEXT = {"all": "⛔ <b>Всё спам</b>", "msg": "💬 <b>Спам только текст</b>",
+             "prof": "🪪 <b>Спам только профиль</b>", "ok": "🕊 <b>Всё норма</b>"}
+
+
 @router.callback_query(F.data.startswith("s:"))
 async def mark(cb: CallbackQuery) -> None:
     what = cb.data.split(":")[1]
-    saved = _pending.pop(cb.message.message_id, None)
-    if saved is None:
+    case = _pending.pop(cb.message.message_id, None)
+    if case is None:
         await cb.answer("Это сообщение я уже забыл — пришлите заново.",
                         show_alert=True)
         return
-    if what == "skip":
+    if what == "skip" or what not in MARKS:
         await cb.message.edit_text(cb.message.html_text + "\n\n⏭ <b>Пропущено</b>")
         await cb.answer()
         return
 
-    text, prof = saved
-    label = "spam" if what == "spam" else "ok"
-    added = 0
+    msg_label, prof_label = MARKS[what]
+    by = cb.from_user.id
     # Текст и профиль кладём в разные списки: сообщение сравнивается с
     # сообщениями, профиль с профилями. Свалить их в одну кучу — значит
     # сравнивать строку из имени и био с обычной репликой в чате.
-    if text and await db.seed_add(text, label, "msg"):
-        added += 1
-    if prof and await db.seed_add(prof, label, "prof"):
-        added += 1
+    ids = []
+    if msg_label and case["text"]:
+        ids.append(await db.seed_add(case["text"], msg_label, "msg",
+                                     user_id=case["uid"], data=case["msg"], labeled_by=by))
+    if prof_label and case["prof"]:
+        ids.append(await db.seed_add(case["prof"], prof_label, "prof",
+                                     user_id=case["uid"], data=case["prof_data"],
+                                     labeled_by=by))
+    await db.sample_link(ids)
     await db.seed_commit()
+    added = sum(1 for i in ids if i)
     if added:
         from ..services import nn
-        nn.invalidate()           # набор изменился, профили чатов устарели
+        nn.invalidate()           # копилка изменилась — модель устарела
 
-    mark_text = "⛔ <b>В набор как спам</b>" if label == "spam" else "🕊 <b>В набор как норма</b>"
-    if not added:
-        mark_text = "🔁 <b>Уже было в наборе</b>"
-    elif added == 2:
-        mark_text += " — и в сообщения, и в профили"
-    elif prof and not text:
-        mark_text += " — в профили"
-    await cb.message.edit_text(cb.message.html_text + "\n\n" + mark_text)
-    await db.add_event(None, "nn", f"сборщик: {label} +{added} by {cb.from_user.id}")
+    note = MARK_TEXT[what] if added else "🔁 <b>Уже было в копилке</b>"
+    if added and not (case["text"] and case["prof"]):
+        note = "⛔ <b>Спам</b>" if what == "all" else "🕊 <b>Норма</b>"
+    await cb.message.edit_text(cb.message.html_text + "\n\n" + note)
+    await db.add_event(None, "nn", f"сборщик: {what} +{added} by {by}")
     await cb.answer("Записал" if added else "Уже было")

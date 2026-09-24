@@ -89,7 +89,7 @@ async def card_lift(cb: CallbackQuery, bot: Bot) -> None:
     if p is not None:
         # админ отменил наказание — значит это был не спам. Такие улики
         # ценнее всего: именно на них видно, где правила ошибаются
-        moved = await db.sample_relabel_by_pid(pid, "ok")
+        moved = await db.sample_relabel_by_pid(pid, "ok", cb.from_user.id)
         if not moved:
             last = await db.sample_last_for(p["chat_id"], p["user_id"])
             if last is not None:
@@ -98,7 +98,8 @@ async def card_lift(cb: CallbackQuery, bot: Bot) -> None:
                 # происхождения. Меняем только оценку
                 keep = last["origin"] == "profile"
                 await db.sample_relabel(last["id"], "ok",
-                                        origin=None if keep else "card")
+                                        origin=None if keep else "card",
+                                        labeled_by=cb.from_user.id)
         from ..services import nn
         nn.invalidate(p["chat_id"])          # профиль изменился
     if p is not None:
@@ -170,7 +171,7 @@ async def card_spam_profile(cb: CallbackQuery, bot: Bot) -> None:
     chat_id, user_id = int(chat_id), int(user_id)
     if not await may_act(cb, chat_id):
         return
-    ok, note = await nn.remember_spam_profile(bot, chat_id, user_id)
+    ok, note = await nn.remember_spam_profile(bot, chat_id, user_id, cb.from_user.id)
     if not ok:
         await cb.answer(note, show_alert=True)
         return
@@ -332,12 +333,16 @@ async def card_ban(cb: CallbackQuery, bot: Bot) -> None:
     from ..services import nn
     last = await db.sample_last_for(chat_id, user_id)
     if last is not None:
-        await db.sample_relabel(last["id"], "spam", origin="card")
+        # улика профиля остаётся профилем: в 'card' она ушла бы в обучение
+        # текстовой модели, где строке из имени и описания делать нечего
+        keep = last["origin"] == "profile"
+        await db.sample_relabel(last["id"], "spam", origin=None if keep else "card",
+                                labeled_by=cb.from_user.id)
         nn.invalidate(chat_id)
     # и сам профиль — тем же видом строки, каким его потом сравнивают: имя,
     # ник, описание и канал. Раньше писались только имя с ником, и такие
     # записи сравнивались с полными профилями вполсилы
-    await nn.remember_spam_profile(bot, chat_id, user_id)
+    await nn.remember_spam_profile(bot, chat_id, user_id, cb.from_user.id)
     await _mark(cb, "\n\n⛔ <b>Забанен</b>")
     from ..services import net
     runtime.spawn(net.spread_id_and_note(

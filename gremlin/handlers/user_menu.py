@@ -880,7 +880,7 @@ async def cb_cluster_label(cb: CallbackQuery) -> None:
     cid = int(cid)
     if not await _guard(cb, cid):
         return
-    moved = await nn.label_cluster(cid, int(index), label)
+    moved = await nn.label_cluster(cid, int(index), label, cb.from_user.id)
     if moved:
         await db.add_event(cid, "nn", f"кучка размечена как {label}: {moved} улик "
                                       f"by {cb.from_user.id}")
@@ -947,13 +947,13 @@ async def cb_cluster_item_label(cb: CallbackQuery) -> None:
     cid = int(cid)
     if not await _guard(cb, cid) or label not in ("spam", "ok"):
         return
-    if await db.sample_set_label(cid, int(sid), label):
+    if await db.sample_set_label(cid, int(sid), label, cb.from_user.id):
         await db.add_event(cid, "nn", f"улика #{sid} размечена как {label} "
                                       f"by {cb.from_user.id}")
         # счётчики кучки берём из разбивки, поэтому сбрасываем только модель,
         # а саму разбивку оставляем: иначе после каждой правки её пришлось бы
         # пересчитывать и номера кучек уезжали бы
-        nn._profile.pop(cid, None)
+        nn._profile.clear()          # модель одна на все чаты
     view = await view_cluster_items(cid, int(index), int(page))
     if view is None:
         await cb.answer("Разбивка устарела, откройте кучки заново.", show_alert=True)
@@ -3883,7 +3883,7 @@ async def cb_status_spam(cb: CallbackQuery, bot: Bot) -> None:
     if not await _guard(cb, cid, "punish"):
         return
     from ..services import nn
-    ok, note = await nn.remember_spam_profile(bot, cid, uid)
+    ok, note = await nn.remember_spam_profile(bot, cid, uid, cb.from_user.id)
     if ok:
         await db.add_event(cid, "card", f"спам-профиль в базу: {uid} "
                                         f"by {cb.from_user.id} (проверка статуса)")
@@ -4549,7 +4549,7 @@ async def cb_doubt_mark(cb: CallbackQuery) -> None:
     cid = int(cid)
     if not await _guard(cb, cid):
         return
-    await db.sample_relabel(int(sid), label, origin="card")
+    await db.sample_relabel(int(sid), label, origin="card", labeled_by=cb.from_user.id)
     nn.invalidate(cid)
     await db.add_event(cid, "nn", f"улика {sid} размечена как {label} "
                                   f"by {cb.from_user.id}")
@@ -4647,26 +4647,28 @@ async def view_seed(uid: int) -> tuple[str, InlineKeyboardMarkup]:
     """Главный экран набора: сколько чего и что с этим можно сделать."""
     msg = await db.seed_stats("msg")
     prof = await db.seed_stats("prof")
+    pool = await db.pool_stats()
     vecs = await db.seed_vec_count()
     label, q, _page, kind = _seed_state(uid)
 
     lines = [
         "<b>🌱 Стартовый набор</b>\n",
-        "Чужие примеры, с которых начинает молодой чат. Два вида, и они не "
-        "смешиваются: сообщение сравнивается с сообщениями, профиль с "
-        "профилями.",
+        "Примеры из сборщика. Вместе с размеченным в чатах это одна копилка: "
+        "по ней учится нейрофильтр и сравниваются профили во всех чатах сразу. "
+        "Два вида, и они не смешиваются: сообщение сравнивается с сообщениями, "
+        "профиль с профилями.",
         "",
-        "Набор общий: удалили пример здесь — он пропал у всех чатов сразу.",
+        "Удалили пример здесь — он пропал у всех чатов сразу.",
         "",
         "<b>📨 Сообщения</b>",
         f"⛔ Спам: <b>{msg['spam']}</b> · 🕊 Норма: <b>{msg['ok']}</b>",
-        f"В работе {min(config.NN_SEED_LIMIT, msg['total'])} — поровну того и "
-        f"другого, и только пока чат не набрал своих {config.NN_SEED_UNTIL}.",
+        f"Вся копилка: ⛔ {pool['msg']['spam']} · 🕊 {pool['msg']['ok']} "
+        f"(разметил человек {pool['msg']['human']}, бот {pool['msg']['bot']})",
         "",
         "<b>🪪 Профили</b>",
-        f"⛔ Спам: <b>{prof['spam']}</b>",
-        f"В работе {min(config.NN_FACE_SEED, prof['spam'])}, не отключаются: "
-        "рекламный профиль одинаков в любом чате.",
+        f"⛔ Спам: <b>{prof['spam']}</b> · 🕊 Норма: <b>{prof['ok']}</b>",
+        f"Вся копилка: ⛔ {pool['prof']['spam']} · 🕊 {pool['prof']['ok']} "
+        f"(разметил человек {pool['prof']['human']}, бот {pool['prof']['bot']})",
         "",
         f"🧮 Посчитано векторов: <b>{vecs}</b>",
     ]

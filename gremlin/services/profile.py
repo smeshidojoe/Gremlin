@@ -136,17 +136,53 @@ def face_join(name: str, username: str | None, data: dict | None) -> str:
     return head or tail
 
 
-# Поля формы профиля в сборщике — в том порядке, в каком они идут в строке.
+# Поля формы профиля в сборщике — в том порядке, в каком они идут в строке,
+# и как они называются в копилке (samples.data) и в выгрузке.
 FACE_FIELDS = ("Имя", "Ник", "О себе", "Канал", "Описание канала")
+FACE_KEYS = dict(zip(FACE_FIELDS, ("name", "username", "bio", "channel", "channel_desc")))
+
+
+def form_to_data(fields: dict, extra: list[str] | tuple = ()) -> dict:
+    """Поля формы {"Имя": …} -> поля копилки {"name": …}; свободные строки — в extra."""
+    out = {FACE_KEYS[k]: v for k, v in fields.items() if k in FACE_KEYS and v}
+    if out.get("username"):
+        out["username"] = out["username"].strip().lstrip("@")
+    if extra:
+        out["extra"] = list(extra)
+    return out
+
+
+def face_of_data(d: dict) -> str:
+    """Строка личности из полей копилки: name, username, bio, channel, channel_desc.
+
+    Одна сборка на всех — форму сборщика, загрузку выгрузки и пересборку
+    старых записей: строка должна выходить той же, что у живой проверки.
+    """
+    head = face_join(d.get("name", ""), d.get("username"),
+                     {"bio": d.get("bio", ""), "channel_title": d.get("channel", ""),
+                      "channel_desc": d.get("channel_desc", "")})
+    return " · ".join(p for p in (head, *(d.get("extra") or ())) if p)
+
+
+def fields_of(user, data: dict | None) -> dict:
+    """Поля живого профиля по отдельности — то, из чего собрана face_text.
+
+    Строка нужна модели, поля — всему остальному: пересобрать строку под
+    другую модель, выгрузить набор, понять, что именно было в профиле.
+    """
+    data = data or {}
+    out = {"name": getattr(user, "full_name", "") or "",
+           "username": getattr(user, "username", None) or "",
+           "bio": data.get("bio") or "", "channel": data.get("channel_title") or "",
+           "channel_desc": data.get("channel_desc") or ""}
+    if data:
+        out["photo"] = bool(data.get("photo_id"))
+    return out
 
 
 def face_of_fields(fields: dict, extra: list[str] | tuple = ()) -> str:
     """Строка личности из полей формы: {"Имя": …, "Ник": …, …} + свободные строки."""
-    data = {"bio": fields.get("О себе", ""),
-            "channel_title": fields.get("Канал", ""),
-            "channel_desc": fields.get("Описание канала", "")}
-    head = face_join(fields.get("Имя", ""), fields.get("Ник"), data)
-    return " · ".join(p for p in (head, *extra) if p)
+    return face_of_data(form_to_data(fields, extra))
 
 
 def unlabel(text: str) -> str | None:

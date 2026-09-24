@@ -473,8 +473,8 @@ async def _profile_punish(bot, chat, user, settings, message, data, why) -> bool
                        f"профиль: {user.full_name} ({user.id}) — {why}")
     if kind == "ban" and settings.watch_nn:
         # такой профиль пригодится: следующий похожий узнается сразу
-        await nn.remember_face(chat.id, user.id,
-                               prof_svc.face_text(user, data), "spam")
+        await nn.remember_face(chat.id, user.id, prof_svc.face_text(user, data),
+                               "spam", prof_svc.fields_of(user, data))
     await moderation.send_card(bot, chat.id, config.BIT_WATCH, card, pid,
                                kind if kind != "delete" else None, user.id)
     return True
@@ -695,10 +695,13 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None,
     # эвристик разные, для модели — одно и то же, поэтому сравниваем профиль
     # с теми, за кого в этом чате уже банили.
     face_sim = None
+    # Строка та же, что лежит в копилке: имя, ник и профиль, если его уже
+    # спросили. Раньше здесь сравнивали голое «имя @ник» с полными профилями —
+    # сходство выходило ниже настоящего, а при бане в копилку ложился огрызок.
+    from . import profile as prof_svc
+    face = prof_svc.face_text(user, pdata)
     if settings.watch_nn and total:
         from . import nn
-        face = (f"{user.full_name} @{user.username}" if user.username
-                else user.full_name)
         got = await nn.face_score(chat.id, face)
         if nn.face_hit(got):
             face_sim = got[0]
@@ -779,9 +782,8 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None,
         await db.add_event(chat.id, "watch", f"ban: {user.full_name} ({user.id}) — {why} ({total})")
         if settings.watch_nn:
             from . import nn
-            face = (f"{user.full_name} @{user.username}" if user.username
-                    else user.full_name)
-            await nn.remember_face(chat.id, user.id, face, "spam")
+            await nn.remember_face(chat.id, user.id, face, "spam",
+                                   prof_svc.fields_of(user, pdata))
         await moderation.send_card(bot, chat.id, config.BIT_WATCH, card, pid, "ban", user.id)
         return
 

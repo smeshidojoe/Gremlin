@@ -133,28 +133,20 @@ async def embed(texts: list[str]):
     return _np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
 
 
-async def _build_profile(chat_id: int):
-    """Собрать матрицу улик чата. Готовые векторы берём из базы, новые считаем
-    и туда же кладём — иначе каждый перезапуск прогонял бы всю копилку заново."""
-    # Чужие чаты в копилку не идут: у чата про рыбалку и у чата про крипту
-    # разное представление о норме. Исключение — своя сетка: эти чаты
-    # принадлежат одному человеку и похожи, там объединять честно (nn_net).
+# Копилка одна на все чаты (см. db.samples_pool), и модель по ней одна:
+# кэш держим под одним ключом, какой бы чат ни спросил.
+POOL = 0
+
+
+async def _build_profile():
+    """Собрать матрицу общей копилки. Готовые векторы берём из базы, новые
+    считаем и туда же кладём — иначе каждый перезапуск прогонял бы всё заново."""
     # Пока улик меньше NN_MIN_SAMPLES — фильтр молчит и копит.
     # Без модели тут делать нечего: и векторы считать нечем, и распаковать
-    # готовые не через что. Раньше это спасала пустая копилка — со стартовым
-    # набором она перестала быть пустой, и сюда стало можно дойти без модели.
+    # готовые не через что.
     if not await ensure():
         return None
-    s = await db.get_settings(chat_id)
-    rows = (await db.samples_profile_net(chat_id) if s.nn_net
-            else await db.samples_profile(chat_id))
-    own = len(rows)
-    # Пока своих улик мало, добавляем стартовый набор — чужие примеры спама
-    # и обычных сообщений. Иначе новый чат месяц не понимает вообще ничего.
-    # Как только своих набирается NN_SEED_UNTIL, набор отпадает: своя норма
-    # всегда точнее чужой.
-    if s.nn_seed and own < config.NN_SEED_UNTIL:
-        rows = list(rows) + list(await db.samples_seed(config.NN_SEED_LIMIT))
+    rows = await db.samples_pool("msg")
     if len(rows) < config.NN_MIN_SAMPLES:
         return None
 
@@ -176,35 +168,38 @@ async def _build_profile(chat_id: int):
     weights = None
     if len(ids) >= config.NN_LOGREG_MIN:
         weights = await asyncio.to_thread(_fit, matrix, labels)
-    logger.debug("профиль чата %s: %d улик (своих %d), регрессия %s",
-                 chat_id, len(ids), own, "есть" if weights else "рано")
+    logger.debug("копилка: %d улик, регрессия %s", len(ids),
+                 "есть" if weights else "рано")
     return matrix, labels, ids, weights
 
 
-async def profile(chat_id: int):
-    """Профиль из кэша; раз в PROFILE_TTL перечитываем — улики прибавляются."""
-    cached = _profile.get(chat_id)
+async def profile(chat_id: int | None = None):
+    """Модель общей копилки из кэша; раз в PROFILE_TTL перечитываем — улики
+    прибавляются. chat_id не влияет: копилка одна на все чаты."""
+    cached = _profile.get(POOL)
     now = time.monotonic()
     if cached and now - cached[0] < PROFILE_TTL:
         return cached[1:]
-    built = await _build_profile(chat_id)
+    built = await _build_profile()
     if built is None:
-        _profile[chat_id] = (now, None, [], [], None)
+        _profile[POOL] = (now, None, [], [], None)
         return None, [], [], None
-    _profile[chat_id] = (now, *built)
+    _profile[POOL] = (now, *built)
     return built
 
 
 def invalidate(chat_id: int | None = None) -> None:
-    """Сбросить кэш: улику переразметили — профиль устарел."""
+    """Сбросить кэш: улику переразметили — модель устарела.
+
+    Копилка общая, поэтому модель сбрасываем всегда, а разбивку на кучки —
+    только у того чата, где правили (она у каждого своя).
+    """
+    _profile.clear()
+    _faces.clear()
     if chat_id is None:
-        _profile.clear()
         _clusters.clear()
-        _faces.clear()
     else:
-        _profile.pop(chat_id, None)
         _clusters.pop(chat_id, None)
-        _faces.pop(chat_id, None)
 
 
 def invalidate_phrases(chat_id: int) -> None:
@@ -567,7 +562,8 @@ def cluster_ids(chat_id: int, index: int) -> list[int] | None:
     return cached[1][index]
 
 
-async def label_cluster(chat_id: int, index: int, label: str) -> int:
+async def label_cluster(chat_id: int, index: int, label: str,
+                        labeled_by: int | None = None) -> int:
     """Разметить в кучке улики без оценки. Возвращает, сколько разметили.
 
     Уже размеченные не трогаем: см. db.samples_label_unknown.
@@ -575,7 +571,7 @@ async def label_cluster(chat_id: int, index: int, label: str) -> int:
     ids = cluster_ids(chat_id, index)
     if ids is None:
         return 0
-    moved = await db.samples_label_unknown(ids, label)
+    moved = await db.samples_label_unknown(ids, label, labeled_by)
     invalidate(chat_id)
     logger.info("кучка %s в чате %s размечена как %s: %d улик",
                 index, chat_id, label, moved)
@@ -664,17 +660,23 @@ def forget_burst(chat_id: int) -> None:
     _recent.pop(chat_id, None)
 
 
-async def remember_face(chat_id: int, user_id: int, name: str, label: str) -> None:
-    """Запомнить профиль: имя и ник того, кого забанили (или не тронули).
+async def remember_face(chat_id: int, user_id: int, name: str, label: str,
+                        fields: dict | None = None,
+                        labeled_by: int | None = None) -> None:
+    """Запомнить профиль: строку того, кого забанили (или не тронули).
 
-    Хранится в той же копилке, но с origin='profile' — в текстовый профиль
+    Хранится в той же копилке, но с origin='profile' — в текстовую модель
     такие улики не попадают, они сравниваются только с профилями.
+    fields — поля профиля по отдельности (profile.fields_of), labeled_by — кто
+    решил; None — решил бот сам, при автобане.
     """
-    await db.sample_add(chat_id, user_id, "profile", label, name, feature="профиль")
-    _faces.pop(chat_id, None)
+    await db.sample_add(chat_id, user_id, "profile", label, name, feature="профиль",
+                        data=fields, labeled_by=labeled_by)
+    _faces.clear()
 
 
-async def remember_spam_profile(bot, chat_id: int, user_id: int) -> tuple[bool, str]:
+async def remember_spam_profile(bot, chat_id: int, user_id: int,
+                                labeled_by: int | None = None) -> tuple[bool, str]:
     """Админ сказал «это спам-аккаунт»: записать профиль в базу для сравнения.
 
     Пишем тем же видом строки, каким сравниваем и запоминаем при автобане, —
@@ -699,28 +701,25 @@ async def remember_spam_profile(bot, chat_id: int, user_id: int) -> tuple[bool, 
             return False, "Не знаю этого человека: ни имени, ни ника."
         user = types.SimpleNamespace(full_name=row["first_name"] or "",
                                      username=row["username"])
-    face = " ".join(prof_svc.face_text(user, await prof_svc.fetch(bot, user_id)).split())
+    data = await prof_svc.fetch(bot, user_id)
+    face = " ".join(prof_svc.face_text(user, data).split())
     if len(face) < 4:
         return False, "Записывать нечего: имя пустое, профиль закрыт."
     stored = face[:config.SAMPLE_TEXT_LIMIT]
 
-    # Проверка статуса ищет человека по всем чатам, а база своя у каждого —
-    # без названия чата запись «терялась» в соседнем
-    row = await db.get_chat(chat_id)
-    where = f" чата «{row['title']}»" if row is not None and row["title"] else ""
-
-    mine = [r for r in await db.samples_of_origin(chat_id, "profile")
-            if r["user_id"] == user_id]
+    # база общая на все чаты: человека ищем везде, а не только в этом
+    mine = [r for r in await db.samples_pool("prof") if r["user_id"] == user_id]
     if any(r["label"] == "spam" and r["text"] == stored for r in mine):
-        return False, f"Этот профиль уже в базе спама{where}."
+        return False, "Этот профиль уже в базе спама."
     # раньше его отметили нормальным («больше не трогать») — теперь передумали;
     # старая пометка иначе спорила бы с новой в каждом сравнении
     for r in mine:
         if r["label"] != "spam":
-            await db.sample_relabel(r["id"], "spam")
-    await remember_face(chat_id, user_id, face, "spam")
+            await db.sample_relabel(r["id"], "spam", labeled_by=labeled_by)
+    await remember_face(chat_id, user_id, face, "spam",
+                        prof_svc.fields_of(user, data), labeled_by)
 
-    note = f"Профиль записан в базу спама{where}: похожих бот узнает сразу."
+    note = "Профиль записан в базу спама: похожих бот узнает сразу, во всех чатах."
     s = await db.get_settings(chat_id)
     if not s.watch_nn:
         note += (" Сравнение профилей в наблюдении сейчас выключено — "
@@ -742,22 +741,18 @@ async def face_score(chat_id: int, name: str) -> tuple[int, int | None] | None:
     name = " ".join((name or "").split())
     if len(name) < 4 or not await ensure():
         return None
-    cached = _faces.get(chat_id)
+    cached = _faces.get(POOL)
     now = time.monotonic()
     if not cached or now - cached[0] > PROFILE_TTL:
-        own = await db.samples_of_origin(chat_id, "profile")
-        # Общий набор подмешиваем всегда, а не «пока чат молодой», как у
-        # текстовых улик: рекламные профили одинаковые везде, и живые люди
-        # тоже — своей нормы у профиля в отдельном чате не бывает.
-        spam = ([r["text"] for r in own if r["label"] == "spam"]
-                + [r["text"] for r in await db.samples_seed_faces(config.NN_FACE_SEED)])
-        ok = ([r["text"] for r in own if r["label"] == "ok"]
-              + [r["text"] for r in await db.samples_seed_faces(config.NN_FACE_SEED, "ok")])
+        # профили из всех чатов и из сборщика — копилка одна
+        rows = await db.samples_pool("prof")
+        spam = [r["text"] for r in rows if r["label"] == "spam"]
+        ok = [r["text"] for r in rows if r["label"] == "ok"]
         if len(spam) < 5:            # на трёх примерах сравнивать нечего
-            _faces[chat_id] = (now, None, None)
+            _faces[POOL] = (now, None, None)
             return None
-        _faces[chat_id] = (now, await embed(spam), await embed(ok) if ok else None)
-        cached = _faces[chat_id]
+        _faces[POOL] = (now, await embed(spam), await embed(ok) if ok else None)
+        cached = _faces[POOL]
     if cached[1] is None:
         return None
     vec = (await embed([name]))[0]
@@ -862,12 +857,9 @@ async def keeper() -> None:
             if old_verdicts:
                 logger.info("журнал вердиктов подрезан: удалено %d", old_verdicts)
             if await ensure():
-                # стартовый набор считаем отдельно: он общий, в samples_without_vec
-                # не попадает (там только свои улики чатов), а без готовых векторов
-                # первое сообщение в молодом чате ждало бы прогон всех четырёхсот
-                rows = [r for r in await db.samples_seed(config.NN_SEED_LIMIT)
-                        if not r["vec"]]
-                rows += await db.samples_without_vec()
+                # векторы для всей копилки, включая сборщик: без готовых первое
+                # сообщение после перезапуска ждало бы прогон тысяч примеров
+                rows = await db.samples_without_vec(5000)
                 if rows:
                     vecs = await embed([r["text"] for r in rows])
                     for r, v in zip(rows, vecs):

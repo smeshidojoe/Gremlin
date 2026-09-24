@@ -536,7 +536,8 @@ async def api_nn_doubt_mark(request: web.Request) -> web.Response:
     label = data.get("label")
     if label not in ("spam", "ok"):
         raise web.HTTPBadRequest(text="bad label")
-    await db.sample_relabel(int(data.get("id") or 0), label, origin="card")
+    await db.sample_relabel(int(data.get("id") or 0), label, origin="card",
+                            labeled_by=uid_of(request))
     nn.invalidate(cid)
     await db.add_event(cid, "nn", f"улика {data.get('id')} размечена как {label} "
                                   f"(панель)")
@@ -572,10 +573,10 @@ async def api_nn_sample_label(request: web.Request) -> web.Response:
     if label not in ("spam", "ok"):
         raise web.HTTPBadRequest(text="bad label")
     sid = int(request.match_info["sid"])
-    if not await db.sample_set_label(cid, sid, label):
+    if not await db.sample_set_label(cid, sid, label, uid_of(request)):
         raise web.HTTPNotFound(text="Этой улики уже нет.")
     await db.add_event(cid, "nn", f"улика #{sid} размечена как {label} (панель)")
-    nn._profile.pop(cid, None)        # разбивку не трогаем, иначе уедут номера
+    nn._profile.clear()        # модель общая; разбивку не трогаем, иначе уедут номера
     return js({"ok": True})
 
 
@@ -587,7 +588,8 @@ async def api_nn_cluster_label(request: web.Request) -> web.Response:
     label = data.get("label")
     if label not in ("spam", "ok"):
         raise web.HTTPBadRequest(text="bad label")
-    moved = await nn.label_cluster(cid, int(data.get("index") or 0), label)
+    moved = await nn.label_cluster(cid, int(data.get("index") or 0), label,
+                                   uid_of(request))
     if moved:
         await db.add_event(cid, "nn", f"кучка размечена как {label}: {moved} улик "
                                       f"(панель)")
@@ -1218,7 +1220,8 @@ async def api_spam_profile(request: web.Request) -> web.Response:
         uid = 0
     if uid <= 0:
         raise web.HTTPBadRequest(text="bad user_id")
-    ok, note = await nn.remember_spam_profile(bot_of(request), cid, uid)
+    ok, note = await nn.remember_spam_profile(bot_of(request), cid, uid,
+                                              uid_of(request))
     if ok:
         await db.add_event(cid, "card", f"спам-профиль в базу: {uid} "
                                         f"by {uid_of(request)} (панель)")
@@ -1252,8 +1255,7 @@ async def api_spam_profiles(request: web.Request) -> web.Response:
               "who": await db.user_handle(r["user_id"]) if r["user_id"] else "—",
               "when": utils.fmt_ts(r["ts"]), "text": r["text"]}
              for r in await db.spam_profiles(cid)]
-    # копия в общий набор — дело хозяина бота: набор один на все чаты
-    return js({"items": items, "owner": is_owner(request)})
+    return js({"items": items})
 
 
 @routes.delete("/api/chat/{cid}/spamprofiles/{rid}")
@@ -1266,23 +1268,6 @@ async def api_spam_profile_del(request: web.Request) -> web.Response:
     await db.add_event(cid, "card", f"спам-профиль убран из базы: "
                                     f"{row['user_id']} by {uid_of(request)} (панель)")
     return js({"ok": True})
-
-
-@routes.post("/api/chat/{cid}/spamprofiles/{rid}/seed")
-async def api_spam_profile_seed(request: web.Request) -> web.Response:
-    """Скопировать профиль в стартовый набор — чтобы ловился во всех чатах."""
-    cid = await cid_of(request)
-    owner_only(request)
-    row = await db.spam_profile_get(cid, int(request.match_info["rid"]))
-    if row is None:
-        raise web.HTTPNotFound(text="Этой записи уже нет.")
-    added = await db.seed_add(row["text"], "spam", "prof")
-    if added:
-        await db.seed_commit()
-        nn.invalidate()          # набор подмешан всем чатам сразу
-        await db.add_event(cid, "nn", f"профиль в стартовый набор: "
-                                      f"{row['user_id']} by {uid_of(request)} (панель)")
-    return js({"ok": True, "added": added})
 
 
 @routes.delete("/api/chat/{cid}/forgiven/{rid}")
@@ -2018,10 +2003,8 @@ async def api_seed(request: web.Request) -> web.Response:
         "stats": await db.seed_stats(kind),
         "msg_stats": await db.seed_stats("msg"),
         "prof_stats": await db.seed_stats("prof"),
-        "face_seed": config.NN_FACE_SEED,
         "vecs": await db.seed_vec_count(),
-        "in_work": config.NN_SEED_LIMIT,
-        "until": config.NN_SEED_UNTIL,
+        "pool": await db.pool_stats(),
         "total": total,
         "page": page,
         "pages": max(1, -(-total // SEED_PAGE)),

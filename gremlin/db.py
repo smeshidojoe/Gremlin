@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass, fields
 
 import glob
+import json
 import logging
 import shutil
 import sqlite3
@@ -381,7 +382,10 @@ CREATE TABLE IF NOT EXISTS samples(
     pid      INTEGER,               -- наказание, к которому относится улика
     text     TEXT    NOT NULL,
     extra    TEXT,                  -- подписи и ссылки с кнопок
-    vec      BLOB                   -- эмбеддинг, считаем лениво
+    vec      BLOB,                  -- эмбеддинг, считаем лениво
+    data     TEXT,                  -- исходные поля в JSON: из них собран text
+    case_id  INTEGER,               -- сообщение и профиль одного случая
+    labeled_by INTEGER              -- кто поставил метку; NULL — решил бот
 );
 CREATE INDEX IF NOT EXISTS idx_samples_chat ON samples(chat_id, id);
 CREATE INDEX IF NOT EXISTS idx_samples_pick ON samples(label, origin);
@@ -747,6 +751,7 @@ _TABLE_MIGRATIONS = {
     "watch_profiles": {"score": "INTEGER NOT NULL DEFAULT 0",
                        "score_ts": "INTEGER NOT NULL DEFAULT 0",
                        "card_score": "INTEGER NOT NULL DEFAULT 0"},
+    "samples": {"data": "TEXT", "case_id": "INTEGER", "labeled_by": "INTEGER"},
 }
 
 
@@ -1933,35 +1938,53 @@ PROFILE_ORIGINS = ("auto", "card", "random")
 SEED_CHAT = 0
 
 
+def _json(data: dict | None) -> str | None:
+    """Исходные поля улики — в JSON. Пустые поля выбрасываем: читать их незачем."""
+    if not data:
+        return None
+    return json.dumps({k: v for k, v in data.items() if v not in (None, "", [], {})},
+                      ensure_ascii=False) or None
+
+
 async def sample_add(chat_id: int, user_id: int | None, origin: str, label: str,
                      text: str, feature: str | None = None,
-                     extra: str | None = None, pid: int | None = None) -> int | None:
-    """Запомнить улику. Пустой текст не храним — учиться на нём нечему."""
+                     extra: str | None = None, pid: int | None = None,
+                     data: dict | None = None,
+                     labeled_by: int | None = None) -> int | None:
+    """Запомнить улику. Пустой текст не храним — учиться на нём нечему.
+
+    text — строка, которую читает модель; data — поля, из которых она собрана
+    (текст, распознанное, ссылки; у профиля — имя, ник, описание по отдельности).
+    Модель меняется — строку можно пересобрать из полей, не теряя данных.
+    """
     text = (text or "").strip()[:config.SAMPLE_TEXT_LIMIT]
     if not text:
         return None
     cur = await _db.execute(
         """INSERT INTO samples (chat_id, user_id, ts, origin, feature, label,
-                                pid, text, extra)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
-        (chat_id, user_id, _now(), origin, feature, label, pid, text, extra),
+                                pid, text, extra, data, labeled_by)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (chat_id, user_id, _now(), origin, feature, label, pid, text, extra,
+         _json(data), labeled_by),
     )
     await _db.commit()
     return cur.lastrowid
 
 
-async def sample_relabel(sample_id: int, label: str, origin: str | None = None) -> None:
+async def sample_relabel(sample_id: int, label: str, origin: str | None = None,
+                         labeled_by: int | None = None) -> None:
     """Переставить оценку: админ снял наказание — значит это был не спам."""
     if origin:
-        await _db.execute("UPDATE samples SET label = ?, origin = ?, vec = NULL "
-                          "WHERE id = ?", (label, origin, sample_id))
+        await _db.execute("UPDATE samples SET label = ?, origin = ?, vec = NULL, "
+                          "labeled_by = ? WHERE id = ?",
+                          (label, origin, labeled_by, sample_id))
     else:
-        await _db.execute("UPDATE samples SET label = ?, vec = NULL WHERE id = ?",
-                          (label, sample_id))
+        await _db.execute("UPDATE samples SET label = ?, vec = NULL, labeled_by = ? "
+                          "WHERE id = ?", (label, labeled_by, sample_id))
     await _db.commit()
 
 
-async def sample_relabel_by_pid(pid: int, label: str) -> int:
+async def sample_relabel_by_pid(pid: int, label: str, labeled_by: int | None = None) -> int:
     """То же по id наказания — им помечены улики автомода.
 
     Улики профилей остаются в своём списке: origin='profile' у них не метка
@@ -1970,10 +1993,10 @@ async def sample_relabel_by_pid(pid: int, label: str) -> int:
     обучении текстовой модели, где строке из имени и био делать нечего.
     """
     cur = await _db.execute(
-        """UPDATE samples SET label = ?, vec = NULL,
+        """UPDATE samples SET label = ?, vec = NULL, labeled_by = ?,
                origin = CASE WHEN origin = 'profile' THEN 'profile' ELSE 'card' END
            WHERE pid = ?""",
-        (label, pid))
+        (label, labeled_by, pid))
     await _db.commit()
     return cur.rowcount or 0
 
@@ -2030,11 +2053,12 @@ async def samples_stats(chat_id: int | None = None) -> dict:
 
 
 async def samples_without_vec(limit: int = 200) -> list[aiosqlite.Row]:
+    origins = POOL_ORIGINS["msg"]
     cur = await _db.execute(
         f"""SELECT id, text FROM samples
-            WHERE vec IS NULL AND label != 'unknown'
-              AND origin IN ({",".join("?" * len(PROFILE_ORIGINS))})
-            ORDER BY id DESC LIMIT ?""", (*PROFILE_ORIGINS, limit))
+            WHERE vec IS NULL AND label IN ('spam', 'ok')
+              AND origin IN ({",".join("?" * len(origins))})
+            ORDER BY id DESC LIMIT ?""", (*origins, limit))
     return await cur.fetchall()
 
 
@@ -2083,49 +2107,155 @@ async def phrase_set_vec(phrase_id: int, vec: bytes) -> None:
     await _db.commit()
 
 
-async def samples_profile_net(chat_id: int, limit: int = 4000) -> list[aiosqlite.Row]:
-    """Улики чата плюс улики его сетки.
-
-    Чаты одной сетки принадлежат одному человеку и похожи между собой, поэтому
-    объединять их копилки честно: молодой чат в сетке начинает работать сразу,
-    а не через месяц. С чужими чатами такого не делаем — там своя норма.
-    """
-    peers = [c["chat_id"] for c in await net_peers(chat_id)]
-    if not peers:
-        return await samples_profile(chat_id, limit)
-    ids = [chat_id, *peers]
-    marks = ",".join("?" * len(PROFILE_ORIGINS))
-    chats = ",".join("?" * len(ids))
-    cur = await _db.execute(
-        f"""SELECT * FROM samples
-            WHERE origin IN ({marks}) AND label != 'unknown' AND chat_id IN ({chats})
-            ORDER BY id DESC LIMIT ?""",
-        (*PROFILE_ORIGINS, *ids, limit))
-    return await cur.fetchall()
-
-
-# Стартовый набор бывает двух видов: примеры сообщений и примеры профилей.
-# Сравниваются они порознь — сообщение с сообщениями, профиль с профилями,
-# — поэтому и лежат под разным origin, хотя и в одной таблице.
+# ---------- общая копилка ----------
+#
+# Копилка одна на все чаты: сборщик, карточки, автобаны, случайные образцы
+# нормы — всё учит одну модель. Раньше у каждого чата (или сетки) была своя,
+# а набор сборщика отключался, как только своих набиралось двести. Своих при
+# этом было 426, спама среди них — 10, и три тысячи примеров из сборщика не
+# работали нигде. Чаты у бота похожие, спам в них одинаковый — делить нечего.
+# chat_id в записи остаётся: откуда пример, видно, просто учёбу он не делит.
+#
+# Сообщения и профили сравниваются порознь — сообщение с сообщениями, профиль
+# с профилями, — поэтому и origin у них разные, хотя таблица одна.
 SEED_ORIGINS = {"msg": "seed", "prof": "seedprof"}
+POOL_ORIGINS = {"msg": ("auto", "card", "random", "seed"),
+                "prof": ("profile", "seedprof")}
+# кто что положил в копилку — для выгрузки
+POOL_SOURCE = {"seed": "collector", "seedprof": "collector", "card": "card",
+               "auto": "rule", "random": "random", "profile": "profile"}
 
 
-async def seed_add(text: str, label: str, kind: str = "msg") -> bool:
-    """Добавить пример в стартовый набор. False — такой уже есть."""
+async def samples_pool(kind: str = "msg",
+                       limit: int = config.NN_POOL_LIMIT) -> list[aiosqlite.Row]:
+    """Все размеченные улики одного вида — из всех чатов и из сборщика.
+
+    Одинаковый текст берём один раз, последний по времени: пример, заведённый
+    и в чате, и в сборщике, иначе весил бы вдвое, а при проверке «по остальным»
+    находил бы сам себя. У профилей так же и с одним человеком: он поменял
+    описание — в работе последнее, а не оба варианта.
+    """
+    origins = POOL_ORIGINS[kind]
+    cur = await _db.execute(
+        f"""SELECT * FROM samples WHERE label IN ('spam', 'ok')
+              AND origin IN ({",".join("?" * len(origins))})
+            ORDER BY id DESC LIMIT ?""", (*origins, limit))
+    seen, out = set(), []
+    for r in await cur.fetchall():
+        keys = {("t", r["text"])}
+        if kind == "prof" and r["user_id"]:
+            keys.add(("u", r["user_id"]))
+        if keys & seen:
+            continue
+        seen |= keys
+        out.append(r)
+    return out
+
+
+async def pool_stats() -> dict:
+    """Сколько в копилке спама и нормы — и сколько из них разметил человек.
+
+    Человек — это сборщик, кнопки на карточках и всё, где записан labeled_by.
+    Остальное решил бот сам: сработавшее правило, автобан, случайный образец.
+    """
+    out = {}
+    for kind, origins in POOL_ORIGINS.items():
+        cur = await _db.execute(
+            f"""SELECT label,
+                       labeled_by IS NOT NULL OR origin IN ('seed', 'seedprof', 'card')
+                           AS human,
+                       COUNT(*) AS n
+                FROM samples WHERE label IN ('spam', 'ok')
+                  AND origin IN ({",".join("?" * len(origins))})
+                GROUP BY 1, 2""", origins)
+        got = {"spam": 0, "ok": 0, "human": 0, "bot": 0}
+        for r in await cur.fetchall():
+            got[r["label"]] += r["n"]
+            got["human" if r["human"] else "bot"] += r["n"]
+        out[kind] = got
+    return out
+
+
+async def seed_add(text: str, label: str, kind: str = "msg", *,
+                   user_id: int | None = None, data: dict | None = None,
+                   labeled_by: int | None = None) -> int | None:
+    """Добавить пример из сборщика. id записи; None — такой уже есть.
+
+    Профиль человека, который уже лежит в копилке, не дублируем, а обновляем:
+    описание поменялось — в работе должно быть новое, а не оба варианта.
+    """
     origin = SEED_ORIGINS.get(kind, "seed")
     text = " ".join((text or "").split())[:config.SAMPLE_TEXT_LIMIT]
     if len(text) < 10:
-        return False
+        return None
+    if kind == "prof" and user_id:
+        cur = await _db.execute(
+            "SELECT id, text, label FROM samples WHERE chat_id = ? AND origin = ? "
+            "AND user_id = ? ORDER BY id DESC LIMIT 1", (SEED_CHAT, origin, user_id))
+        old = await cur.fetchone()
+        if old is not None:
+            if old["text"] == text and old["label"] == label:
+                return None
+            await _db.execute(
+                """UPDATE samples SET text = ?, label = ?, data = ?, labeled_by = ?,
+                       ts = ?, vec = NULL WHERE id = ?""",
+                (text, label, _json(data), labeled_by, _now(), old["id"]))
+            return old["id"]
     cur = await _db.execute(
         "SELECT 1 FROM samples WHERE chat_id = ? AND origin = ? AND text = ?",
         (SEED_CHAT, origin, text))
     if await cur.fetchone():
-        return False
-    await _db.execute(
-        """INSERT INTO samples (chat_id, user_id, ts, origin, feature, label, text)
-           VALUES (?, NULL, ?, ?, 'набор', ?, ?)""",
-        (SEED_CHAT, _now(), origin, label, text))
-    return True
+        return None
+    cur = await _db.execute(
+        """INSERT INTO samples (chat_id, user_id, ts, origin, feature, label, text,
+                                data, labeled_by)
+           VALUES (?, ?, ?, ?, 'набор', ?, ?, ?, ?)""",
+        (SEED_CHAT, user_id, _now(), origin, label, text, _json(data), labeled_by))
+    return cur.lastrowid
+
+
+async def sample_link(ids: list[int]) -> None:
+    """Связать записи одного случая: сообщение и профиль его автора.
+
+    Номер случая — id первой записи. Так пару «что написал + кто написал»
+    можно собрать обратно: нужна она и вердикту, и любой будущей модели.
+    """
+    ids = [i for i in ids if i]
+    if len(ids) < 2:
+        return
+    marks = ",".join("?" * len(ids))
+    await _db.execute(f"UPDATE samples SET case_id = ? WHERE id IN ({marks})",
+                      (min(ids), *ids))
+
+
+async def pool_export() -> list[dict]:
+    """Вся копилка случаями: сообщение и профиль автора — одной записью.
+
+    Формат один для любых моделей: поля как есть, метки у сообщения и профиля
+    свои. Строку для rubert, словарь для Laya — собирает уже тот, кто читает.
+    У старых записей полей нет — там одна готовая строка в "text".
+    """
+    origins = POOL_ORIGINS["msg"] + POOL_ORIGINS["prof"]
+    cur = await _db.execute(
+        f"""SELECT * FROM samples WHERE label IN ('spam', 'ok')
+              AND origin IN ({",".join("?" * len(origins))}) ORDER BY id""", origins)
+    cases: dict = {}
+    for r in await cur.fetchall():
+        part = "profile" if r["origin"] in POOL_ORIGINS["prof"] else "message"
+        body = json.loads(r["data"]) if r["data"] else {}
+        body.setdefault("text", r["text"])
+        body["label"] = r["label"]
+        key = r["case_id"] or -r["id"]
+        rec = cases.get(key)
+        if rec is None or part in rec:
+            key = -r["id"] if rec is not None else key
+            rec = cases.setdefault(key, {
+                "id": r["id"], "ts": r["ts"], "source": POOL_SOURCE[r["origin"]],
+                "by": r["labeled_by"], "chat_id": r["chat_id"] or None,
+                "user_id": r["user_id"], "rule": r["feature"]})
+        rec[part] = body
+        rec["by"] = rec["by"] or r["labeled_by"]
+    return list(cases.values())
 
 
 async def seed_commit() -> None:
@@ -2153,41 +2283,6 @@ async def seed_clear() -> int:
     return cur.rowcount or 0
 
 
-async def samples_seed_faces(limit: int, label: str = "spam") -> list[aiosqlite.Row]:
-    """Профили из стартового набора: подмешиваются к своим при сравнении.
-
-    В отличие от текстового набора не отключаются никогда: рекламные профили
-    похожи между собой в любом чате, и живые люди тоже. label='ok' — норма:
-    с ней сравнивают, чтобы не принять живого человека за похожий спам.
-    """
-    cur = await _db.execute(
-        """SELECT * FROM samples WHERE chat_id = ? AND origin = ?
-             AND label = ? ORDER BY id LIMIT ?""",
-        (SEED_CHAT, SEED_ORIGINS["prof"], label, limit))
-    return await cur.fetchall()
-
-
-async def samples_seed(limit: int) -> list[aiosqlite.Row]:
-    """Стартовый набор для подмешивания в профиль молодого чата.
-
-    Берём поровну спама и нормы. Чужие датасеты почти всегда лежат
-    отсортированными по метке — обычный «первые N по id» дал бы одну только
-    норму, и молодой чат научился бы, что спама не существует.
-
-    Отбор всегда один и тот же (по возрастанию id), иначе посчитанные векторы
-    пришлось бы считать заново после каждого перезапуска.
-    """
-    half = max(limit // 2, 1)
-    rows: list[aiosqlite.Row] = []
-    for label in ("spam", "ok"):
-        cur = await _db.execute(
-            """SELECT * FROM samples WHERE chat_id = ? AND origin = ? AND label = ?
-               ORDER BY id LIMIT ?""",
-            (SEED_CHAT, SEED_ORIGINS["msg"], label, half))
-        rows.extend(await cur.fetchall())
-    return rows
-
-
 # ---------- база спам-профилей ----------
 #
 # Профили лежат в той же копилке улик, что и сообщения, с origin='profile'.
@@ -2202,14 +2297,6 @@ async def spam_profiles(chat_id: int) -> list[aiosqlite.Row]:
            WHERE chat_id = ? AND origin = 'profile' AND label = 'spam'
            ORDER BY id DESC""", (chat_id,))
     return await cur.fetchall()
-
-
-async def spam_profile_get(chat_id: int, sample_id: int) -> aiosqlite.Row | None:
-    """Одна запись спам-профиля — для копирования в стартовый набор."""
-    cur = await _db.execute(
-        """SELECT id, user_id, text FROM samples WHERE id = ? AND chat_id = ?
-           AND origin = 'profile' AND label = 'spam'""", (sample_id, chat_id))
-    return await cur.fetchone()
 
 
 async def spam_profile_delete(chat_id: int, sample_id: int) -> aiosqlite.Row | None:
@@ -2252,7 +2339,8 @@ async def samples_unknown(chat_id: int, limit: int = 2000) -> list[aiosqlite.Row
     return await cur.fetchall()
 
 
-async def samples_label_unknown(ids: list[int], label: str) -> int:
+async def samples_label_unknown(ids: list[int], label: str,
+                                labeled_by: int | None = None) -> int:
     """Разметить из пачки только улики без оценки. Сколько разметили.
 
     Кучку складывает смысл текста, а не пометки: рядом с тремя рекламными
@@ -2265,9 +2353,9 @@ async def samples_label_unknown(ids: list[int], label: str) -> int:
         return 0
     marks = ",".join("?" * len(ids))
     cur = await _db.execute(
-        f"""UPDATE samples SET label = ?, origin = 'card'
+        f"""UPDATE samples SET label = ?, origin = 'card', labeled_by = ?
             WHERE id IN ({marks}) AND label = 'unknown' AND origin != 'profile'""",
-        (label, *ids))
+        (label, labeled_by, *ids))
     await _db.commit()
     return cur.rowcount or 0
 
@@ -2284,16 +2372,17 @@ async def samples_by_ids(chat_id: int, ids: list[int]) -> list[aiosqlite.Row]:
     return [rows[i] for i in ids if i in rows]
 
 
-async def sample_set_label(chat_id: int, sample_id: int, label: str) -> bool:
+async def sample_set_label(chat_id: int, sample_id: int, label: str,
+                           labeled_by: int | None = None) -> bool:
     """Поправить оценку одной улики сообщения. False — такой в чате нет.
 
     origin становится 'card': оценку поставил человек, такие при подрезке
     копилки не удаляются. Профили людей здесь не правим — у них свой список.
     """
     cur = await _db.execute(
-        """UPDATE samples SET label = ?, origin = 'card'
+        """UPDATE samples SET label = ?, origin = 'card', labeled_by = ?
            WHERE id = ? AND chat_id = ? AND origin != 'profile'""",
-        (label, sample_id, chat_id))
+        (label, labeled_by, sample_id, chat_id))
     await _db.commit()
     return bool(cur.rowcount)
 

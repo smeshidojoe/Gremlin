@@ -253,6 +253,16 @@ _kicked: dict[tuple[int, int], float] = {}
 _deciding: dict[tuple[int, int], asyncio.Event] = {}
 
 
+def _by_human(actor) -> bool:
+    """Наказал человек, а не чужой бот-модератор.
+
+    По сетке расходится только то, что решил админ: правила Combot и прочих
+    пусть остаются в их чате. Анонимный админ приходит служебным ботом —
+    это тоже человек.
+    """
+    return not actor.is_bot or actor.id in config.SERVICE_IDS
+
+
 def _recent_kick(key: tuple[int, int]) -> bool:
     """Этого только что кикнули — второе обновление не новость.
 
@@ -338,6 +348,9 @@ async def member_updated(update: ChatMemberUpdated, bot: Bot) -> None:
         await db.add_event(
             chat.id, "admin_action", f"снято наказание: {target.full_name} ({target.id}) by {actor.id}"
         )
+        if _by_human(actor):
+            from ..services import net
+            runtime.spawn(net.lift(bot, chat.id, target.id))
         return
 
     if kind is None:
@@ -363,10 +376,17 @@ async def member_updated(update: ChatMemberUpdated, bot: Bot) -> None:
     )
     # чат и человека передаём явно: без них «Забанить» под мутом уходила
     # с k:ban:None:None и падала на нажатии
-    await moderation.send_card(
+    sent = await moderation.send_card(
         bot, chat.id, config.BIT_ADMIN, card, pid, kind, target.id,
         markup=moderation.with_spam_button(
             moderation.card_kb(pid, kind, chat.id, target.id), chat.id, target.id))
+    if _by_human(actor):
+        # срок — сколько осталось по Telegram; без срока мут вечный (0)
+        mute_min = max(1, round((until - time.time()) / 60)) if until else 0
+        from ..services import net
+        runtime.spawn(net.spread_and_note(
+            bot, sent, chat.id, target, "mute", mute_min,
+            "вручную админом чата", actor.id))
 
 
 async def _ban_or_kick(bot: Bot, chat, target, actor) -> None:
@@ -415,10 +435,15 @@ async def _ban_or_kick(bot: Bot, chat, target, actor) -> None:
     )
     await db.add_event(
         chat.id, "admin_action", f"{kind}: {target.full_name} ({target.id}) by {actor.id}")
-    await moderation.send_card(
+    sent = await moderation.send_card(
         bot, chat.id, config.BIT_ADMIN, card, pid, kind, target.id,
         markup=moderation.with_spam_button(
             moderation.card_kb(pid, kind, chat.id, target.id), chat.id, target.id))
+    # кик по сетке не расходится — так же, как у команд
+    if banned and _by_human(actor):
+        from ..services import net
+        runtime.spawn(net.spread_and_note(
+            bot, sent, chat.id, target, "ban", 0, "вручную админом чата", actor.id))
 
 
 # ---------- смена названия чата ----------

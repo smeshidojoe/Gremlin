@@ -88,8 +88,14 @@ async def card_lift(cb: CallbackQuery, bot: Bot) -> None:
         )
     if p is not None:
         # админ отменил наказание — значит это был не спам. Такие улики
-        # ценнее всего: именно на них видно, где правила ошибаются
-        moved = await db.sample_relabel_by_pid(pid, "ok", cb.from_user.id)
+        # ценнее всего: именно на них видно, где правила ошибаются. Нормой
+        # становится весь случай — и сообщение, и профиль автора
+        from ..services import cases
+        moved = await cases.settle(await db.case_of_pid(pid), "ok",
+                                   cb.from_user.id, p["chat_id"])
+        # наказания до случаев: улика без номера случая, ищем по-старому
+        if not moved:
+            moved = await db.sample_relabel_by_pid(pid, "ok", cb.from_user.id)
         if not moved:
             last = await db.sample_last_for(p["chat_id"], p["user_id"])
             if last is not None:
@@ -234,10 +240,14 @@ async def _report_punish(cb: CallbackQuery, bot: Bot, kind: str) -> None:
     if pid is None:
         await cb.answer("Не вышло: у бота нет прав.", show_alert=True)
         return
-    if rec and rec.get("body"):
-        await db.sample_add(chat_id, user_id, "card", "spam", rec["body"],
-                            feature="жалоба", pid=pid)
-        nn.invalidate(chat_id)
+    # сообщение спам — админ посмотрел жалобу и наказал; профиль «не решено»
+    from ..services import cases
+    await cases.record(bot, chat_id, user,
+                       msg_label="spam" if rec and rec.get("body") else None,
+                       prof_label="unknown", origin="card", feature="жалоба",
+                       text=(rec or {}).get("body"), pid=pid,
+                       labeled_by=cb.from_user.id)
+    nn.invalidate(chat_id)
     await db.add_event(chat_id, "report",
                        f"{kind} по жалобе: {user_id} by {cb.from_user.id}")
     word = "Мут выдан" if kind == "mute" else "Забанен"
@@ -330,8 +340,10 @@ async def card_ban(cb: CallbackQuery, bot: Bot) -> None:
     )
     await db.add_event(chat_id, "card", f"бан из карточки: {user_id} by {cb.from_user.id}")
     # человек посмотрел на конкретное сообщение и подтвердил, что это спам
-    from ..services import nn
-    last = await db.sample_last_for(chat_id, user_id)
+    from ..services import cases, nn
+    settled = await cases.settle(await db.case_last_for(chat_id, user_id), "spam",
+                                 cb.from_user.id, chat_id)
+    last = None if settled else await db.sample_last_for(chat_id, user_id)
     if last is not None:
         # улика профиля остаётся профилем: в 'card' она ушла бы в обучение
         # текстовой модели, где строке из имени и описания делать нечего
@@ -354,10 +366,21 @@ async def card_ban(cb: CallbackQuery, bot: Bot) -> None:
 
 # ---------- карточка наблюдения: «не трогать» ----------
 
-@router.callback_query(F.data == "k:wok")
+@router.callback_query(F.data.startswith("k:wok"))
 async def card_watch_ok(cb: CallbackQuery) -> None:
-    # чата наблюдения в кнопке нет — пускаем админов того чата, где карточка
-    if not await may_act(cb, cb.message.chat.id):
+    parts = cb.data.split(":")
+    if len(parts) == 4:
+        chat_id, user_id = int(parts[2]), int(parts[3])
+    else:
+        # старые карточки: чата в кнопке нет — пускаем админов того чата,
+        # где карточка, и исход не пишем, не зная, про кого он
+        chat_id, user_id = cb.message.chat.id, None
+    if not await may_act(cb, chat_id):
         return
+    if user_id is not None:
+        # админ посмотрел и решил: это человек. Нормой становится весь случай
+        from ..services import cases
+        await cases.settle(await db.case_last_for(chat_id, user_id), "ok",
+                           cb.from_user.id, chat_id)
     ok = await _mark(cb, "\n\n🕊 <b>Оставлен под наблюдением</b>")
     await cb.answer("" if ok else "Оставлен под наблюдением")

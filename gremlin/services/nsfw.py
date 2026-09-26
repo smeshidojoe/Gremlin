@@ -19,7 +19,7 @@ import logging
 import os
 import time
 
-from .. import config
+from .. import config, utils
 
 logger = logging.getLogger("gremlin.nsfw")
 
@@ -113,7 +113,7 @@ async def ensure() -> bool:
         return _state == "ok"
     async with _load_lock:
         if _state is None:
-            _state = await asyncio.to_thread(_load_sync)
+            _state = await utils.in_model_thread(_load_sync)
             if _state == "ok":
                 logger.info("классификатор картинок загружен из %s",
                             config.NSFW_MODEL_DIR)
@@ -144,7 +144,7 @@ async def score(raw: bytes) -> int | None:
     try:
         from . import diag
         with diag.step("аватарка"):
-            return await asyncio.to_thread(_score_sync, raw)
+            return await utils.in_model_thread(_score_sync, raw)
     except Exception:
         logger.warning("классификатор не справился с картинкой", exc_info=True)
         return None

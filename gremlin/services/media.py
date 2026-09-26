@@ -80,10 +80,6 @@ def _key(message) -> str | None:
 
 # ---------- картинки ----------
 
-def ocr_ready() -> bool:
-    return _ocr_state() == "ok"
-
-
 _ocr_checked = _MISSING
 
 

@@ -1572,6 +1572,9 @@ async def api_games(request: web.Request) -> web.Response:
         item = {"bit": bit, "label": label, "how": how, "about": about,
                 "on": bool(s.games_on & bit), "admins": bool(s.games_adm & bit),
                 "by_hand": by_hand}
+        if bit == config.GAME_VANISH:
+            item["vanish"] = True
+            item["n"] = s.vanish_n
         if bit == config.GAME_PASTE:
             item["paste"] = True
             item["min"] = s.paste_min
@@ -1590,6 +1593,7 @@ async def api_games(request: web.Request) -> web.Response:
                "mutes": [{"value": m, "label": utils.fmt_minutes(m)}
                          for m in config.MUTE_PRESETS],
                "paste_mins": list(config.PASTE_MIN_PRESETS),
+               "vanish_ns": list(config.VANISH_PRESETS),
                "paste_cds": [{"value": c,
                               "label": utils.fmt_minutes(c) if c else "без паузы"}
                              for c in config.PASTE_CD_PRESETS]})
@@ -1612,6 +1616,17 @@ async def api_game_prize(request: web.Request) -> web.Response:
         if minutes not in config.MUTE_PRESETS:
             raise web.HTTPBadRequest(text="bad minutes")
         await db.set_setting(cid, min_field, minutes)
+    return js({"ok": True})
+
+
+@routes.post("/api/chat/{cid}/games/vanish")
+async def api_game_vanish(request: web.Request) -> web.Response:
+    """Сколько последних сообщений стирает !vanish."""
+    cid = await cid_of(request)
+    value = int((await body(request)).get("n") or 0)
+    if value not in config.VANISH_PRESETS:
+        raise web.HTTPBadRequest(text="bad n")
+    await db.set_setting(cid, "vanish_n", value)
     return js({"ok": True})
 
 

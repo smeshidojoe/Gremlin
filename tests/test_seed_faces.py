@@ -53,7 +53,8 @@ async def test_reshape_keeps_conflicting_labels(database):
 def test_face_hit_needs_to_beat_norm():
     top = config.PROFILE_SIM + 10
     assert nn.face_hit((top, None))
-    assert nn.face_hit((top, top - 1))
+    assert nn.face_hit((top, top - config.PROFILE_MARGIN))
+    assert not nn.face_hit((top, top - 1))          # перевес в пункт — это шум
     assert not nn.face_hit((top, top))              # на норму похож не меньше
     assert not nn.face_hit((config.PROFILE_SIM - 1, None))
     assert not nn.face_hit(None)

@@ -22,8 +22,16 @@ CURRENCIES = (
     ("EUR", "€", "евро"),
     ("CNY", "¥", "юань"),
     ("KZT", "₸", "тенге"),
+    ("UAH", "₴", "грив"),        # основа слова: гривна, гривны, гривен
+    ("MNT", "₮", "тугрик"),
 )
 RUB = "₽"
+# Тугрик стоит пару копеек: «₮1 = 0,02 ₽» ничего не говорит, а округление
+# съедает саму цену. Такие валюты на табло показываем за тысячу.
+BOARD_UNIT = {"MNT": 1000}
+# на табло по умолчанию — только главные; остальные, когда о них спросили
+# («!курс тенге») или когда переводят сумму — тогда видно всё сразу
+MAIN = ("USD", "EUR")
 
 _cache: dict = {"ts": 0.0, "rates": {}, "date": None}
 _lock = asyncio.Lock()
@@ -144,8 +152,17 @@ def parse_amount(text: str) -> tuple[float, str] | None:
     return None
 
 
-async def board() -> str:
-    """Табло курсов: сколько стоит каждая валюта в рублях."""
+def mentioned(text: str) -> str | None:
+    """Какую валюту назвали без суммы: «!курс тенге» -> KZT. None — никакую."""
+    low = text.lower()
+    for cur, sym, name in CURRENCIES:
+        if sym in text or cur.lower() in low or name in low:
+            return cur
+    return None
+
+
+async def board(extra: str | None = None) -> str:
+    """Табло курсов: доллар и евро в рублях, плюс названная валюта, если есть."""
     rates, date, fresh = await fetch()
     if not rates:
         return "💱 Курс сейчас не получить — источник не отвечает."
@@ -153,8 +170,9 @@ async def board() -> str:
     # с курсами в один комок, и глазами его не разобрать
     lines = ["💱 <b>Курс валют</b>", ""]
     for code, sym, _name in CURRENCIES:
-        if code in rates:
-            lines.append(f"{sym}1 = {_money(rates[code])} {RUB}")
+        if code in rates and (code in MAIN or code == extra):
+            unit = BOARD_UNIT.get(code, 1)
+            lines.append(f"{sym}{_money(unit)} = {_money(rates[code] * unit)} {RUB}")
     lines += ["", _footer(date, fresh)]
     return "\n".join(lines)
 

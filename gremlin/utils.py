@@ -1,13 +1,37 @@
 """Мелкие помощники: время, форматирование, упоминания."""
+import asyncio
+import ctypes
 import html
 import re
 import unicodedata
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 from aiogram.types import (
     ChatAdministratorRights, KeyboardButton, KeyboardButtonRequestChat, ReplyKeyboardMarkup,
 )
+
+# Модели (нейрофильтр, картинки) считают в одном своём потоке. Через общий
+# пул прогон каждый раз попадал в новый поток, а у glibc на каждый поток своя
+# куча: после большого прогона память оставалась разбросанной по ним и назад
+# не отдавалась — 1.7 ГБ в покое после пересчёта копилки с пиком 4.1 ГБ.
+_model_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model")
+
+
+async def in_model_thread(fn, *args):
+    """fn(*args) в потоке моделей."""
+    return await asyncio.get_running_loop().run_in_executor(_model_pool, fn, *args)
+
+
+def release_memory() -> None:
+    """Отдать системе освободившуюся память кучи. Есть только у glibc —
+    на других системах молча ничего не делает."""
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
 
 _DUR_RE = re.compile(r"^(\d+)\s*([mмhчdд])$", re.IGNORECASE)
 

@@ -32,11 +32,10 @@ class TrackingMiddleware(BaseMiddleware):
             private = event.message is not None and event.message.chat.type == "private"
         if user is not None and private and not user.is_bot:
             if user.id not in config.ADMIN_IDS:
-                banned = await db.is_bot_banned(user.id)
                 # Список допуска. Пустой = бот доступен только владельцам из
                 # ADMIN_IDS: раньше пустой список означал «открыт всем», и любой
                 # прохожий получал полное меню со всеми чатами.
-                ok = not banned and await db.access_allowed(user.id, user.username)
+                ok = await db.access_allowed(user.id, user.username)
                 if isinstance(event, Message):
                     # Отметка о приходе — до отказа: иначе о тех, кого бот
                     # не пустил, не оставалось вообще ничего. Нажатия кнопок
@@ -45,7 +44,7 @@ class TrackingMiddleware(BaseMiddleware):
                 if not ok:
                     if isinstance(event, CallbackQuery):
                         await event.answer("Доступ к боту закрыт.", show_alert=True)
-                    elif not banned:
+                    else:
                         await event.answer(_DENIED)
                     return None
             await db.track_user(user.id, user.username, user.first_name)

@@ -1416,9 +1416,11 @@ async def view_games(cid: int) -> tuple[str, InlineKeyboardMarkup]:
             prize_line = f" · от <b>{s.paste_min}</b> знаков"
             if s.paste_cd:
                 prize_line += f" · не чаще раза в {utils.fmt_minutes(s.paste_cd)}"
+        if bit == config.GAME_VANISH:
+            prize_line = f" · стирает <b>{s.vanish_n}</b>"
         lines.append(
             f"{'✅' if on else '🚫'} <b>{label}</b> · <code>{how}</code>"
-            + (" · только админы" if on and adm and by_hand else "")
+            + (" · только админы" if on and adm and bit in config.GAME_CALLED else "")
             + prize_line
             + f"\n<i>{about}</i>\n"
         )
@@ -1438,6 +1440,9 @@ async def view_games(cid: int) -> tuple[str, InlineKeyboardMarkup]:
                                else "без паузы"), f"u:pcd:{cid}"))
             b.row(_btn(f"{'✏️' if paste_n else '⚠️'} Заготовки ответов: {paste_n}",
                        f"u:an:{cid}:p:{cid}:0"))
+        elif bit == config.GAME_VANISH:
+            b.row(toggle, _btn("🛡 админы" if adm else "👥 все", f"u:ga:{cid}:{bit}"),
+                  _btn(f"🧹 {s.vanish_n}", f"u:vn:{cid}"))
         else:
             b.row(toggle)
     b.row(_btn("⬅️ Назад", f"u:c:{cid}"))
@@ -1553,6 +1558,11 @@ async def cb_paste_min(cb: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("u:pcd:"))
 async def cb_paste_cd(cb: CallbackQuery) -> None:
     await _paste_cycle(cb, "paste_cd", config.PASTE_CD_PRESETS)
+
+
+@router.callback_query(F.data.startswith("u:vn:"))
+async def cb_vanish_n(cb: CallbackQuery) -> None:
+    await _paste_cycle(cb, "vanish_n", config.VANISH_PRESETS)
 
 
 @router.callback_query(F.data.startswith("u:ga:"))
@@ -2209,8 +2219,6 @@ async def _drop_reply_kb(message: Message) -> None:
 @router.message(CommandStart())
 @router.message(Command("menu"))
 async def cmd_menu(message: Message, state: FSMContext, bot: Bot) -> None:
-    if await db.is_bot_banned(message.from_user.id):
-        return
     # клавиатуру пикера снимаем только если она реально могла остаться —
     # иначе на каждый /start мелькала бы пустышка
     if await state.get_state() == Input.pick_log.state:

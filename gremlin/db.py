@@ -70,7 +70,9 @@ CREATE TABLE IF NOT EXISTS verdicts(
     was      TEXT,                   -- что на самом деле сделали старые правила
     families TEXT,                   -- json: семья -> очки
     signals  TEXT,                   -- json: список улик
-    text     TEXT
+    text     TEXT,
+    case_id  INTEGER,                -- случай в копилке: по нему виден исход
+    learned  INTEGER                 -- обученная оценка (services/score.py), тень
 );
 CREATE INDEX IF NOT EXISTS idx_verdicts_chat ON verdicts(chat_id, ts);
 CREATE TABLE IF NOT EXISTS nets(
@@ -186,6 +188,7 @@ CREATE TABLE IF NOT EXISTS settings(
     court_min       INTEGER NOT NULL DEFAULT 15,
     paste_min       INTEGER NOT NULL DEFAULT 1000,
     paste_cd        INTEGER NOT NULL DEFAULT 15,
+    vanish_n        INTEGER NOT NULL DEFAULT 10,
     nn_mode         INTEGER NOT NULL DEFAULT 1,
     nn_threshold    INTEGER NOT NULL DEFAULT 85,
     sem_on          INTEGER NOT NULL DEFAULT 0,
@@ -402,8 +405,7 @@ CREATE TABLE IF NOT EXISTS users(
     username   TEXT,
     first_name TEXT,
     first_seen INTEGER,
-    last_seen  INTEGER,
-    banned     INTEGER NOT NULL DEFAULT 0
+    last_seen  INTEGER
 );
 -- Кто приходил к боту в личку или звал его к себе в чат. Строка на человека,
 -- а не на сообщение: важно, кто заглядывал и чем кончилось. В users такие
@@ -543,6 +545,7 @@ class Settings:
     court_min: int = 15
     paste_min: int = 1000
     paste_cd: int = 15
+    vanish_n: int = 10
     nn_mode: int = 1
     nn_threshold: int = 85
     sem_on: int = 0
@@ -703,6 +706,7 @@ _SETTINGS_MIGRATIONS = {
     "court_min": "INTEGER NOT NULL DEFAULT 15",
     "paste_min": "INTEGER NOT NULL DEFAULT 1000",
     "paste_cd": "INTEGER NOT NULL DEFAULT 15",
+    "vanish_n": "INTEGER NOT NULL DEFAULT 10",
     "links_guest_punish": "TEXT NOT NULL DEFAULT 'delete'",
     "links_guest_mute_min": "INTEGER NOT NULL DEFAULT 60",
     "lp_tg": "TEXT NOT NULL DEFAULT 'delete'",
@@ -752,6 +756,7 @@ _TABLE_MIGRATIONS = {
                        "score_ts": "INTEGER NOT NULL DEFAULT 0",
                        "card_score": "INTEGER NOT NULL DEFAULT 0"},
     "samples": {"data": "TEXT", "case_id": "INTEGER", "labeled_by": "INTEGER"},
+    "verdicts": {"case_id": "INTEGER", "learned": "INTEGER"},
 }
 
 
@@ -878,7 +883,29 @@ async def _migrate() -> None:
     if await cur.fetchone() is None:
         await _db.execute("UPDATE settings SET extlinks_on = 1")
         await _db.execute("INSERT INTO kv (k, v) VALUES ('mig_extlinks_on', '1')")
+
+    # остатки убранных функций: ИИ-собеседник (настройки ai_* и таблица lore
+    # с его ролевыми подсказками), ограничение для жалоб и исходное сообщение
+    # триггера. Код их давно не читает, а в каждом бэкапе они ехали дальше
+    for table, cols in _DROPPED_COLUMNS.items():
+        cur = await _db.execute(f"PRAGMA table_info({table})")
+        have = {r["name"] for r in await cur.fetchall()}
+        for col in cols:
+            if col in have:
+                await _db.execute(f"ALTER TABLE {table} DROP COLUMN {col}")
+    await _db.execute("DROP TABLE IF EXISTS lore")
     await _db.commit()
+
+
+# колонки удалённых функций: чистятся при старте, если ещё остались
+_DROPPED_COLUMNS = {
+    "settings": ("ai_on", "ai_persona", "ai_random", "ai_ctx", "ai_daily",
+                 "ai_names", "ai_free", "ai_len", "report_restrict"),
+    "triggers": ("src_msg",),
+    # «заблокирован в боте»: выставить было нечем, а личку и так закрывает
+    # список допуска
+    "users": ("banned",),
+}
 
 
 def _healthy(path: str) -> bool:
@@ -1070,21 +1097,9 @@ async def migrate_chat(old_id: int, new_id: int) -> bool:
     return True
 
 
-async def set_owner(chat_id: int, owner_id: int) -> None:
-    await _db.execute("UPDATE chats SET owner_id = ? WHERE chat_id = ?", (owner_id, chat_id))
-    await _db.commit()
-
-
 async def get_chat(chat_id: int) -> aiosqlite.Row | None:
     cur = await _db.execute("SELECT * FROM chats WHERE chat_id = ?", (chat_id,))
     return await cur.fetchone()
-
-
-async def chats_of(owner_id: int) -> list[aiosqlite.Row]:
-    cur = await _db.execute(
-        "SELECT * FROM chats WHERE owner_id = ? AND active = 1 ORDER BY added_at", (owner_id,)
-    )
-    return await cur.fetchall()
 
 
 async def all_chats(active_only: bool = False) -> list[aiosqlite.Row]:
@@ -1473,11 +1488,6 @@ async def forgiven_get(row_id: int) -> aiosqlite.Row | None:
 
 async def forgiven_remove(row_id: int) -> None:
     await _db.execute("DELETE FROM forgiven WHERE id = ?", (row_id,))
-    await _db.commit()
-
-
-async def forgiven_clear(chat_id: int) -> None:
-    await _db.execute("DELETE FROM forgiven WHERE chat_id = ?", (chat_id,))
     await _db.commit()
 
 
@@ -2228,6 +2238,128 @@ async def sample_link(ids: list[int]) -> None:
                       (min(ids), *ids))
 
 
+# ---------- случаи: сообщение, профиль и чем кончилось ----------
+#
+# Случай пишет services/cases.py при каждом решении бота или админа. Исход
+# ставится на весь случай разом: сняли наказание — нормой становится и
+# сообщение, и профиль; бан из карточки — оба спам.
+
+async def case_link(case_id: int, ids: list[int]) -> None:
+    """Записи одного случая — под одним номером, даже если запись одна."""
+    ids = [i for i in ids if i]
+    if not ids:
+        return
+    marks = ",".join("?" * len(ids))
+    await _db.execute(f"UPDATE samples SET case_id = ? WHERE id IN ({marks})",
+                      (case_id, *ids))
+    await _db.commit()
+
+
+async def case_of_pid(pid: int) -> int | None:
+    cur = await _db.execute(
+        "SELECT case_id FROM samples WHERE pid = ? AND case_id IS NOT NULL "
+        "ORDER BY id DESC LIMIT 1", (pid,))
+    row = await cur.fetchone()
+    return row["case_id"] if row else None
+
+
+async def case_last_for(chat_id: int, user_id: int, within: int = 3 * 86400) -> int | None:
+    """Последний случай по человеку в чате — к нему идут кнопки карточки
+    наблюдения: наказания там нет, искать больше не по чему. Случайные
+    образцы нормы не в счёт: карточка была не про них."""
+    cur = await _db.execute(
+        """SELECT case_id FROM samples WHERE chat_id = ? AND user_id = ?
+             AND case_id IS NOT NULL AND origin != 'random' AND ts > ?
+           ORDER BY id DESC LIMIT 1""",
+        (chat_id, user_id, _now() - within))
+    row = await cur.fetchone()
+    return row["case_id"] if row else None
+
+
+async def case_label(case_id: int, label: str, labeled_by: int | None) -> int:
+    """Исход всего случая. Сколько записей переметили.
+
+    Сообщение уходит в 'card' — размечено человеком, и 'manual' иначе так
+    и остался бы вне копилки. Профиль остаётся 'profile': это адрес, по
+    которому его находит сравнение профилей.
+    """
+    cur = await _db.execute(
+        """UPDATE samples SET label = ?, labeled_by = ?,
+               origin = CASE WHEN origin = 'profile' THEN 'profile' ELSE 'card' END
+           WHERE case_id = ?""", (label, labeled_by, case_id))
+    await _db.commit()
+    return cur.rowcount or 0
+
+
+REVIEW_DAYS = 30      # старше — в очередь разбора не берём: помнишь уже плохо
+
+
+def _review_sql(extra: str = "") -> str:
+    """Случаи для очереди разбора: есть «не решено», человек ещё не смотрел."""
+    return f"""SELECT case_id FROM samples
+               WHERE case_id IS NOT NULL AND chat_id != 0 AND ts > ? {extra}
+               GROUP BY case_id
+               HAVING SUM(label = 'unknown') > 0 AND SUM(labeled_by IS NOT NULL) = 0"""
+
+
+async def review_next(before: int | None = None) -> int | None:
+    """Следующий случай очереди — самый свежий, либо старше before."""
+    extra = "AND case_id < ?" if before else ""
+    args = (_now() - REVIEW_DAYS * 86400, *((before,) if before else ()))
+    cur = await _db.execute(_review_sql(extra) + " ORDER BY case_id DESC LIMIT 1", args)
+    row = await cur.fetchone()
+    return row["case_id"] if row else None
+
+
+async def review_count() -> int:
+    cur = await _db.execute(f"SELECT COUNT(*) FROM ({_review_sql()})",
+                            (_now() - REVIEW_DAYS * 86400,))
+    return (await cur.fetchone())[0]
+
+
+async def case_parts(case_id: int) -> list[aiosqlite.Row]:
+    cur = await _db.execute("SELECT * FROM samples WHERE case_id = ? ORDER BY id",
+                            (case_id,))
+    return await cur.fetchall()
+
+
+async def case_label_parts(case_id: int, msg_label: str | None,
+                           prof_label: str | None, labeled_by: int) -> None:
+    """Метки частей случая по отдельности. None — эту часть не трогаем.
+
+    Сообщение, размеченное человеком, уходит в 'card' (иначе 'manual' так и
+    остался бы вне копилки), профиль остаётся 'profile'.
+    """
+    if msg_label:
+        await _db.execute(
+            """UPDATE samples SET label = ?, labeled_by = ?, origin = 'card'
+               WHERE case_id = ? AND origin != 'profile'""",
+            (msg_label, labeled_by, case_id))
+    if prof_label:
+        await _db.execute(
+            """UPDATE samples SET label = ?, labeled_by = ?
+               WHERE case_id = ? AND origin = 'profile'""",
+            (prof_label, labeled_by, case_id))
+    await _db.commit()
+
+
+async def verdict_attach(chat_id: int, user_id: int, case_id: int,
+                         learned: int | None = None, within: int = 300) -> None:
+    """Привязать к случаю последний вердикт по человеку.
+
+    Вердикт считается в том же проходе, что и решение, чуть раньше записи
+    случая. Связь нужна единой оценке: у вердикта есть признаки, у случая —
+    исход, вместе это готовый пример для обучения. learned — что сказала
+    бы обученная оценка; пишется рядом, решает пока не она.
+    """
+    await _db.execute(
+        """UPDATE verdicts SET case_id = ?, learned = ? WHERE id = (
+               SELECT id FROM verdicts WHERE chat_id = ? AND user_id = ?
+                 AND ts > ? AND case_id IS NULL ORDER BY id DESC LIMIT 1)""",
+        (case_id, learned, chat_id, user_id, _now() - within))
+    await _db.commit()
+
+
 async def pool_export() -> list[dict]:
     """Вся копилка случаями: сообщение и профиль автора — одной записью.
 
@@ -2387,22 +2519,6 @@ async def sample_set_label(chat_id: int, sample_id: int, label: str,
     return bool(cur.rowcount)
 
 
-async def samples_relabel_many(ids: list[int], label: str) -> int:
-    """Разметить пачку улик разом — по итогам разбивки на кучки.
-
-    origin становится 'card': оценку поставил человек, а такие мы не удаляем
-    при подрезке копилки.
-    """
-    if not ids:
-        return 0
-    marks = ",".join("?" * len(ids))
-    cur = await _db.execute(
-        f"UPDATE samples SET label = ?, origin = 'card' WHERE id IN ({marks})",
-        (label, *ids))
-    await _db.commit()
-    return cur.rowcount or 0
-
-
 async def sample_by_id(sample_id: int):
     cur = await _db.execute("SELECT * FROM samples WHERE id = ?", (sample_id,))
     return await cur.fetchone()
@@ -2525,22 +2641,6 @@ async def get_user(user_id: int) -> aiosqlite.Row | None:
     return await cur.fetchone()
 
 
-async def all_users() -> list[aiosqlite.Row]:
-    cur = await _db.execute("SELECT * FROM users ORDER BY first_seen")
-    return await cur.fetchall()
-
-
-async def set_bot_ban(user_id: int, banned: bool) -> None:
-    await _db.execute("UPDATE users SET banned = ? WHERE user_id = ?", (int(banned), user_id))
-    await _db.commit()
-
-
-async def is_bot_banned(user_id: int) -> bool:
-    cur = await _db.execute("SELECT banned FROM users WHERE user_id = ?", (user_id,))
-    row = await cur.fetchone()
-    return bool(row and row["banned"])
-
-
 # ---------- триггеры ----------
 
 # ---------- варианты ответов (общие для триггеров и счётчиков) ----------
@@ -2635,15 +2735,6 @@ async def ans_remove(row_id: int) -> None:
 async def ans_clear(owner: str, owner_id: int) -> None:
     for r in await ans_list(owner, owner_id):
         await ans_remove(r["id"])
-
-
-async def trig_find(chat_id: int, phrase: str):
-    """Триггер с такой же фразой. Второй такой не нужен: сработает всё равно
-    первый, а в списке будут висеть две одинаковые строки."""
-    cur = await _db.execute(
-        "SELECT * FROM triggers WHERE chat_id = ? AND phrase = ?",
-        (chat_id, phrase.strip().lower()))
-    return await cur.fetchone()
 
 
 async def trig_add(chat_id: int, phrase: str, text: str | None,

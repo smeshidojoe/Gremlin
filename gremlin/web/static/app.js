@@ -1447,6 +1447,11 @@ async function gamesView(cid) {
         <button class="chip" data-act="game-kind" data-bit="${g.bit}">🔨 ${esc(g.kind === 'ban' ? 'бан' : 'мут')}</button>
         ${g.kind === 'mute' ? `<button class="chip" data-act="game-min" data-bit="${g.bit}">⏰ ${esc(g.prize.replace('мут на ', ''))}</button>` : ''}
       </div>` : ''}
+      ${g.vanish ? `<div class="wrap" style="margin-top:10px">
+        <button class="chip ${g.admins ? 'on' : ''}" data-act="game-who" data-bit="${g.bit}">
+          ${g.admins ? '🛡 только админы' : '👥 все'}</button>
+        <button class="chip" data-act="vanish-n">🧹 стирает ${g.n}</button>
+      </div>` : ''}
       ${g.paste ? `<div class="wrap" style="margin-top:10px">
         <button class="chip" data-act="paste-min">📏 от ${g.min} знаков</button>
         <button class="chip" data-act="paste-cd">⏰ ${esc(g.cd_label)}</button>
@@ -2449,6 +2454,15 @@ const ACT = {
       options: d.paste_mins.map((n) => ({ value: n, label: `${n} знаков` })) });
     if (v === null) return;
     await api(`/chat/${curChat()}/games/paste`, { json: { min: +v } });
+    render();
+  },
+
+  async 'vanish-n'() {
+    const d = await api(`/chat/${curChat()}/games`);
+    const v = await pick({ title: 'Сколько сообщений стирать',
+      options: d.vanish_ns.map((n) => ({ value: n, label: `${n} последних` })) });
+    if (v === null) return;
+    await api(`/chat/${curChat()}/games/vanish`, { json: { n: +v } });
     render();
   },
 

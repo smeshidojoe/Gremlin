@@ -204,11 +204,14 @@ async def _handle_bot_spam(bot: Bot, chat_id: int, message, sender) -> None:
         lines.append("👤 Позвавшего найти не удалось")
         uid = None
 
-    if s.nn_mode:
-        await db.sample_add(chat_id, uid, "auto", "spam",
-                            getattr(message, "text", "") or "",
-                            feature="спам-бот",
-                            extra="\n".join(_button_urls(message)) or None, pid=pid)
+    # сообщение стороннего бота — спам; профиль позвавшего «не решено»:
+    # позвать инлайн-бота мог и обычный участник, не понимая, что это
+    from .services import cases, net
+    caller_user = await net.user_stub(uid) if uid else None
+    await cases.record(bot, chat_id, caller_user, msg_label="spam",
+                       prof_label="unknown" if uid else None, origin="auto",
+                       feature="спам-бот", text=getattr(message, "text", "") or "",
+                       pid=pid, facts={"buttons": _button_urls(message)})
     await db.add_event(chat_id, "watch", f"спам-бот @{bot_uname} ({score}) — {why}")
     sent = await moderation.send_card(
         bot, chat_id, config.BIT_WATCH, "\n".join(lines) + body,

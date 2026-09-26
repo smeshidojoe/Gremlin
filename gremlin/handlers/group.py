@@ -213,15 +213,13 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
 
     # Ручное наказание тоже запоминаем, но помечаем «unknown»: причины у людей
     # свои, к тексту сообщения они часто отношения не имеют, и учить на этом
-    # модель — верный способ научить её ерунде.
-    if s.nn_mode and message.reply_to_message is not None:
-        await db.sample_add(
-            message.chat.id, target.id, "manual", "unknown",
-            message.reply_to_message.text or message.reply_to_message.caption or "",
-            feature=kind,
-            extra="\n".join(moderation._buttons(message.reply_to_message)) or None,
-            pid=pid,
-        )
+    # модель — верный способ научить её ерунде. Случай пишем целиком, с
+    # профилем: кнопка на карточке потом решит, спам это или нет.
+    from ..services import cases
+    await cases.record(bot, message.chat.id, target,
+                       msg_label="unknown" if message.reply_to_message else None,
+                       prof_label="unknown", origin="manual", feature=kind,
+                       message=message.reply_to_message, pid=pid)
 
     # кик показываем как действие админа: отменять там нечего, и в биты
     # «баны/муты» он не укладывается
@@ -885,7 +883,10 @@ async def fire_rates(bot: Bot, message: Message, s) -> bool:
     from ..services import rates
     body = text.split(maxsplit=1)[1] if " " in text else ""
     amount = rates.parse_amount(body) if body else None
-    answer = (await rates.convert(*amount)) if amount else (await rates.board())
+    if amount:
+        answer = await rates.convert(*amount)          # перевод суммы — во все валюты
+    else:
+        answer = await rates.board(rates.mentioned(body))
     try:
         await message.reply(answer)
     except Exception as e:
@@ -1578,10 +1579,9 @@ async def moderate(message: Message, bot: Bot) -> None:
 
     # Сообщение прошло всю модерацию — изредка берём такое как образец нормы.
     # Без отрицательных примеров сравнивать не с чем: всё будет «похоже на спам».
-    if s.nn_mode and random.randrange(config.SAMPLE_RANDOM_EVERY) == 0:
-        await db.sample_add(chat.id, user.id, "random", "ok",
-                            " ".join(filter(None, [message.text or message.caption or "",
-                                                   seen])))
+    if random.randrange(config.SAMPLE_RANDOM_EVERY) == 0:
+        from ..services import cases
+        await cases.norm_sample(bot, message)
 
     # --- триггеры (последними: на удалённое модерацией не отвечаем) ---
     # игры зовём здесь, а не отдельным хендлером: иначе сообщение с командой

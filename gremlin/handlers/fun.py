@@ -218,9 +218,6 @@ async def _candidates(bot: Bot, chat_id: int) -> list[int]:
         if (uid in admins or uid == me or uid in config.ADMIN_IDS or uid < 0
                 or uid in config.SERVICE_IDS):
             continue
-        row = await db.get_user(uid)
-        if row and row["banned"]:
-            continue
         out.append(uid)
     return out
 

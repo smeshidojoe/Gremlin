@@ -26,7 +26,10 @@ logger = logging.getLogger("gremlin.nn")
 MAX_TOKENS = 256          # длиннее не нужно: спам весь в первых строках
 PROFILE_TTL = 300         # как часто перечитываем улики из базы
 TOP_K = 5                 # сколько соседей голосует
-VEC_BATCH = 64            # столько текстов считаем за один прогон модели
+# столько текстов считаем за один прогон модели. Больше не быстрее: поток
+# один, а память на пачку растёт вместе с ней — при 64 пересчёт копилки
+# поднимал процесс до 4 ГБ
+VEC_BATCH = 16
 
 _sess = None              # onnxruntime.InferenceSession
 _tok = None               # tokenizers.Tokenizer
@@ -90,7 +93,7 @@ async def ensure() -> bool:
         return _state == "ok"
     async with _load_lock:
         if _state is None:
-            _state = await asyncio.to_thread(_load_sync)
+            _state = await utils.in_model_thread(_load_sync)
             if _state == "ok":
                 logger.info("нейрофильтр загружен из %s", config.NN_MODEL_DIR)
             else:
@@ -122,15 +125,26 @@ def _embed_sync(texts: list[str]):
 
 
 async def embed(texts: list[str]):
-    """Векторы пачкой. Модель синхронная, поэтому уводим её в поток."""
+    """Векторы пачкой. Модель синхронная, поэтому уводим её в поток моделей.
+
+    Тексты считаем по длине: пачка дополняется до самого длинного в ней, и
+    один длинный профиль раздувал до 256 токенов всю пачку коротких реплик.
+    """
     if not texts:
         return None
+    from . import diag
+    order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
     chunks = []
-    for i in range(0, len(texts), VEC_BATCH):
-        from . import diag
+    for i in range(0, len(order), VEC_BATCH):
+        part = [texts[j] for j in order[i:i + VEC_BATCH]]
         with diag.step("нейросеть"):
-            chunks.append(await asyncio.to_thread(_embed_sync, texts[i:i + VEC_BATCH]))
-    return _np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+            chunks.append(await utils.in_model_thread(_embed_sync, part))
+    if len(chunks) == 1:
+        return chunks[0][_np.argsort(order)]
+    vecs = _np.empty((len(texts), chunks[0].shape[1]), dtype=chunks[0].dtype)
+    vecs[order] = _np.concatenate(chunks)
+    utils.release_memory()
+    return vecs
 
 
 # Копилка одна на все чаты (см. db.samples_pool), и модель по ней одна:
@@ -167,7 +181,7 @@ async def _build_profile():
     matrix = _np.stack([vecs[i] for i in ids])
     weights = None
     if len(ids) >= config.NN_LOGREG_MIN:
-        weights = await asyncio.to_thread(_fit, matrix, labels)
+        weights = await utils.in_model_thread(_fit, matrix, labels)
     logger.debug("копилка: %d улик, регрессия %s", len(ids),
                  "есть" if weights else "рано")
     return matrix, labels, ids, weights
@@ -306,24 +320,6 @@ def shadow_path(chat_id: int) -> str:
     и в имени файла только мешало бы.
     """
     return os.path.join(config.NN_LOG_DIR, f"{chat_id}.log")
-
-
-def shadow_files() -> list[tuple[int, int]]:
-    """Что уже накопилось: [(chat_id, размер в байтах)] — для меню."""
-    out = []
-    try:
-        for name in os.listdir(config.NN_LOG_DIR):
-            if not name.endswith(".log"):
-                continue
-            try:
-                cid = int(name[:-4])
-            except ValueError:
-                continue
-            out.append((cid, os.path.getsize(
-                os.path.join(config.NN_LOG_DIR, name))))
-    except OSError:
-        return []
-    return sorted(out, key=lambda x: -x[1])
 
 
 def _append(chat_id: int, line: str) -> None:
@@ -525,7 +521,7 @@ async def clusters(chat_id: int, scope: str = "unknown", k: int | None = None):
 
     ids = [r["id"] for r in rows]
     matrix = _np.stack([known[i] for i in ids])
-    assign, centers = await asyncio.to_thread(
+    assign, centers = await utils.in_model_thread(
         _kmeans, matrix, k or config.NN_CLUSTERS)
 
     out, buckets = [], []
@@ -761,11 +757,11 @@ async def face_score(chat_id: int, name: str) -> tuple[int, int | None] | None:
 
 
 def face_hit(got: tuple[int, int | None] | None) -> bool:
-    """Попадание: похож на спам не меньше порога и сильнее, чем на норму."""
+    """Попадание: похож на спам не меньше порога и заметно сильнее, чем на норму."""
     if got is None:
         return False
     spam, ok = got
-    return spam >= config.PROFILE_SIM and (ok is None or spam > ok)
+    return spam >= config.PROFILE_SIM and (ok is None or spam - ok >= config.PROFILE_MARGIN)
 
 
 def face_note(got: tuple[int, int | None]) -> str:
@@ -866,6 +862,10 @@ async def keeper() -> None:
                         await db.sample_set_vec(r["id"], v.astype(_np.float32).tobytes())
                     logger.info("посчитано векторов: %d", len(rows))
                     invalidate()
+            # обученная оценка: веса по свежим исходам. Пока случаев мало,
+            # retrain сам откажется и скажет, скольких не хватает
+            from . import score
+            logger.info("обученная оценка: %s", await score.retrain())
         except asyncio.CancelledError:
             raise
         except Exception:

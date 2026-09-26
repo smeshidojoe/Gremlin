@@ -1,4 +1,4 @@
-"""Курс валют: разбор ответа ЦБ (с номиналами), тенге, оформление ответа."""
+"""Курс валют: разбор ответа ЦБ (с номиналами), тенге, гривна, тугрик, оформление."""
 import time
 
 import pytest
@@ -11,6 +11,8 @@ XML = """<?xml version="1.0" encoding="windows-1251"?>
 <Valute><CharCode>EUR</CharCode><Nominal>1</Nominal><Value>98,7654</Value></Valute>
 <Valute><CharCode>CNY</CharCode><Nominal>10</Nominal><Value>118,32</Value></Valute>
 <Valute><CharCode>KZT</CharCode><Nominal>100</Nominal><Value>15,6789</Value></Valute>
+<Valute><CharCode>UAH</CharCode><Nominal>10</Nominal><Value>18,8088</Value></Valute>
+<Valute><CharCode>MNT</CharCode><Nominal>1000</Nominal><Value>23,4571</Value></Valute>
 </ValCurs>""".encode("cp1251")
 
 
@@ -29,14 +31,27 @@ def test_nominal_is_divided():
     assert got["KZT"] == pytest.approx(0.156789)
 
 
-async def test_board_has_tenge_and_blank_lines(cached):
-    text = await rates.board()
-    lines = text.split("\n")
+async def test_board_shows_main_and_blank_lines(cached):
+    lines = (await rates.board()).split("\n")
     assert lines[0] == "💱 <b>Курс валют</b>"
     assert lines[1] == ""                      # абзац после заголовка
-    assert any(line.startswith("₸1 = ") for line in lines)
-    assert lines[-2] == ""                     # абзац перед подписью ЦБ
+    assert lines[2:4] == ["$1 = 84,5 ₽", "€1 = 98,77 ₽"]
+    assert lines[4] == ""                      # остальных без спроса нет
     assert "курс ЦБ на 08.09.2026" in lines[-1]
+
+
+async def test_board_adds_named_currency(cached):
+    assert "₸1 = 0,16 ₽" in (await rates.board(rates.mentioned("тенге"))).split("\n")
+    assert "₴1 = 1,88 ₽" in (await rates.board(rates.mentioned("гривна"))).split("\n")
+    # тугрик за тысячу: «₮1 = 0,02 ₽» ничего не говорит
+    assert "₮1 000 = 23,46 ₽" in (await rates.board(rates.mentioned("тугрик"))).split("\n")
+    assert rates.mentioned("что там") is None
+
+
+async def test_convert_lists_all(cached):
+    text = await rates.convert(100, "USD")
+    for sym in ("₽", "€", "¥", "₸", "₴", "₮"):
+        assert sym in text
 
 
 async def test_convert_tenge(cached):
@@ -51,6 +66,10 @@ async def test_convert_tenge(cached):
     ("300 kzt", (300.0, "KZT")),
     ("100$", (100.0, "USD")),
     ("5000", (5000.0, "RUB")),
+    ("200 гривен", (200.0, "UAH")),
+    ("50 гривны", (50.0, "UAH")),
+    ("10000 тугриков", (10000.0, "MNT")),
+    ("300₮", (300.0, "MNT")),
 ])
 def test_parse_amount(raw, want):
     assert rates.parse_amount(raw) == want

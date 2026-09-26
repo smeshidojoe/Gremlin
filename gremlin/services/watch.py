@@ -445,7 +445,7 @@ async def photo_points(bot, chat_id: int, user, settings,
 async def _profile_punish(bot, chat, user, settings, message, data, why) -> bool:
     """Режим «наказывать»: удалить сообщение и выдать наказание. True — выдали."""
     from .. import config, db, utils
-    from . import moderation, nn
+    from . import moderation
 
     kind = settings.prof_punish
     if message is not None:
@@ -471,10 +471,12 @@ async def _profile_punish(bot, chat, user, settings, message, data, why) -> bool
     )
     await db.add_event(chat.id, "watch",
                        f"профиль: {user.full_name} ({user.id}) — {why}")
-    if kind == "ban" and settings.watch_nn:
-        # такой профиль пригодится: следующий похожий узнается сразу
-        await nn.remember_face(chat.id, user.id, prof_svc.face_text(user, data),
-                               "spam", prof_svc.fields_of(user, data))
+    # профиль спам — за него и наказали; сообщение «не решено»: под постом
+    # такие аккаунты пишут обычную реплику по теме, вся реклама в профиле
+    from . import cases
+    await cases.record(bot, chat.id, user, msg_label="unknown", prof_label="spam",
+                       origin="auto", feature="профиль", message=message, pid=pid,
+                       pdata=data, facts={"why": why})
     await moderation.send_card(bot, chat.id, config.BIT_WATCH, card, pid,
                                kind if kind != "delete" else None, user.id)
     return True
@@ -763,6 +765,11 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None,
 
     who = utils.mention(user.id, user.full_name, user.username)
     why = ", ".join(reasons)
+    # очки наблюдения — признаки случая: по ним единая оценка потом и учится
+    facts = {"watch": {"name": p_hard, "name_cos": p_cos, "msg": hard,
+                       "msg_cos": cosmetic, "saved": saved, "profile": prof_pts,
+                       "cas": cas_pts, "face": face_sim, "nn": nn_hit,
+                       "total": total, "event": event}}
 
     # автобан по порогу
     if ban_at and total >= ban_at:
@@ -780,10 +787,13 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None,
             f"🤖 Кем: Gremlin (автомод)" + body_gone
         )
         await db.add_event(chat.id, "watch", f"ban: {user.full_name} ({user.id}) — {why} ({total})")
-        if settings.watch_nn:
-            from . import nn
-            await nn.remember_face(chat.id, user.id, face, "spam",
-                                   prof_svc.fields_of(user, pdata))
+        # профиль спам: наблюдение судит аккаунт целиком. Сообщение — только
+        # если тревожное было в нём самом, иначе оно просто оказалось рядом
+        from . import cases
+        await cases.record(bot, chat.id, user,
+                           msg_label="spam" if hard else "unknown", prof_label="spam",
+                           origin="auto", feature="наблюдение", message=message,
+                           pid=pid, pdata=pdata, facts=facts)
         await moderation.send_card(bot, chat.id, config.BIT_WATCH, card, pid, "ban", user.id)
         return
 
@@ -804,10 +814,15 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None,
         + body
     )
     await db.add_event(chat.id, "watch", f"suspect: {user.full_name} ({user.id}) — {why} ({total})")
+    # случай ждёт исхода: «Забанить» сделает его спамом, «Не трогать» — нормой
+    from . import cases
+    await cases.record(bot, chat.id, user, msg_label="unknown" if message else None,
+                       prof_label="unknown", origin="auto", feature="наблюдение",
+                       message=message, pdata=pdata, facts=facts)
     from aiogram.utils.keyboard import InlineKeyboardBuilder
     b = InlineKeyboardBuilder()
     b.button(text="⛔ Забанить", callback_data=f"k:ban:{chat.id}:{user.id}")
-    b.button(text="🕊 Не трогать", callback_data="k:wok")
+    b.button(text="🕊 Не трогать", callback_data=f"k:wok:{chat.id}:{user.id}")
     b.adjust(2)
     # через send_card: он сам сверится с настройками карточек, отправит копию
     # в глобальный лог и свяжет обе, чтобы кнопки гасли разом

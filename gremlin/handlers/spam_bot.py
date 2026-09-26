@@ -107,6 +107,8 @@ HELP = (
     "заполняете что знаете, лишние строки удаляете.\n\n"
     "/режим — сообщения или профили\n"
     "/стат — сколько уже собрано\n"
+    "/разбор — случаи из чатов, про которые бот не знает, спам ли это: "
+    "по одному, кнопкой\n"
     "/экспорт — выгрузить копилку файлом JSONL. Такой же файл, присланный "
     "сюда, загружается обратно."
 )
@@ -195,6 +197,120 @@ async def cmd_export(message: Message) -> None:
     await message.answer_document(
         BufferedInputFile(buf.getvalue().encode("utf-8"), filename=name),
         caption=f"Случаев: {len(records)}. Пришлите такой файл сюда — загружу обратно.")
+
+
+# ---------- очередь разбора ----------
+#
+# Бот сам встречает в чатах спорных людей: ручные баны, карточки подозрения,
+# которые никто не нажал, профили тех, у кого сработало стоп-слово. Такие
+# случаи лежат в копилке «не решено», и учиться на них нельзя, пока человек
+# не скажет, что это было. Здесь они приходят по одному, кнопка — и следующий.
+
+REVIEW_MARKS = {"all": ("spam", "spam"), "msg": ("spam", None),
+                "prof": ("ok", "spam"), "ok": ("ok", "ok")}
+REVIEW_NOTE = {"all": "⛔ всё спам", "msg": "💬 спам только текст",
+               "prof": "🪪 спам только профиль", "ok": "✅ всё норма"}
+
+
+def _features_line(f: dict) -> str:
+    """Признаки случая одной строкой — то, что видел бот в момент решения."""
+    bits = []
+    if f.get("days") is not None:
+        bits.append(f"в чате {f['days']} дн.")
+    if f.get("member") is not None:
+        bits.append("участник" if f["member"] else "не участник")
+    if f.get("nsfw") is not None:
+        bits.append(f"аватарка {f['nsfw']}%")
+    elif f.get("photo") is False:
+        bits.append("без аватарки")
+    if f.get("text") is not None:
+        bits.append(f"текст {f['text']}")
+    if f.get("face"):
+        bits.append(f"профиль {f['face'][0]}" + (f"/{f['face'][1]}" if f["face"][1] else ""))
+    return " · ".join(bits)
+
+
+async def _review_view(case_id: int) -> tuple[str, object] | None:
+    """Текст и кнопки одного случая. None — случая уже нет."""
+    parts = await db.case_parts(case_id)
+    if not parts:
+        return None
+    msg = next((p for p in parts if p["origin"] != "profile"), None)
+    prof = next((p for p in parts if p["origin"] == "profile"), None)
+    head = parts[0]
+    chat = await db.get_chat(head["chat_id"])
+    when = dt.datetime.fromtimestamp(head["ts"]).strftime("%d.%m %H:%M")
+    lines = [f"<b>📋 Разбор</b> · в очереди {await db.review_count()}",
+             f"🏠 {utils.esc(chat['title'] if chat else head['chat_id'])} · {when}"]
+    did = f"⚙️ {utils.esc(head['feature'] or 'случайный образец')}"
+    pid = next((p["pid"] for p in parts if p["pid"]), None)
+    if pid:
+        pun = await db.get_punishment(pid)
+        if pun is not None:
+            did += (f" · {utils.shown_kind(pun['kind'], pun['reason'])}"
+                    + (" · действует" if pun["active"] else " · снято"))
+    lines.append(did)
+    if msg is not None:
+        lines.append(f"💬 {utils.esc(utils.chunk(msg['text'], 500))}")
+    if prof is not None:
+        lines.append(f"🪪 {utils.esc(utils.chunk(prof['text'], 300))}")
+    data = next((json.loads(p["data"]) for p in parts if p["data"]), {})
+    feats = _features_line(data.get("features") or {})
+    if feats:
+        lines.append(f"📊 {feats}")
+
+    b = InlineKeyboardBuilder()
+    if msg is not None and prof is not None:
+        b.row(_btn("⛔ Всё спам", f"r:all:{case_id}"),
+              _btn("💬 Только текст", f"r:msg:{case_id}"))
+        b.row(_btn("🪪 Только профиль", f"r:prof:{case_id}"),
+              _btn("✅ Всё норма", f"r:ok:{case_id}"))
+    else:
+        # одна часть — спрашивать про вторую нечего
+        b.row(_btn("⛔ Спам", f"r:all:{case_id}"), _btn("✅ Норма", f"r:ok:{case_id}"))
+    b.row(_btn("⏭ Пропустить", f"r:skip:{case_id}"))
+    return "\n".join(lines), b.as_markup()
+
+
+async def _review_show(target, case_id: int | None, note: str = "") -> None:
+    """Показать случай: новым сообщением (команда) или вместо старого (кнопка)."""
+    view = await _review_view(case_id) if case_id else None
+    if view is None:
+        left = await db.review_count()
+        text = (note + "\n\n" if note else "") + (
+            "Очередь пуста — всё разобрано." if not left else
+            f"Дошли до конца, пропущенных осталось {left}. /разбор начнёт сначала.")
+        markup = None
+    else:
+        text, markup = view
+        if note:
+            text = f"<i>{note}</i>\n\n{text}"
+    if isinstance(target, Message):
+        await target.answer(text, reply_markup=markup)
+    else:
+        await target.edit_text(text, reply_markup=markup)
+
+
+@router.message(Command("review", "разбор"))
+async def cmd_review(message: Message) -> None:
+    await _review_show(message, await db.review_next())
+
+
+@router.callback_query(F.data.startswith("r:"))
+async def review_mark(cb: CallbackQuery) -> None:
+    _, what, raw = cb.data.split(":")
+    case_id = int(raw)
+    note = ""
+    if what in REVIEW_MARKS:
+        msg_label, prof_label = REVIEW_MARKS[what]
+        await db.case_label_parts(case_id, msg_label, prof_label, cb.from_user.id)
+        from ..services import nn
+        nn.invalidate()
+        note = f"Предыдущий: {REVIEW_NOTE[what]}"
+        await db.add_event(None, "nn", f"разбор: случай {case_id} — {what} "
+                                        f"by {cb.from_user.id}")
+    await _review_show(cb.message, await db.review_next(case_id), note)
+    await cb.answer()
 
 
 # Поля профиля: что человек пишет слева от двоеточия -> как назовём внутри.

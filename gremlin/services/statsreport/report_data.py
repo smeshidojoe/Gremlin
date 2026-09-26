@@ -13,13 +13,6 @@ def _parse(dt):
         return None
 
 
-def load_meta(db):
-    con = sqlite3.connect(db)
-    rows = dict(con.execute("SELECT key, value FROM meta").fetchall())
-    con.close()
-    return rows
-
-
 def load_rows(db):
     """Возвращает (rows, meta). Одна строка = один участник или экс-участник."""
     con = sqlite3.connect(db)

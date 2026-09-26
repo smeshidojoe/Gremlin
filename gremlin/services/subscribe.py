@@ -199,15 +199,6 @@ def note_problem(chat_id: int, err: str) -> str:
     return text
 
 
-def problem(chat_id: int) -> str | None:
-    """Свежая поломка настройки или None. Старше суток не показываем:
-    её могли уже починить, а мы бы пугали зря."""
-    hit = _problem.get(chat_id)
-    if hit is None or time.time() - hit[0] > config.SUB_WARN_TTL:
-        return None
-    return hit[1]
-
-
 def clear_problem(chat_id: int) -> None:
     _problem.pop(chat_id, None)
     _warned.pop(chat_id, None)

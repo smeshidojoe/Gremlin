@@ -194,3 +194,46 @@ async def test_paste_silent_without_answers(paste, chat):
     s = await db.get_settings(chat)
     await group.fire_paste(FakeBot(), Msg("буква " * 100), s)
     assert paste == []
+
+
+@pytest.fixture
+async def vanish(chat, members, monkeypatch):
+    """!vanish включён, стирает 3; удалённое перехватываем."""
+    from gremlin.services import deleting
+    members["admins"].add(ADMIN)
+    await db.set_setting(chat, "games_on", config.GAME_VANISH)
+    await db.set_setting(chat, "vanish_n", 3)
+    gone = []
+
+    async def many(bot, chat_id, ids):
+        gone.extend(ids)
+        return len(ids)
+
+    monkeypatch.setattr(deleting, "many", many)
+    monkeypatch.setattr(moderation, "_seen_msgs", {})
+    for uid, base in ((PLAIN, 100), (VICTIM, 200)):
+        for i in range(5):
+            moderation.remember_message(chat, uid, base + i)
+    return gone
+
+
+def vanish_msg(author, reply_from=None, mid=999):
+    msg = Msg("!vanish", author=make_user(author), reply_from=reply_from)
+    msg.message_id = mid
+    moderation.remember_message(CHAT, author, mid)     # команду бот тоже запомнил
+    return msg
+
+
+async def test_vanish_erases_own_last_n_and_the_command(vanish, chat):
+    await games.fire_game(FakeBot(), vanish_msg(PLAIN))
+    assert sorted(vanish) == [102, 103, 104, 999]      # чужие 200+ не тронуты
+
+
+async def test_vanish_by_reply_admin_only(vanish, chat):
+    # обычный участник ответом стирает только своё
+    await games.fire_game(FakeBot(), vanish_msg(PLAIN, reply_from=make_user(VICTIM)))
+    assert sorted(vanish) == [102, 103, 104, 999]
+    vanish.clear()
+    # админ ответом — сообщения автора того, на что ответил
+    await games.fire_game(FakeBot(), vanish_msg(ADMIN, reply_from=make_user(VICTIM), mid=998))
+    assert sorted(vanish) == [202, 203, 204, 998]

@@ -729,11 +729,35 @@ async def send_titles(bot: Bot) -> int:
 # игры зовутся последними, после всех проверок — на то, что их пережило.
 # Комментарий к команде (обвинение в суде) при этом сохраняется: он проходит
 # те же фильтры, что любой другой текст.
+async def cmd_vanish(message: Message, bot: Bot) -> None:
+    """Стереть последние сообщения позвавшего — или, у админа ответом, чужие.
+
+    Историю чата бот читать не может: стирает только то, что запомнил сам
+    (moderation.remember_message). Отвечать в чат нечем и незачем — команда
+    исчезает вместе с сообщениями, в этом и смысл.
+    """
+    if not await _allowed(bot, message, config.GAME_VANISH):
+        return
+    chat_id = message.chat.id
+    s = await db.get_settings(chat_id)
+    target = message.from_user.id
+    reply = message.reply_to_message
+    author = getattr(reply, "from_user", None) if reply else None
+    # ответом на чужое — только админ: иначе любой вычищал бы переписку других
+    if (author is not None and author.id != target and not author.is_bot
+            and target in await adm_cache.chat_admin_ids(bot, chat_id)):
+        target = author.id
+    ids = moderation.take_recent(chat_id, target, s.vanish_n, skip=message.message_id)
+    from ..services import deleting
+    await deleting.many(bot, chat_id, ids + [message.message_id])
+
+
 COMMANDS = (
     (re.compile(r"^!(рулетка|roulette)(\s|$)", re.IGNORECASE), cmd_roulette),
     (re.compile(r"^!(дуэль|duel)(\s|$)", re.IGNORECASE), cmd_duel),
     (re.compile(r"^!(битва|battle)(\s|$)", re.IGNORECASE), cmd_battle),
     (re.compile(r"^!(суд|court)(\s|$)", re.IGNORECASE), cmd_court),
+    (re.compile(r"^!vanish(\s|$)", re.IGNORECASE), cmd_vanish),
 )
 
 

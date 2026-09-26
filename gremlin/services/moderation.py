@@ -306,6 +306,21 @@ def remember_message(chat_id: int, user_id: int, msg_id: int) -> None:
     dq.append(msg_id)
 
 
+def take_recent(chat_id: int, user_id: int, n: int, skip: int | None = None) -> list[int]:
+    """Забрать из памяти id последних n сообщений человека (кроме skip).
+
+    Забранные из памяти уходят: удалять их второй раз незачем. Остальные
+    остаются — вдруг автора потом забанят и за ним надо будет убрать.
+    """
+    dq = _seen_msgs.get((chat_id, user_id))
+    if not dq or n <= 0:
+        return []
+    rest = [m for m in dq if m != skip]
+    dq.clear()
+    dq.extend(rest[:-n])
+    return rest[-n:]
+
+
 def forget_messages(chat_id: int, user_id: int) -> None:
     _seen_msgs.pop((chat_id, user_id), None)
 
@@ -1037,15 +1052,12 @@ async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
         except Exception:
             logger.debug("единая оценка по снятому не посчиталась", exc_info=True)
 
-    # улика для нейрофильтра: сработало правило — значит это пример спама
-    if s.nn_mode:
-        await db.sample_add(
-            chat.id, user.id, "auto", "spam",
-            " ".join(filter(None, [message.text or message.caption or "",
-                                   media.cached(message)])),
-            feature=feature_label, pid=pid,
-            extra="\n".join(_buttons(message)) or None,
-        )
+    # случай в копилку: сработало правило — сообщение спам. Профиль пишем
+    # «не решено»: за стоп-слово банят и взломанные аккаунты обычных людей
+    from . import cases
+    await cases.record(bot, chat.id, user, msg_label="spam", prof_label="unknown",
+                       origin="auto", feature=feature_label, message=message,
+                       pid=pid)
 
     sent = await send_card(bot, chat.id, feature_bit, card, pid, applied, user.id)
     if applied != "delete":

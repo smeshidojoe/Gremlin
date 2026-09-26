@@ -59,8 +59,6 @@ async def allowed(user: dict) -> bool:
     uid = int(user["id"])
     if uid in config.ADMIN_IDS:
         return True
-    if await db.is_bot_banned(uid):
-        return False
     return await db.access_allowed(uid, user.get("username"))
 
 

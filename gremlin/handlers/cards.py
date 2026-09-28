@@ -171,7 +171,7 @@ def _without_spam(markup) -> InlineKeyboardMarkup | None:
 
 @router.callback_query(F.data.startswith("k:sp:"))
 async def card_spam_profile(cb: CallbackQuery, bot: Bot) -> None:
-    """«Спам-профиль» под ручным наказанием: профиль — в базу для сравнения."""
+    """«Спам-профиль» под ручным наказанием: профиль — в спам-базу."""
     from ..services import nn
     _, _, chat_id, user_id = cb.data.split(":")
     chat_id, user_id = int(chat_id), int(user_id)
@@ -187,22 +187,24 @@ async def card_spam_profile(cb: CallbackQuery, bot: Bot) -> None:
     # отмена стоит там же, где нажали
     rows = list((_without_spam(cb.message.reply_markup)
                  or InlineKeyboardMarkup(inline_keyboard=[])).inline_keyboard)
-    rows.append([InlineKeyboardButton(text="↩️ Убрать из базы спама",
+    rows.append([InlineKeyboardButton(text="↩️ Убрать из спам-базы",
                                       callback_data=f"k:spu:{chat_id}:{user_id}")])
-    await _mark(cb, "\n🧪 <b>Профиль записан в базу спама</b>",
+    await _mark(cb, "\n🧪 <b>Профиль записан в спам-базу</b>",
                 InlineKeyboardMarkup(inline_keyboard=rows))
     await cb.answer("Записан")
 
 
 @router.callback_query(F.data.startswith("k:spu:"))
 async def card_spam_profile_undo(cb: CallbackQuery, bot: Bot) -> None:
-    """Отмена «Спам-профиля»: запись уходит из базы, кнопка возвращается."""
+    """Отмена «Спам-профиля»: запись уходит из спам-базы, кнопка возвращается."""
     from ..services import moderation, nn
     _, _, chat_id, user_id = cb.data.split(":")
     chat_id, user_id = int(chat_id), int(user_id)
     if not await may_act(cb, chat_id):
         return
-    gone = await db.spam_profile_forget(chat_id, user_id)
+    # карточки, нажатые до переезда в спам-базу, писали в базу чата
+    gone = (await db.seed_forget_user(user_id)
+            + await db.spam_profile_forget(chat_id, user_id))
     nn.invalidate(chat_id)
     await db.add_event(chat_id, "card",
                        f"спам-профиль убран из базы: {user_id} by {cb.from_user.id}")
@@ -211,8 +213,8 @@ async def card_spam_profile_undo(cb: CallbackQuery, bot: Bot) -> None:
             if not any((b.callback_data or "").startswith("k:spu:") for b in row)]
     markup = moderation.with_spam_button(
         InlineKeyboardMarkup(inline_keyboard=rows) if rows else None, chat_id, user_id)
-    await _mark(cb, "\n↩️ <b>Профиль убран из базы спама</b>", markup)
-    await cb.answer("Убран" if gone else "Его уже нет в базе")
+    await _mark(cb, "\n↩️ <b>Профиль убран из спам-базы</b>", markup)
+    await cb.answer("Убран" if gone else "Его уже нет в спам-базе")
 
 
 async def _report_punish(cb: CallbackQuery, bot: Bot, kind: str) -> None:

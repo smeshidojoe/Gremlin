@@ -1,4 +1,4 @@
-"""«Спам-профиль»: ручная запись профиля в базу для сравнения."""
+"""«Спам-профиль»: ручная запись профиля в спам-базу."""
 import types
 
 import pytest
@@ -36,7 +36,11 @@ class SpamBot(FakeBot):
         return await super().get_chat(cid)
 
 
-async def faces(chat_id):
+async def seed_faces():
+    return [(r["label"], r["text"]) for r in await db.seed_page(None, None, 0, 50, "prof")]
+
+
+async def chat_faces(chat_id):
     return [(r["label"], r["text"]) for r in await db.samples_of_origin(chat_id, "profile")]
 
 
@@ -56,21 +60,31 @@ def test_manual_mute_card_has_real_ban_button():
     assert f"k:ban:{CHAT}:{U}" in buttons(kb)
 
 
-async def test_remember_writes_full_face_once(chat):
+async def test_remember_writes_to_spam_base_once(chat):
+    """Кнопка пишет в спам-базу, а не в базу чата: там её и ищут."""
     bot = SpamBot()
     ok, note = await nn.remember_spam_profile(bot, chat, U)
     assert ok and "записан" in note
-    assert await faces(chat) == [("spam", "Анна 18+ @anna_dm · пиши в лс")]
+    assert await seed_faces() == [("spam", "Анна 18+ @anna_dm · пиши в лс")]
+    assert await chat_faces(chat) == []
     ok, note = await nn.remember_spam_profile(bot, chat, U)
     assert not ok and "уже" in note
-    assert len(await faces(chat)) == 1
+    assert len(await seed_faces()) == 1
+
+
+async def test_autoban_record_does_not_block_button(chat):
+    """Запись автобана в копилке — не «уже в базе»: в спам-базе её нет."""
+    await db.sample_add(chat, U, "profile", "spam", "Анна 18+ @anna_dm · пиши в лс")
+    ok, _ = await nn.remember_spam_profile(SpamBot(), chat, U)
+    assert ok
+    assert len(await seed_faces()) == 1
 
 
 async def test_remember_relabels_forgiven_face(chat):
-    await nn.remember_face(chat, U, "старое имя", "ok")
+    await db.sample_add(chat, U, "profile", "ok", "старое имя", labeled_by=1)
     ok, _ = await nn.remember_spam_profile(SpamBot(), chat, U)
     assert ok
-    assert {label for label, _ in await faces(chat)} == {"spam"}
+    assert {r["label"] for r in await db.samples_pool("prof")} == {"spam"}
 
 
 async def test_remember_falls_back_to_db_and_refuses_unknown(chat):
@@ -86,55 +100,40 @@ async def test_card_button(chat):
     cb = CB(f"k:sp:{chat}:{U}", message=msg)
     cb.bot = SpamBot()
     await cards.card_spam_profile(cb, cb.bot)
-    assert "записан в базу спама" in msg.text
+    assert "записан в спам-базу" in msg.text
     # «Спам-профиль» ушёл, на его месте — отмена
     assert buttons(msg.reply_markup) == ["k:lift:5", f"k:spu:{chat}:{U}"]
     assert cb.alerts == ["Записан"]
-    assert len(await faces(chat)) == 1
+    assert len(await seed_faces()) == 1
 
-    # передумали — запись уходит из базы, кнопка «Спам-профиль» возвращается
+    # передумали — запись уходит из спам-базы, кнопка «Спам-профиль» возвращается
     undo = CB(f"k:spu:{chat}:{U}", message=msg)
     await cards.card_spam_profile_undo(undo, SpamBot())
-    assert "убран из базы спама" in msg.text
+    assert "убран из спам-базы" in msg.text
     assert buttons(msg.reply_markup) == ["k:lift:5", f"k:sp:{chat}:{U}"]
     assert undo.alerts == ["Убран"]
-    assert await faces(chat) == []
+    assert await seed_faces() == []
 
 
-async def test_undo_keeps_other_people_and_ok_marks(chat):
-    await nn.remember_face(chat, U, "спамер", "spam")
-    await nn.remember_face(chat, U + 1, "другой спамер", "spam")
-    await nn.remember_face(chat, U, "не трогать", "ok")   # отметка «не трогать»
-    assert await db.spam_profile_forget(chat, U) == 1
-    assert sorted(await faces(chat)) == [("ok", "не трогать"), ("spam", "другой спамер")]
+async def test_undo_keeps_other_people(chat):
+    await db.seed_add("спамер номер один", "spam", "prof", user_id=U)
+    await db.seed_add("другой спамер тут", "spam", "prof", user_id=U + 1)
+    assert await db.seed_forget_user(U) == 1
+    assert await seed_faces() == [("spam", "другой спамер тут")]
 
 
-async def test_spam_profiles_list_and_delete(chat):
-    await nn.remember_face(chat, U, "Анна 18+ @anna_dm", "spam")
-    await nn.remember_face(chat, U + 1, "Кристина пиши в лс", "spam")
-    rows = await db.spam_profiles(chat)
-    assert [r["text"] for r in rows] == ["Кристина пиши в лс", "Анна 18+ @anna_dm"]
-
-    text, kb = await um.view_spam_profiles(chat)
-    assert "Всего: <b>2</b>" in text and "Анна 18+" in text
-    first = rows[0]["id"]
-    assert f"u:pfd:{chat}:{first}:0" in buttons(kb)
-
-    msg = Sent(text)
-    cb = CB(f"u:pfd:{chat}:{first}:0", uid=OWNER, message=msg)
-    await um.cb_spam_profile_del(cb)
-    assert cb.alerts == ["Убран"]
-    assert [r["text"] for r in await db.spam_profiles(chat)] == ["Анна 18+ @anna_dm"]
-    assert "Всего: <b>1</b>" in msg.text
-
-    # чужой чат удалить не даёт: запись ищется в пределах своего чата
-    assert await db.spam_profile_delete(chat - 1, rows[1]["id"]) is None
-
-
-async def test_watch_page_links_to_the_list(chat):
-    await nn.remember_face(chat, U, "спамер", "spam")
-    _text, kb = await um.view_section(chat, "watch")
-    assert f"u:pf:{chat}:0" in buttons(kb)
+async def test_old_chat_profiles_move_to_spam_base(chat):
+    """Ручные спам-профили из баз чатов переезжают в спам-базу при старте;
+    автобаны и случаи остаются в копилке."""
+    await db.sample_add(chat, U, "profile", "spam", "ручной спамер", labeled_by=1)
+    await db.sample_add(chat, U + 1, "profile", "spam", "автобан бота")
+    await db.seed_add("уже в базе давно", "spam", "prof", user_id=U + 2)
+    await db.sample_add(chat, U + 2, "profile", "spam", "дубль того же", labeled_by=1)
+    await db.seed_commit()
+    await db._migrate()
+    assert sorted(await seed_faces()) == [("spam", "ручной спамер"),
+                                          ("spam", "уже в базе давно")]
+    assert await chat_faces(chat) == [("spam", "автобан бота")]
 
 
 async def test_status_card_button(chat):
@@ -152,4 +151,4 @@ async def test_status_card_button(chat):
     cb = CB(f"u:spp:{chat}:{U}", uid=OWNER, message=msg)
     await um.cb_status_spam(cb, SpamBot())
     assert "записан" in cb.alerts[0]
-    assert len(await faces(chat)) == 1
+    assert len(await seed_faces()) == 1

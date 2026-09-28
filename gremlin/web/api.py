@@ -406,8 +406,7 @@ async def _widget(cid: int, widget: str, s) -> dict:
                 "phrases": len(await db.phrases_list(cid))}
 
     if widget == "watch_subs":
-        return {"cas_on": bool(s.cas_on), "prof_on": bool(s.prof_on),
-                "spam_profiles": len(await db.spam_profiles(cid))}
+        return {"cas_on": bool(s.cas_on), "prof_on": bool(s.prof_on)}
 
     if widget == "cas_stats":
         st = await db.cas_stats()
@@ -1211,7 +1210,7 @@ async def api_status(request: web.Request) -> web.Response:
 
 @routes.post("/api/chat/{cid}/spamprofile")
 async def api_spam_profile(request: web.Request) -> web.Response:
-    """«Спам-профиль» со страницы проверки: профиль — в базу этого чата."""
+    """«Спам-профиль» со страницы проверки: профиль — в спам-базу."""
     cid = await cid_of(request, "punish")
     data = await body(request)
     try:
@@ -1246,28 +1245,6 @@ async def api_forgiven(request: web.Request) -> web.Response:
             "reason": why,
         })
     return js({"items": items})
-
-
-@routes.get("/api/chat/{cid}/spamprofiles")
-async def api_spam_profiles(request: web.Request) -> web.Response:
-    cid = await cid_of(request)
-    items = [{"id": r["id"], "user_id": r["user_id"],
-              "who": await db.user_handle(r["user_id"]) if r["user_id"] else "—",
-              "when": utils.fmt_ts(r["ts"]), "text": r["text"]}
-             for r in await db.spam_profiles(cid)]
-    return js({"items": items})
-
-
-@routes.delete("/api/chat/{cid}/spamprofiles/{rid}")
-async def api_spam_profile_del(request: web.Request) -> web.Response:
-    cid = await cid_of(request)
-    row = await db.spam_profile_delete(cid, int(request.match_info["rid"]))
-    if row is None:
-        raise web.HTTPNotFound(text="Этой записи уже нет.")
-    nn.invalidate(cid)
-    await db.add_event(cid, "card", f"спам-профиль убран из базы: "
-                                    f"{row['user_id']} by {uid_of(request)} (панель)")
-    return js({"ok": True})
 
 
 @routes.delete("/api/chat/{cid}/forgiven/{rid}")
@@ -1971,9 +1948,9 @@ async def api_roulette_spin(request: web.Request) -> web.Response:
     return js({"note": note})
 
 
-# ---------- стартовый набор нейрофильтра ----------
+# ---------- спам-база нейрофильтра ----------
 #
-# Набор общий на весь бот, поэтому только владельцу: удалённый пример пропадает
+# Спам-база общая на весь бот, поэтому только владельцу: удалённый пример пропадает
 # сразу у всех чатов.
 
 SEED_PAGE = 20
@@ -2051,7 +2028,7 @@ async def api_seed_delete(request: web.Request) -> web.Response:
         gone = await db.seed_delete_where(label, q, kind)
         what = f"удалено по фильтру ({q or label})"
     if gone:
-        nn.invalidate()          # набор подмешан всем молодым чатам
-        await db.add_event(None, "nn", f"стартовый набор: {what}, {gone} шт "
+        nn.invalidate()          # спам-база общая для всех чатов
+        await db.add_event(None, "nn", f"спам-база: {what}, {gone} шт "
                                        f"by {uid_of(request)}")
     return js({"ok": True, "gone": gone})

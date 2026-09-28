@@ -234,7 +234,7 @@ async def collect(bot: Bot, user_id: int, chats, first: int | None = None) -> di
         if r.pop("tg") or r["chat_id"] in seen:
             got = seen.get(r["chat_id"], set())
             if "spam_profile" in got:
-                r["lines"].append("🧪 профиль в базе спам-профилей этого чата")
+                r["lines"].append("🧪 профиль записан спамом в этом чате")
             # Строк нет, а чат в списке: человек тут не писал и не наказан.
             # Без пояснения такой чат выглядел ошибкой — говорим, откуда он
             if not r["lines"]:
@@ -264,6 +264,8 @@ async def collect(bot: Bot, user_id: int, chats, first: int | None = None) -> di
         facts.append(f"✉️ пишет в ваших чатах с {first} · последнее сообщение {last}")
     if stats["cas"]:
         facts.append("🌐 в общем списке спамеров (CAS)")
+    if await db.seed_has_user(user_id):
+        facts.append("🧪 профиль в спам-базе")
 
     titles = {c["chat_id"]: c["title"] or str(c["chat_id"]) for c in chats}
     events = []

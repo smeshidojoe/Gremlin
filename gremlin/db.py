@@ -894,6 +894,28 @@ async def _migrate() -> None:
             if col in have:
                 await _db.execute(f"ALTER TABLE {table} DROP COLUMN {col}")
     await _db.execute("DROP TABLE IF EXISTS lore")
+
+    # ручные спам-профили, записанные раньше в базу чата, — в спам-базу, где
+    # их видно и можно убрать. Человек уже есть там — чатовая запись лишняя.
+    # Записи случаев (case_id) и автобанов (без labeled_by) остаются в копилке
+    await _db.execute(
+        """DELETE FROM samples WHERE origin = 'profile' AND label = 'spam'
+             AND labeled_by IS NOT NULL AND case_id IS NULL AND chat_id != ?
+             AND user_id IN (SELECT user_id FROM samples WHERE chat_id = ?
+                             AND origin = 'seedprof' AND user_id IS NOT NULL)""",
+        (SEED_CHAT, SEED_CHAT))
+    await _db.execute(
+        """UPDATE samples SET chat_id = ?, origin = 'seedprof', feature = 'набор'
+           WHERE origin = 'profile' AND label = 'spam' AND labeled_by IS NOT NULL
+             AND case_id IS NULL AND chat_id != ?
+             AND id IN (SELECT MAX(id) FROM samples WHERE origin = 'profile'
+                        AND label = 'spam' AND labeled_by IS NOT NULL
+                        AND case_id IS NULL GROUP BY COALESCE(user_id, -id))""",
+        (SEED_CHAT, SEED_CHAT))
+    await _db.execute(
+        """DELETE FROM samples WHERE origin = 'profile' AND label = 'spam'
+             AND labeled_by IS NOT NULL AND case_id IS NULL AND chat_id != ?""",
+        (SEED_CHAT,))
     await _db.commit()
 
 
@@ -970,6 +992,11 @@ async def init() -> None:
     _db.row_factory = aiosqlite.Row
     await _db.execute("PRAGMA journal_mode=WAL")
     await _db.execute("PRAGMA synchronous=NORMAL")
+    # База живёт на папке Windows, проброшенной в контейнер (9p), и каждое
+    # чтение страницы с диска там дорогое. При кэше по умолчанию (2 МБ)
+    # спам-база в панели перечитывала всю таблицу улик на каждый клик —
+    # 3 с против 15 мс, когда база целиком помещается в память
+    await _db.execute("PRAGMA cache_size=-32000")
     await _db.executescript(_SCHEMA)
     await _db.commit()
     await _migrate()
@@ -2036,7 +2063,7 @@ async def samples_profile(chat_id: int | None = None,
 
 async def samples_stats(chat_id: int | None = None) -> dict:
     """Сколько чего накопилось — показываем в меню, чтобы было видно прогресс."""
-    # без чата считаем свои улики всех чатов; стартовый набор сюда не идёт —
+    # без чата считаем свои улики всех чатов; спам-база сюда не идёт —
     # он общий и чужой, в «сколько чат накопил» ему делать нечего
     q = "SELECT origin, label, COUNT(*) AS n FROM samples"
     args: tuple = ()
@@ -2415,40 +2442,37 @@ async def seed_clear() -> int:
     return cur.rowcount or 0
 
 
-# ---------- база спам-профилей ----------
+# ---------- спам-профили ----------
 #
-# Профили лежат в той же копилке улик, что и сообщения, с origin='profile'.
-# Отдельного списка в меню у них не было: записать кнопкой можно, а увидеть и
-# убрать ошибку — нет. Спрашиваем только спам: «нормальные» профили — это
-# отметки «не трогать», их смысл в самом сравнении, не в ручной чистке.
+# Всё, что человек пометил «спам-профилем», лежит в спам-базе (сборщик,
+# origin='seedprof'): одна база на все чаты, смотрит и чистит её владелец.
+# Своих списков у чатов больше нет — раньше кнопка писала в базу чата, и
+# записанное не находилось там, где его искали.
 
-async def spam_profiles(chat_id: int) -> list[aiosqlite.Row]:
-    """Профили, записанные как спам: кнопкой на карточке или при автобане."""
+async def seed_forget_user(user_id: int) -> int:
+    """Убрать из спам-базы спам-профиль человека. Сколько убрали."""
     cur = await _db.execute(
-        """SELECT id, user_id, ts, text FROM samples
-           WHERE chat_id = ? AND origin = 'profile' AND label = 'spam'
-           ORDER BY id DESC""", (chat_id,))
-    return await cur.fetchall()
-
-
-async def spam_profile_delete(chat_id: int, sample_id: int) -> aiosqlite.Row | None:
-    """Убрать одну запись. Возвращает удалённую строку, None — такой нет."""
-    cur = await _db.execute(
-        """SELECT id, user_id FROM samples WHERE id = ? AND chat_id = ?
-           AND origin = 'profile' AND label = 'spam'""", (sample_id, chat_id))
-    row = await cur.fetchone()
-    if row is None:
-        return None
-    await _db.execute("DELETE FROM samples WHERE id = ?", (sample_id,))
+        """DELETE FROM samples WHERE chat_id = ? AND origin = ? AND user_id = ?
+           AND label = 'spam'""", (SEED_CHAT, SEED_ORIGINS["prof"], user_id))
     await _db.commit()
-    return row
+    return cur.rowcount or 0
+
+
+async def seed_has_user(user_id: int) -> bool:
+    """Профиль человека лежит в спам-базе спамом."""
+    cur = await _db.execute(
+        """SELECT 1 FROM samples WHERE chat_id = ? AND origin = ? AND user_id = ?
+           AND label = 'spam' LIMIT 1""", (SEED_CHAT, SEED_ORIGINS["prof"], user_id))
+    return await cur.fetchone() is not None
 
 
 async def spam_profile_forget(chat_id: int, user_id: int) -> int:
-    """Убрать из базы спама все записи о человеке в этом чате. Сколько убрали."""
+    """Убрать ручной спам-профиль из базы чата — для карточек, нажатых до
+    того, как кнопка стала писать в спам-базу. Сколько убрали."""
     cur = await _db.execute(
         """DELETE FROM samples WHERE chat_id = ? AND user_id = ?
-           AND origin = 'profile' AND label = 'spam'""", (chat_id, user_id))
+           AND origin = 'profile' AND label = 'spam' AND case_id IS NULL""",
+        (chat_id, user_id))
     await _db.commit()
     return cur.rowcount or 0
 
@@ -3552,7 +3576,7 @@ async def cas_stats() -> dict:
     return out
 
 
-# ---------- стартовый набор: просмотр и чистка ----------
+# ---------- спам-база: просмотр и чистка ----------
 #
 # Набор общий на весь бот, поэтому и правит его только владелец бота: удалил
 # пример — он пропал у всех чатов сразу.

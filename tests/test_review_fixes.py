@@ -153,7 +153,7 @@ async def test_card_ban_remembers_full_profile(chat, members, monkeypatch):
             return await super().get_chat(cid)
 
     await cards.card_ban(CB(f"k:ban:{chat}:{THEM}", uid=OWNER), Bot())
-    faces = [r["text"] for r in await db.samples_of_origin(chat, "profile")]
+    faces = [r["text"] for r in await db.seed_page(None, None, 0, 50, "prof")]
     assert faces == ["Анна 18+ @anna_dm · пиши в лс"]
 
 
@@ -270,11 +270,11 @@ async def test_status_explains_chat_without_messages(chat, monkeypatch):
             return types.SimpleNamespace(status="left", user=None)
 
     await db.watch_set(chat, uid, "sig", False, score=0)
-    await nn.remember_face(chat, uid, "Varya · 18+", "spam")
+    await db.sample_add(chat, uid, "profile", "spam", "Varya · 18+")
     await db.add_event(chat, "card", f"спам-профиль в базу: {uid} by 1 (проверка статуса)")
     assert (await db.user_seen_why(uid, [chat]))[chat] == {"watch_profiles", "spam_profile"}
     d = await st.collect(Bot(), uid, [{"chat_id": chat, "title": "Мой"}])
-    assert d["chats"][0]["lines"] == ["🧪 профиль в базе спам-профилей этого чата"]
+    assert d["chats"][0]["lines"] == ["🧪 профиль записан спамом в этом чате"]
 
     other = CHAT - 30
     await db.add_event(other, "leave", f"Varya ({uid})")

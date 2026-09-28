@@ -656,26 +656,12 @@ def forget_burst(chat_id: int) -> None:
     _recent.pop(chat_id, None)
 
 
-async def remember_face(chat_id: int, user_id: int, name: str, label: str,
-                        fields: dict | None = None,
-                        labeled_by: int | None = None) -> None:
-    """Запомнить профиль: строку того, кого забанили (или не тронули).
-
-    Хранится в той же копилке, но с origin='profile' — в текстовую модель
-    такие улики не попадают, они сравниваются только с профилями.
-    fields — поля профиля по отдельности (profile.fields_of), labeled_by — кто
-    решил; None — решил бот сам, при автобане.
-    """
-    await db.sample_add(chat_id, user_id, "profile", label, name, feature="профиль",
-                        data=fields, labeled_by=labeled_by)
-    _faces.clear()
-
-
 async def remember_spam_profile(bot, chat_id: int, user_id: int,
                                 labeled_by: int | None = None) -> tuple[bool, str]:
-    """Админ сказал «это спам-аккаунт»: записать профиль в базу для сравнения.
+    """Админ сказал «это спам-аккаунт»: записать профиль в спам-базу.
 
-    Пишем тем же видом строки, каким сравниваем и запоминаем при автобане, —
+    Спам-база одна на все чаты, её и видно в панели: запись в базу чата
+    оттуда не находилась. Пишем тем же видом строки, каким сравниваем, —
     имя, ник, описание и канал вместе (profile.face_text). Иначе ручные записи
     лежали бы голыми именами, а спрашивали бы описаниями.
 
@@ -703,19 +689,30 @@ async def remember_spam_profile(bot, chat_id: int, user_id: int,
         return False, "Записывать нечего: имя пустое, профиль закрыт."
     stored = face[:config.SAMPLE_TEXT_LIMIT]
 
-    # база общая на все чаты: человека ищем везде, а не только в этом
+    # копилка общая на все чаты: человека ищем везде, а не только в этом.
+    # «Уже есть» — только если он в спам-базе: запись автобана в копилке
+    # не повод отказать, в панели её не видно
     mine = [r for r in await db.samples_pool("prof") if r["user_id"] == user_id]
-    if any(r["label"] == "spam" and r["text"] == stored for r in mine):
-        return False, "Этот профиль уже в базе спама."
+    if any(r["origin"] == db.SEED_ORIGINS["prof"] and r["label"] == "spam"
+           and r["text"] == stored for r in mine):
+        return False, "Этот профиль уже в спам-базе."
     # раньше его отметили нормальным («больше не трогать») — теперь передумали;
     # старая пометка иначе спорила бы с новой в каждом сравнении
     for r in mine:
         if r["label"] != "spam":
             await db.sample_relabel(r["id"], "spam", labeled_by=labeled_by)
-    await remember_face(chat_id, user_id, face, "spam",
-                        prof_svc.fields_of(user, data), labeled_by)
+    await db.seed_add(stored, "spam", "prof", user_id=user_id,
+                      data=prof_svc.fields_of(user, data), labeled_by=labeled_by)
+    await db.seed_commit()
+    # профиль свежего случая по нему — тоже спам: это метка человека,
+    # по таким учится оценка
+    if labeled_by is not None:
+        case = await db.case_last_for(chat_id, user_id)
+        if case is not None:
+            await db.case_label_parts(case, None, "spam", labeled_by)
+    _faces.clear()
 
-    note = "Профиль записан в базу спама: похожих бот узнает сразу, во всех чатах."
+    note = "Профиль записан в спам-базу: похожих бот узнает сразу, во всех чатах."
     s = await db.get_settings(chat_id)
     if not s.watch_nn:
         note += (" Сравнение профилей в наблюдении сейчас выключено — "

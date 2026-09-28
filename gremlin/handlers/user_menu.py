@@ -42,7 +42,7 @@ class Input(StatesGroup):
     mass_kick = State()         # ждём список id для массового кика
     mass_ban = State()          # ждём список id для массового бана
     phrase = State()            # ждём фразу-образец для смысловых стоп-слов
-    seed_q = State()            # ждём слово для поиска по стартовому набору
+    seed_q = State()            # ждём слово для поиска по спам-базе
     sub_chat = State()          # ждём канал для проверки подписки
     prof_words = State()        # ждём слова для списка профилей
     status = State()            # ждём id/@username/пересылку для проверки статуса
@@ -80,7 +80,7 @@ async def view_home(user_id: int, bot: Bot) -> tuple[str, InlineKeyboardMarkup]:
         b.button(text="🐞 Ошибки", callback_data="a:errors")
         b.button(text="⚙️ Состояние", callback_data="a:health")
         b.button(text="👥 Доступ к боту", callback_data="u:acc")
-        b.button(text="🌱 Стартовый набор", callback_data="u:seed")
+        b.button(text="🗄 Спам-база", callback_data="u:seed")
         b.button(text="🎪 Приколы", callback_data="f:home")
     b.button(text="✖️ Закрыть", callback_data="u:close")
     b.adjust(1, 1, 2, 1, 1, 1, 1, 1)
@@ -605,7 +605,7 @@ async def _render_widget(b: InlineKeyboardBuilder, cid: int, widget: str, s) -> 
                    f"u:s:{cid}:nn"))
         b.row(_btn(f"💬 Сообщения: ⛔ {st['spam']} · 🕊 {st['ok']} · "
                    f"✋ {st['unknown']}", f"u:s:{cid}:nn"))
-        b.row(_btn(f"🧪 Профили спамеров: {st['faces_spam']}", f"u:pf:{cid}:0"))
+        b.row(_btn(f"🧪 Профили спамеров: {st['faces_spam']}", f"u:s:{cid}:nn"))
         state = nn.status()
         b.row(_btn(f"🧠 Модель: {'загружена' if state == 'ok' else state}",
                    f"u:s:{cid}:nn"))
@@ -666,8 +666,6 @@ async def _render_widget(b: InlineKeyboardBuilder, cid: int, widget: str, s) -> 
                    f"u:s:{cid}:prof"))
         b.row(_btn(f"{'✅' if s.cas_on else '🚫'} 🌐 Общий список спамеров",
                    f"u:s:{cid}:cas"))
-        b.row(_btn(f"🧪 Спам-профили: {len(await db.spam_profiles(cid))}",
-                   f"u:pf:{cid}:0"))
 
     elif widget == "cas_stats":
         from ..services import cas as cas_svc
@@ -2018,70 +2016,6 @@ async def view_punishments(cid: int, page: int = 0,
         b.row(_btn("⚙️ Настройки", f"u:s:{cid}:punish_cfg"))
     b.row(_btn("⬅️ Назад", f"u:c:{cid}"))
     return "\n".join(lines), b.as_markup()
-
-
-async def view_spam_profiles(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
-    """База спам-профилей: что записано и кнопка убрать."""
-    rows = await db.spam_profiles(cid)
-    chunk, page, pages = _page_slice(rows, page)
-    lines = [
-        "<b>🧪 Спам-профили</b>\n",
-        "С этими профилями бот сравнивает новых людей, когда включено "
-        "«Сравнивать профили с забаненными». Сюда попадают профили, записанные "
-        "кнопкой «Спам-профиль», и те, кого бот забанил сам.",
-        "\nЗаписали по ошибке — уберите номером ниже.",
-        f"\nВсего: <b>{len(rows)}</b>"
-        + (f" · страница {page + 1} из {pages}" if pages > 1 else ""),
-        "",
-    ]
-    if not rows:
-        lines.append("Пусто.")
-    start = page * LIST_PER_PAGE
-    for i, r in enumerate(chunk, start + 1):
-        who = await db.user_handle(r["user_id"]) if r["user_id"] else "—"
-        lines.append(
-            f"{i}. <b>{utils.esc(who)}</b> · {utils.fmt_ts(r['ts'])}\n"
-            f"    <i>{utils.esc(utils.chunk(r['text'], 90))}</i>")
-    b = InlineKeyboardBuilder()
-    row = []
-    for i, r in enumerate(chunk, start + 1):
-        row.append(_btn(f"❌ {i}", f"u:pfd:{cid}:{r['id']}:{page}"))
-        if len(row) == 5:
-            b.row(*row)
-            row = []
-    if row:
-        b.row(*row)
-    _pager(b, cid, "u:pf", page, pages)
-    b.row(_btn("⬅️ Назад", f"u:s:{cid}:watch"))
-    return "\n".join(lines), b.as_markup()
-
-
-@router.callback_query(F.data.startswith("u:pf:"))
-async def cb_spam_profiles(cb: CallbackQuery) -> None:
-    _, _, cid, page = cb.data.split(":")
-    cid = int(cid)
-    if not await _guard(cb, cid):
-        return
-    text, kb = await view_spam_profiles(cid, int(page))
-    await cb.message.edit_text(text, reply_markup=kb)
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("u:pfd:"))
-async def cb_spam_profile_del(cb: CallbackQuery) -> None:
-    from ..services import nn
-    _, _, cid, rid, page = cb.data.split(":")
-    cid = int(cid)
-    if not await _guard(cb, cid):
-        return
-    row = await db.spam_profile_delete(cid, int(rid))
-    if row is not None:
-        nn.invalidate(cid)
-        await db.add_event(cid, "card", f"спам-профиль убран из базы: "
-                                        f"{row['user_id']} by {cb.from_user.id}")
-    text, kb = await view_spam_profiles(cid, int(page))
-    await cb.message.edit_text(text, reply_markup=kb)
-    await cb.answer("Убран" if row is not None else "Его уже нет")
 
 
 async def view_forgiven(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
@@ -3870,13 +3804,7 @@ async def status_input(message: Message, state: FSMContext, bot: Bot) -> None:
     chats = await db.chats_for(message.from_user.id)
     d = await status_svc.collect(bot, uid, chats, first=cid)
     b = InlineKeyboardBuilder()
-    # база спам-профилей своя у каждого чата, а проверка смотрит все —
-    # пишем в кнопке, куда именно ляжет запись
-    here = await db.get_chat(cid)
-    title = (here["title"] if here is not None else "") or ""
-    title = title if len(title) <= 24 else title[:23] + "…"
-    b.row(_btn(f"🧪 Спам-профиль в «{title}»" if title else "🧪 Спам-профиль",
-               f"u:spp:{cid}:{uid}"))
+    b.row(_btn("🧪 Спам-профиль в спам-базу", f"u:spp:{cid}:{uid}"))
     b.row(_btn("🔎 Проверить другого", f"u:ps:{cid}"))
     b.row(_btn("⬅️ Назад", f"u:p:{cid}:0"))
     await _edit_menu(message, bot, state, status_svc.render(d), b.as_markup())
@@ -3885,7 +3813,7 @@ async def status_input(message: Message, state: FSMContext, bot: Bot) -> None:
 
 @router.callback_query(F.data.startswith("u:spp:"))
 async def cb_status_spam(cb: CallbackQuery, bot: Bot) -> None:
-    """«Спам-профиль» в карточке проверки: профиль — в базу этого чата."""
+    """«Спам-профиль» в карточке проверки: профиль — в спам-базу."""
     _, _, cid, uid = cb.data.split(":")
     cid, uid = int(cid), int(uid)
     if not await _guard(cb, cid, "punish"):
@@ -4621,10 +4549,10 @@ async def words_input(message: Message, state: FSMContext, bot: Bot) -> None:
     await _done(message, bot, state, await view_words(cid, 0), note + "\n\n")
 
 
-# ---------- стартовый набор (только владелец бота) ----------
+# ---------- спам-база (только владелец бота) ----------
 #
-# Набор общий на весь бот: один и тот же список примеров подмешивается всем
-# молодым чатам. Поэтому и правит его владелец, а не хозяин отдельного чата —
+# Спам-база общая на весь бот: по ней сравниваются сообщения и профили во
+# всех чатах. Поэтому и правит её владелец, а не хозяин отдельного чата —
 # удалил пример здесь, он пропал сразу везде.
 
 SEED_PER_PAGE = 5
@@ -4643,16 +4571,16 @@ def _seed_state(uid: int) -> tuple[str | None, str | None, int, str]:
 
 
 async def _seed_admin(cb: CallbackQuery) -> bool:
-    """Набор общий, поэтому правит его только владелец бота."""
+    """Спам-база общая, поэтому правит её только владелец бота."""
     if cb.from_user.id in config.ADMIN_IDS:
         return True
-    await cb.answer("Стартовый набор общий для всех чатов — его правит "
+    await cb.answer("Спам-база общая для всех чатов — её правит "
                     "владелец бота.", show_alert=True)
     return False
 
 
 async def view_seed(uid: int) -> tuple[str, InlineKeyboardMarkup]:
-    """Главный экран набора: сколько чего и что с этим можно сделать."""
+    """Главный экран спам-базы: сколько чего и что с этим можно сделать."""
     msg = await db.seed_stats("msg")
     prof = await db.seed_stats("prof")
     pool = await db.pool_stats()
@@ -4660,8 +4588,8 @@ async def view_seed(uid: int) -> tuple[str, InlineKeyboardMarkup]:
     label, q, _page, kind = _seed_state(uid)
 
     lines = [
-        "<b>🌱 Стартовый набор</b>\n",
-        "Примеры из сборщика. Вместе с размеченным в чатах это одна копилка: "
+        "<b>🗄 Спам-база</b>\n",
+        "Примеры из сборщика и кнопок «Спам-профиль». Вместе с размеченным в чатах это одна копилка: "
         "по ней учится нейрофильтр и сравниваются профили во всех чатах сразу. "
         "Два вида, и они не смешиваются: сообщение сравнивается с сообщениями, "
         "профиль с профилями.",
@@ -4707,7 +4635,7 @@ async def view_seed_list(uid: int, page: int = 0) -> tuple[str, InlineKeyboardMa
     _seed_view[uid] = (label, q, page, kind)
     rows = await db.seed_page(label, q, page * SEED_PER_PAGE, SEED_PER_PAGE, kind)
 
-    head = f"<b>🌱 Набор</b> · {_SEED_KINDS[kind]} · {_SEED_LABELS[label]}"
+    head = f"<b>🗄 Спам-база</b> · {_SEED_KINDS[kind]} · {_SEED_LABELS[label]}"
     if q:
         head += f" · поиск «{utils.esc(q)}»"
     lines = [head + "\n",
@@ -4799,7 +4727,7 @@ async def cb_seed_delete(cb: CallbackQuery) -> None:
     gone = await db.seed_delete([sid])
     if gone:
         _seed_changed()
-        await db.add_event(None, "nn", f"из набора удалён пример #{sid} "
+        await db.add_event(None, "nn", f"из спам-базы удалён пример #{sid} "
                                        f"by {cb.from_user.id}")
     _l, _q, page, _k = _seed_state(cb.from_user.id)
     text, kb = await view_seed_list(cb.from_user.id, page)
@@ -4824,7 +4752,7 @@ async def cb_seed_search_ask(cb: CallbackQuery, state: FSMContext) -> None:
         return
     await _ask(
         cb, state, Input.seed_q,
-        "<b>🔎 Поиск в наборе</b>\n\nПришлите слово или кусок фразы — покажу "
+        "<b>🔎 Поиск в спам-базе</b>\n\nПришлите слово или кусок фразы — покажу "
         "все примеры, где оно встречается, и предложу удалить их разом.\n"
         "Например: <code>docker</code>, <code>ядро</code>, <code>systemd</code>.",
         "u:seed",
@@ -4858,8 +4786,8 @@ async def cb_seed_wipe_ask(cb: CallbackQuery) -> None:
     await cb.message.edit_text(
         f"<b>❌ Удалить найденное</b>\n\nПо «<code>{utils.esc(q)}</code>» "
         f"({_SEED_LABELS[label]}) нашлось <b>{found}</b> примеров.\n"
-        "Они пропадут из набора у всех чатов. Отменить будет нельзя — "
-        "набор придётся загружать заново.",
+        "Они пропадут из спам-базы у всех чатов. Отменить будет нельзя — "
+        "примеры придётся загружать заново.",
         reply_markup=b.as_markup())
     await cb.answer()
 
@@ -4872,7 +4800,7 @@ async def cb_seed_wipe(cb: CallbackQuery) -> None:
     gone = await db.seed_delete_where(label, q, kind)
     if gone:
         _seed_changed()
-        await db.add_event(None, "nn", f"из набора удалено по «{q}»: {gone} "
+        await db.add_event(None, "nn", f"из спам-базы удалено по «{q}»: {gone} "
                                        f"by {cb.from_user.id}")
     _seed_view[cb.from_user.id] = (label, None, 0, kind)
     text, kb = await view_seed(cb.from_user.id)
@@ -4908,7 +4836,7 @@ async def cb_seed_clear(cb: CallbackQuery) -> None:
     _l, _q, _p, kind = _seed_state(cb.from_user.id)
     gone = await db.seed_delete_where(None, None, kind)
     _seed_changed()
-    await db.add_event(None, "nn", f"стартовый набор ({kind}) очищен: {gone} "
+    await db.add_event(None, "nn", f"спам-база ({kind}) очищена: {gone} "
                                    f"by {cb.from_user.id}")
     _seed_view[cb.from_user.id] = (None, None, 0, kind)
     text, kb = await view_seed(cb.from_user.id)

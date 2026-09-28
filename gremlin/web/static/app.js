@@ -362,7 +362,7 @@ async function homeView() {
     <div class="tiles">
       ${tile('#/access', '👥 Доступ к боту')}
       ${tile('#/knocks', '🚪 Постучались')}
-      ${tile('#/seed', '🌱 Стартовый набор')}
+      ${tile('#/seed', '🗄 Спам-база')}
       ${tile('#/roulette', '🎯 Бан-рулетка')}
       ${tile('#/admin/log', '📜 Лог событий')}
       ${tile('#/admin/errors', '🐞 Ошибки')}
@@ -605,7 +605,8 @@ function widgetHtml(name, w, cid, d) {
           <div class="value">${w.spam}</div></div>
         <div class="row"><div class="label">🕊 Норма<small>сообщения</small></div>
           <div class="value">${w.ok}</div></div>
-        ${linkRow(`#/chat/${cid}/spamprofiles`, '🧪 Профили спамеров', w.faces_spam)}
+        <div class="row"><div class="label">🧪 Профили спамеров<small>автобаны в этом чате</small></div>
+          <div class="value">${w.faces_spam}</div></div>
         <div class="row"><div class="label">✋ Ручные наказания<small>в сравнении не участвуют</small></div>
           <div class="value">${w.unknown}</div></div>
         <div class="row"><div class="label">🧠 Модель</div>
@@ -671,7 +672,6 @@ function widgetHtml(name, w, cid, d) {
       return `<div class="card">
         ${tile(`#/chat/${cid}/s/prof`, '🪪 Проверка профиля', { dot: w.prof_on })}
         ${tile(`#/chat/${cid}/s/cas`, '🌐 Общий список спамеров', { dot: w.cas_on })}
-        ${tile(`#/chat/${cid}/spamprofiles`, '🧪 Спам-профили', { sub: `записей ${w.spam_profiles}` })}
       </div>`;
 
     case 'cas_stats':
@@ -820,26 +820,6 @@ async function wlEntryView(cid, rid) {
       </div>
       <button class="btn wide danger" style="margin-top:12px" data-act="wl-del" data-row="${e.row_id}">
         🗑 Убрать из вайтлиста</button>
-    </div>`,
-  };
-}
-
-async function spamProfilesView(cid) {
-  const d = await api(`/chat/${cid}/spamprofiles`);
-  return {
-    title: 'Спам-профили',
-    back: `#/chat/${cid}/s/watch`,
-    html: `<div class="card">
-      <div class="intro">${introHtml('С этими профилями бот сравнивает новых людей, когда включено «Сравнивать профили с забаненными».\n\n'
-        + 'Сюда попадают профили, записанные кнопкой «Спам-профиль», и те, кого бот забанил сам. Записали по ошибке — уберите.\n\n'
-        + 'База общая: профиль, записанный здесь, бот узнаёт во всех чатах.')}</div>
-    </div>
-    <div class="card">
-      <h2>Всего: ${d.items.length}</h2>
-      ${d.items.map((p) => `<div class="item">
-          <div class="body">${esc(p.who)}<small>${esc(p.when)} · ${esc(p.text)}</small></div>
-          <button class="btn small ghost" data-act="spamprofile-del" data-id="${p.id}">✕ Убрать</button>
-        </div>`).join('') || '<div class="empty">Пусто.</div>'}
     </div>`,
   };
 }
@@ -1359,7 +1339,7 @@ function statusHtml(cid) {
       <h2 style="margin-top:12px">⚖️ Наказания в ваших чатах</h2>
       <div class="wrap">${counts}</div>
       <div class="wrap" style="margin-top:10px">
-        <button class="btn ghost" data-act="spam-profile" data-uid="${esc(d.user_id)}">🧪 Спам-профиль${d.here ? ` в «${esc(d.here)}»` : ''}</button>
+        <button class="btn ghost" data-act="spam-profile" data-uid="${esc(d.user_id)}">🧪 Спам-профиль в спам-базу</button>
       </div>
     </div>
     <div class="card"><h2>💬 Чаты</h2>${chats}</div>
@@ -1718,7 +1698,7 @@ async function knocksView() {
   };
 }
 
-// Стартовый набор общий на весь бот: удалили пример — он пропал у всех
+// Спам-база общая на весь бот: удалили пример — он пропал у всех
 // чатов сразу. Чужая «норма» из чата про Linux в чате про рыбалку только
 // мешает, поэтому смысл страницы — быстро найти лишнее и выкинуть.
 const SEED = { label: '', q: '', page: 0, kind: 'msg' };
@@ -1734,10 +1714,10 @@ async function seedView() {
   const kindTab = (key, name) => `<button class="btn ${SEED.kind === key ? '' : 'ghost'}"
     data-act="seed-kind" data-kind="${key}">${name}</button>`;
   return {
-    title: 'Стартовый набор',
+    title: 'Спам-база',
     back: '#/',
     html: `<div class="card">
-      <div class="intro">Примеры из сборщика. Вместе с тем, что размечено в
+      <div class="intro">Примеры из сборщика и кнопок «Спам-профиль». Вместе с тем, что размечено в
         чатах, это одна копилка: по ней учится нейрофильтр и сравниваются
         профили во всех чатах сразу. Два вида, и они не смешиваются: сообщение
         сравнивается с сообщениями, профиль с профилями.<br><br>
@@ -1888,7 +1868,6 @@ const ROUTES = [
   [/^chat\/(-?\d+)\/wl\/(\d+)$/, wlEntryView],
   [/^chat\/(-?\d+)\/linkwl$/, linkwlView],
   [/^chat\/(-?\d+)\/admins$/, adminsView],
-  [/^chat\/(-?\d+)\/spamprofiles$/, spamProfilesView],
   [/^chat\/(-?\d+)\/charts$/, chartsView],
   [/^chat\/(-?\d+)\/trigs$/, trigsView],
   [/^chat\/(-?\d+)\/trig\/(\d+)$/, trigView],
@@ -1988,7 +1967,7 @@ function skeletonFor(path) {
     return skelCard(skelHead + skelLine(95) + skelLine(88) + skelLine(60) + skelRows(4))
       + skelCard(skelHead + skelRows(2));
   }
-  const lists = /^(chat\/-?\d+\/(active|events|trigs|cmds|words|profwords|warned|answers|linkwl|admins|spamprofiles)|access|knocks|seed|admin\/log)/;
+  const lists = /^(chat\/-?\d+\/(active|events|trigs|cmds|words|profwords|warned|answers|linkwl|admins)|access|knocks|seed|admin\/log)/;
   if (lists.test(path)) return skelCard(skelHead + skelItems(6));
   return skelCard(skelHead + skelRows(3));
 }
@@ -2413,13 +2392,6 @@ const ACT = {
     render();
   },
 
-  async 'spamprofile-del'(el) {
-    if (!await confirmAsk('Убрать профиль из базы спама?')) return;
-    await api(`/chat/${curChat()}/spamprofiles/${el.dataset.id}`, { method: 'DELETE' });
-    toast('Убран');
-    render();
-  },
-
   async unforgive(el) {
     await api(`/chat/${curChat()}/forgiven/${el.dataset.id}`, { method: 'DELETE' });
     toast('Правило снова работает');
@@ -2647,7 +2619,7 @@ const ACT = {
   },
 
   async 'seed-search'() {
-    const v = await ask({ title: 'Поиск в наборе',
+    const v = await ask({ title: 'Поиск в спам-базе',
                           hint: 'Слово или кусок фразы — например docker, ядро, systemd.' });
     if (v === null) return;
     SEED.q = v.trim();

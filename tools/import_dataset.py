@@ -1,4 +1,4 @@
-"""Загрузить чужой датасет в стартовый набор улик.
+"""Загрузить чужой датасет в спам-базу.
 
 Зачем: модели нужны примеры спама и обычных сообщений, а свои чаты дают их
 медленно. Набор ложится в общую копилку улик — ту же, что пополняют сборщик
@@ -118,7 +118,7 @@ def prepare(rows, args) -> list[tuple[str, str]]:
 
 
 async def main() -> None:
-    ap = argparse.ArgumentParser(description="Импорт датасета в стартовый набор")
+    ap = argparse.ArgumentParser(description="Импорт датасета в спам-базу")
     ap.add_argument("path", help="файл датасета (.jsonl, .csv, .parquet)")
     ap.add_argument("--text-col", help="колонка с текстом")
     ap.add_argument("--label-col", help="колонка с меткой")

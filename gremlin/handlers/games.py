@@ -1,4 +1,5 @@
-"""Игры в чате: рулетка, дуэль, королевская битва, суд, титулы недели.
+"""Игры в чате: рулетка, дуэль, королевская битва, суд, титулы недели;
+и жесты — любовь, мог, статус.
 
 Каждая включается отдельно в меню чата и может быть открыта либо всем, либо
 только админам. Наказания настоящие — выдаются через общий механизм, поэтому
@@ -13,6 +14,7 @@ import logging
 import random
 import re
 import time
+from types import SimpleNamespace
 
 from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery, Message
@@ -54,8 +56,10 @@ async def _drum_save(chat_id: int, drum: dict) -> None:
     await db.kv_set(_RUS_KEY.format(chat_id), json.dumps(drum))
 
 
-async def _pull(chat_id: int) -> tuple[str, int]:
+async def _pull(chat_id: int, reload_min: int) -> tuple[str, int]:
     """Нажать на спуск. Вернуть (что вышло, число).
+
+    reload_min — перезарядка после выстрела, из настроек чата.
 
     ('reload', секунд до готовности) — револьвер на перезарядке;
     ('miss', сколько гнёзд осталось) — щелчок, барабан провернулся;
@@ -71,7 +75,7 @@ async def _pull(chat_id: int) -> tuple[str, int]:
             # заряжаем: патрон в случайное гнездо, крутим с нуля
             drum = {"bullet": random.randrange(config.RUS_CHANCE), "pulls": 0}
         if drum["pulls"] >= drum["bullet"]:
-            await _drum_save(chat_id, {"reload_until": now + config.RUS_CD})
+            await _drum_save(chat_id, {"reload_until": now + reload_min * 60})
             return "hit", 0
         drum["pulls"] += 1
         await _drum_save(chat_id, drum)
@@ -117,14 +121,30 @@ async def _cleanup(bot: Bot, chat_id: int, msg_id: int,
         pass
 
 
-def _later(bot: Bot, chat_id: int, msg_id: int) -> None:
-    runtime.spawn(_cleanup(bot, chat_id, msg_id))
+def _later(bot: Bot, chat_id: int, msg_id: int,
+           delay: int = config.GAME_CLEANUP) -> None:
+    runtime.spawn(_cleanup(bot, chat_id, msg_id, delay))
 
 
 async def _who(user_id: int) -> str:
     row = await db.get_user(user_id)
     return utils.mention(user_id, row["first_name"] if row else None,
                          row["username"] if row else None)
+
+
+def _replied(message: Message):
+    """Сообщение, на которое ответили по-настоящему, или None.
+
+    В чате с темами Telegram сам делает каждое сообщение темы «ответом» на
+    её первое, служебное сообщение — без этой проверки команда без ответа
+    доставалась бы автору темы: его вызывали на дуэль, судили, ему кидали
+    жест.
+    """
+    reply = message.reply_to_message
+    if (reply is None or reply.from_user is None
+            or getattr(reply, "forum_topic_created", None) is not None):
+        return None
+    return reply
 
 
 _STRICTER = {"ban": "и так забанен", "mute": "и так в муте навсегда"}
@@ -191,8 +211,8 @@ async def _rus_target(message: Message, bot: Bot):
     Обычному участнику так нельзя: иначе рулетка стала бы способом мутить
     кого хочешь чужими руками с шансом один к шести.
     """
-    reply = message.reply_to_message
-    author = getattr(reply, "from_user", None) if reply else None
+    reply = _replied(message)
+    author = reply.from_user if reply else None
     if author is None or author.id == message.from_user.id or author.is_bot:
         return message.from_user, False
     if message.from_user.id not in await adm_cache.chat_admin_ids(
@@ -207,7 +227,8 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
     player, by_admin = await _rus_target(message, bot)
     # Щелчок считаем сразу, до паузы: пока барабан «крутится» две секунды,
     # следующий игрок уже должен видеть его провёрнутым.
-    outcome, value = await _pull(message.chat.id)
+    s = await db.get_settings(message.chat.id)
+    outcome, value = await _pull(message.chat.id, s.rus_cd)
     if outcome == "reload":
         sent = await message.reply(
             f"🔫 Револьвер на перезарядке. Будет готов через "
@@ -215,7 +236,6 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
         _later(bot, message.chat.id, sent.message_id)
         return
 
-    s = await db.get_settings(message.chat.id)
     kind, minutes = await prize(s, config.GAME_RUS)
     who = utils.mention(player.id, player.full_name, player.username)
     sent = await message.reply("🔫 Крутим барабан…" if not by_admin
@@ -230,7 +250,7 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
             f"<i>В барабане {value} {word} — шанс 1 из {value}.</i>")
         return
     reload_note = (f"<i>Револьвер ушёл на перезарядку на "
-                   f"{utils.fmt_minutes(config.RUS_CD // 60)}.</i>")
+                   f"{utils.fmt_minutes(s.rus_cd)}.</i>")
     # патрон потрачен в любом случае: иначе админ разряжал бы барабан без
     # последствий, а перезарядку чату всё равно пришлось бы ждать
     if not await _can_target(bot, message.chat.id, player.id):
@@ -247,14 +267,74 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
 
 # ---------- дуэль ----------
 
+# Кто когда последний раз вызывал: (chat_id, user_id) -> time.time().
+# Держим в памяти — перезапуск обнулит часовую паузу, для дуэли это мелочь.
+_duel_last: dict[tuple[int, int], float] = {}
+
+_DUEL_NO = (
+    "{foe} струсил перед грозной силой {caller} и сбежал, теряя тапки.",
+    "{foe} внезапно вспомнил, что у него суп на плите, и покинул поле боя.",
+    "{foe} отказался: пистолет не подходит к цвету его носков.",
+    "{foe} предъявил справку от мамы — к дуэлям не допущен.",
+    "{foe} поймал взгляд {caller} и упал в обморок ещё до барьера.",
+    "{foe} спрятался под стол и делает вид, что его тут нет.",
+    "{foe} объявил себя пацифистом и ушёл обнимать деревья.",
+    "{foe} заранее притворился мёртвым, чтобы не тратить время на дуэль.",
+    "{foe} сбежал так быстро, что на его месте осталось облачко пыли.",
+    "{foe} сослался на ретроградный Меркурий: дуэли ему сегодня противопоказаны.",
+    "{foe} попросил перенести дуэль на после дождичка в четверг.",
+)
+
+
+async def _is_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
+    """Админ чата или владелец бота: паузы и антиспам приколов их не держат."""
+    return (user_id in config.ADMIN_IDS
+            or user_id in await adm_cache.chat_admin_ids(bot, chat_id))
+
+
+async def _quiet_penalty(bot: Bot, message: Message, minutes: int, reason: str,
+                         wipe: int = 0) -> None:
+    """Молча убрать команду (и wipe последних сообщений автора) и выдать мут.
+
+    Без карточки в лог: это не нарушение правил чата, а перебор с приколом.
+    Мут всё равно ложится в «Наказания», чтобы его можно было снять кнопкой.
+    minutes=0 — только удаляем.
+    """
+    from ..services import deleting
+    chat_id, user = message.chat.id, message.from_user
+    ids = (moderation.take_recent(chat_id, user.id, wipe, skip=message.message_id)
+           if wipe else [])
+    await deleting.many(bot, chat_id, ids + [message.message_id])
+    if not minutes:
+        return
+    pid, _total, _stricter = await moderation.game_punish(
+        bot, chat_id, user, "mute", minutes, reason, None)
+    if pid is not None:
+        await db.add_event(chat_id, "manual", f"игра: {reason} — {user.id}")
+
+
+def _prune(last: dict, older: float) -> None:
+    """Выкинуть давние отметки, чтобы словари пауз не росли бесконечно."""
+    if len(last) > 5000:
+        for k in [k for k, t in last.items() if t < older]:
+            del last[k]
+
+
 async def cmd_duel(message: Message, bot: Bot) -> None:
     if not await _allowed(bot, message, config.GAME_DUEL):
         return
-    if not message.reply_to_message or not message.reply_to_message.from_user:
+    chat_id, caller = message.chat.id, message.from_user.id
+    admin = await _is_admin(bot, chat_id, caller)
+    now = time.time()
+    if not admin and now - _duel_last.get((chat_id, caller), 0) < config.DUEL_CD:
+        await _quiet_penalty(bot, message, config.DUEL_CD_MUTE,
+                             "вызов на дуэль раньше срока")
+        return
+    if _replied(message) is None:
         sent = await message.reply("⚔️ Вызывать на дуэль надо ответом на сообщение.")
         _later(bot, message.chat.id, sent.message_id, 60)
         return
-    foe = message.reply_to_message.from_user
+    foe = _replied(message).from_user
     me = message.from_user
     if foe.id == me.id or foe.is_bot:
         sent = await message.reply("⚔️ С собой и с ботами не дерутся.")
@@ -265,6 +345,8 @@ async def cmd_duel(message: Message, bot: Bot) -> None:
     kind, minutes = await prize(s, config.GAME_DUEL)
     b = InlineKeyboardBuilder()
     b.button(text="⚔️ Принять вызов", callback_data="g:duel")
+    b.button(text="🏳️ Отказаться", callback_data="g:duelno")
+    b.adjust(2)
     head = (f"⚔️ <b>Дуэль!</b>\n\n{utils.mention(me.id, me.full_name, me.username)} "
             f"вызывает {utils.mention(foe.id, foe.full_name, foe.username)}.\n"
             f"Проигравший получает {prize_label(kind, minutes)}.\n\n")
@@ -274,6 +356,11 @@ async def cmd_duel(message: Message, bot: Bot) -> None:
     )
     key = (message.chat.id, sent.message_id)
     _duels[key] = {"caller": me.id, "foe": foe.id}
+    # час идёт с вызова, а не с боя: иначе отказы соперника давали бы
+    # вызывать снова и снова
+    if not admin:
+        _prune(_duel_last, now - config.DUEL_CD)
+        _duel_last[(chat_id, caller)] = now
     runtime.spawn(_duel_timeout(bot, key, foe.id, head, b.as_markup()))
 
 
@@ -314,6 +401,8 @@ async def cb_duel(cb: CallbackQuery, bot: Bot) -> None:
 
     loser = random.choice([duel["caller"], duel["foe"]])
     winner = duel["foe"] if loser == duel["caller"] else duel["caller"]
+    await db.tally_add(key[0], winner, "duel_win")
+    await db.tally_add(key[0], loser, "duel_loss")
     try:
         await cb.message.edit_text("⚔️ <b>Дуэль!</b>\n\nСходятся у барьера…",
                                    reply_markup=None)
@@ -333,6 +422,28 @@ async def cb_duel(cb: CallbackQuery, bot: Bot) -> None:
                    else " · но приз не вручить, у бота нет прав"))
     try:
         await cb.message.edit_text(text, reply_markup=None)
+    except Exception:
+        pass
+    _later(bot, key[0], key[1])
+
+
+@router.callback_query(F.data == "g:duelno")
+async def cb_duel_no(cb: CallbackQuery, bot: Bot) -> None:
+    key = (cb.message.chat.id, cb.message.message_id)
+    duel = _duels.get(key)
+    if duel is None:
+        await cb.answer("Дуэль уже закончилась.", show_alert=True)
+        return
+    if cb.from_user.id != duel["foe"]:
+        await cb.answer(CLICK_ONLY_PLAYERS, show_alert=True)
+        return
+    _duels.pop(key, None)
+    await cb.answer("Позор засчитан.")
+    line = random.choice(_DUEL_NO).format(foe=await _who(duel["foe"]),
+                                          caller=await _who(duel["caller"]))
+    try:
+        await cb.message.edit_text(f"🏳️ <b>Дуэль не состоялась</b>\n\n{line}",
+                                   reply_markup=None)
     except Exception:
         pass
     _later(bot, key[0], key[1])
@@ -485,11 +596,11 @@ async def _battle_run(bot: Bot, key: tuple[int, int]) -> None:
 async def cmd_court(message: Message, bot: Bot) -> None:
     if not await _allowed(bot, message, config.GAME_COURT):
         return
-    if not message.reply_to_message or not message.reply_to_message.from_user:
+    if _replied(message) is None:
         sent = await message.reply("⚖️ Судить надо ответом на сообщение обвиняемого.")
         _later(bot, message.chat.id, sent.message_id, 60)
         return
-    accused = message.reply_to_message.from_user
+    accused = _replied(message).from_user
     if accused.is_bot or not await _can_target(bot, message.chat.id, accused.id):
         sent = await message.reply("⚖️ Этот подсудимый неподсуден.")
         _later(bot, message.chat.id, sent.message_id, 60)
@@ -741,8 +852,8 @@ async def cmd_vanish(message: Message, bot: Bot) -> None:
     chat_id = message.chat.id
     s = await db.get_settings(chat_id)
     target = message.from_user.id
-    reply = message.reply_to_message
-    author = getattr(reply, "from_user", None) if reply else None
+    reply = _replied(message)
+    author = reply.from_user if reply else None
     # ответом на чужое — только админ: иначе любой вычищал бы переписку других
     if (author is not None and author.id != target and not author.is_bot
             and target in await adm_cache.chat_admin_ids(bot, chat_id)):
@@ -752,19 +863,231 @@ async def cmd_vanish(message: Message, bot: Bot) -> None:
     await deleting.many(bot, chat_id, ids + [message.message_id])
 
 
+# ---------- жесты: любовь, мог, статус ----------
+#
+# Не игры: приза нет, кидать может любой. Бот отвечает случайной фразой из
+# списка чата, в фразе {кто}, {кому} и {сколько} подставляются сами.
+
+# последний жест: (chat_id, user_id, бит жеста) -> time.time(); у каждого
+# жеста своя пауза
+_gest_last: dict[tuple[int, int, int], float] = {}
+_status_last: dict[tuple[int, int], float] = {}
+
+# бит -> (ключ «кинул», ключ «получил») в tally
+_GEST_KEYS = {config.GAME_LOVE: ("love_gave", "love_got"),
+              config.GAME_MOG: ("mog_gave", "mog_got")}
+_GEST_HINT = {
+    config.GAME_LOVE: "💘 Любовь кидают ответом на сообщение или так: "
+                      "<code>!любовь @ник</code>.",
+    config.GAME_MOG: "🗿 Моггнуть можно ответом на сообщение или так: "
+                     "<code>!моггнуть @ник</code>.",
+}
+_GEST_SELF = {config.GAME_LOVE: "{кто} любит себя — и правильно 💖",
+              config.GAME_MOG: "{кто} моггнул сам себя в зеркале 🪞"}
+_UNKNOWN = "🤷 Не знаю, кто это: пусть сначала что-нибудь напишет в чат."
+
+
+def tag(user_id: int, name: str | None, username: str | None) -> str:
+    """Имя профиля ссылкой на профиль. Ник не показываем — только если имени
+    нет вовсе, он идёт вместо него."""
+    return (f'<a href="tg://user?id={user_id}">'
+            f'{utils.esc(name or username or str(user_id))}</a>')
+
+
+async def _target(message: Message, bot: Bot):
+    """Кому жест: по @нику или упоминанию в самой команде, иначе автор
+    сообщения, на которое ответили.
+
+    None — не указано никого; "unknown" — ник есть, но такого человека бот
+    не видел. Bot API не умеет искать людей по нику, поэтому ищем в своей
+    базе — там все, кто писал при боте. Себя бот узнаёт и так.
+    """
+    from ..services import filters
+    for ent in message.entities or ():
+        if ent.type == "text_mention" and ent.user:
+            u = ent.user
+            return SimpleNamespace(id=u.id, full_name=u.full_name,
+                                   username=u.username, is_bot=u.is_bot)
+    names = filters.mentions_in(message)
+    if names:
+        me = await bot.me()
+        if me.username and names[0].lower() == me.username.lower():
+            return SimpleNamespace(id=me.id, full_name=getattr(me, "full_name", None),
+                                   username=me.username, is_bot=True)
+        row = await db.user_by_username(names[0])
+        if row is None:
+            return "unknown"
+        return SimpleNamespace(id=row["user_id"], full_name=row["first_name"],
+                               username=row["username"], is_bot=False)
+    reply = _replied(message)
+    return reply.from_user if reply is not None else None
+
+
+async def _notice(bot: Bot, message: Message, text: str) -> None:
+    sent = await message.reply(text)
+    _later(bot, message.chat.id, sent.message_id, 60)
+
+
+async def cmd_gesture(message: Message, bot: Bot, bit: int,
+                      inline: bool = False) -> bool:
+    """Кинуть жест. Вернуть, был ли это жест.
+
+    inline — команда стоит посреди текста («дать тебе !любовь»). Тогда без
+    адресата молчим и отдаём сообщение дальше триггерам: человек мог просто
+    написать слово с восклицательным знаком, подсказка тут была бы шумом.
+    """
+    chat_id = message.chat.id
+    s = await db.get_settings(chat_id)
+    me = message.from_user
+    if not s.games_on & bit:
+        # Жест выключен — команду в начале сообщения убираем и, если так
+        # настроено, мутим: чат, где жесты не нужны, не должен ими зарастать.
+        # Посреди текста не трогаем: это может быть просто слово с «!»
+        if inline:
+            return False
+        if s.gest_off_punish and not await _is_admin(bot, chat_id, me.id):
+            await _quiet_penalty(bot, message, s.gest_mute, "жест, когда жесты выключены")
+        return True
+    target = await _target(message, bot)
+    if target is None or target == "unknown":
+        if inline:
+            return False
+        await _notice(bot, message, _GEST_HINT[bit] if target is None else _UNKNOWN)
+        return True
+
+    now = time.time()
+    key = (chat_id, me.id, bit)
+    if (not await _is_admin(bot, chat_id, me.id)
+            and now - _gest_last.get(key, 0) < config.GESTURE_CD):
+        await _quiet_penalty(bot, message, s.gest_mute, "спам жестами",
+                             config.GESTURE_WIPE)
+        return True
+    _prune(_gest_last, now - config.GESTURE_CD)
+    _gest_last[key] = now
+
+    who = tag(me.id, me.full_name, me.username)
+    if target.id == me.id:
+        await message.reply(_GEST_SELF[bit].replace("{кто}", who))
+        return True
+    gave, got = _GEST_KEYS[bit]
+    # Гремлину жесты считаем, как человеку. Чужим ботам — нет: от их имени
+    # пишут анонимные админы и канал, и счёт был бы общим на всех сразу
+    if target.is_bot and target.id != (await bot.me()).id:
+        n = (await db.tally_get(chat_id, target.id)).get(got, 0)
+    else:
+        await db.tally_add(chat_id, me.id, gave)
+        n = await db.tally_add(chat_id, target.id, got)
+
+    owner = config.GESTURE_OWNER[bit]
+    # список пуст (все фразы удалили) — берём встроенную, а не молчим
+    ans = await db.ans_pick(owner, chat_id) or {
+        "text": random.choice(config.GESTURE_SEED[owner]),
+        "file_path": None, "media_type": None}
+    subs = {"{кто}": who,
+            "{кому}": tag(target.id, target.full_name, target.username),
+            "{сколько}": str(n)}
+    # отвечаем на сообщение того, кому жест; кинули по нику — на саму команду
+    reply = _replied(message)
+    anchor = (reply if reply is not None and reply.from_user.id == target.id
+              else message)
+    from ..services import triggers
+    await triggers.send_answer(anchor, ans, subs=subs)
+    return True
+
+
+async def cmd_love(message: Message, bot: Bot) -> None:
+    await cmd_gesture(message, bot, config.GAME_LOVE)
+
+
+async def cmd_mog(message: Message, bot: Bot) -> None:
+    await cmd_gesture(message, bot, config.GAME_MOG)
+
+
+async def status_text(chat_id: int, user, itself: bool = False) -> str:
+    """Карточка для !статус. itself — карточка самого Гремлина: сообщения
+    свои он не считает, в дуэлях не участвует, жесты только получает."""
+    t = await db.tally_get(chat_id, user.id)
+    head = f"📋 <b>Статус</b> · {tag(user.id, user.full_name, user.username)}\n\n"
+    if itself:
+        return (head + "🤖 Это я, местный бот. Работаю, не жалуюсь.\n\n"
+                f"❤️ Получил любви: <b>{t.get('love_got', 0)}</b>\n"
+                f"🗿 Моггнули меня: <b>{t.get('mog_got', 0)}</b>")
+    msgs = await db.msg_total(chat_id, user.id)
+    return (
+        head +
+        f"💬 Сообщений в чате: <b>{msgs}</b>\n\n"
+        f"❤️ Получил любви: <b>{t.get('love_got', 0)}</b>\n"
+        f"💝 Подарил любви: <b>{t.get('love_gave', 0)}</b>\n\n"
+        f"🗿 Моггнули его: <b>{t.get('mog_got', 0)}</b>\n"
+        f"😎 Моггнул сам: <b>{t.get('mog_gave', 0)}</b>\n\n"
+        f"🏆 Побед в дуэлях: <b>{t.get('duel_win', 0)}</b>\n"
+        f"💀 Поражений в дуэлях: <b>{t.get('duel_loss', 0)}</b>"
+    )
+
+
+async def cmd_status(message: Message, bot: Bot) -> None:
+    chat_id = message.chat.id
+    s = await db.get_settings(chat_id)
+    if not s.games_on & config.GAME_STATUS:
+        return
+    me = message.from_user
+    admin = await _is_admin(bot, chat_id, me.id)
+    now = time.time()
+    # это просмотр, а не жест: лишние вызовы просто не замечаем
+    if not admin and now - _status_last.get((chat_id, me.id), 0) < config.STATUS_CD:
+        return
+    _prune(_status_last, now - config.STATUS_CD)
+    _status_last[(chat_id, me.id)] = now
+    target = await _target(message, bot)
+    if target == "unknown" and admin:
+        await _notice(bot, message, _UNKNOWN)
+        return
+    # чужой профиль смотрят только админы; остальным — свой, и ещё ботов
+    if target is None or target == "unknown" or (not admin and not target.is_bot):
+        target = me
+    itself = target.id == (await bot.me()).id
+    sent = await message.reply(await status_text(chat_id, target, itself))
+    _later(bot, chat_id, sent.message_id)
+
+
+async def seed_gesture(cid: int, bit: int) -> None:
+    """Включили жест, а фраз нет — кладём встроенные, чтобы было с чего начать."""
+    owner = config.GESTURE_OWNER.get(bit)
+    if owner and not await db.ans_list(owner, cid):
+        for text in config.GESTURE_SEED[owner]:
+            await db.ans_add(owner, cid, text)
+
+
 COMMANDS = (
     (re.compile(r"^!(рулетка|roulette)(\s|$)", re.IGNORECASE), cmd_roulette),
     (re.compile(r"^!(дуэль|duel)(\s|$)", re.IGNORECASE), cmd_duel),
     (re.compile(r"^!(битва|battle)(\s|$)", re.IGNORECASE), cmd_battle),
     (re.compile(r"^!(суд|court)(\s|$)", re.IGNORECASE), cmd_court),
     (re.compile(r"^!vanish(\s|$)", re.IGNORECASE), cmd_vanish),
+    (re.compile(r"^!(любить|любовь|love)(\s|$)", re.IGNORECASE), cmd_love),
+    (re.compile(r"^!(моггнуть|моггнул|mog)(\s|$)", re.IGNORECASE), cmd_mog),
+    (re.compile(r"^!(статус|status)(\s|$)", re.IGNORECASE), cmd_status),
+)
+
+
+# жесты срабатывают и посреди текста: «я бы хотел дать тебе !любовь»
+INLINE_GESTURES = (
+    (re.compile(r"(?:^|\s)!(любить|любовь|love)(?=$|[\s.,!?;:)…])", re.IGNORECASE),
+     config.GAME_LOVE),
+    (re.compile(r"(?:^|\s)!(моггнуть|моггнул|mog)(?=$|[\s.,!?;:)…])", re.IGNORECASE),
+     config.GAME_MOG),
 )
 
 
 async def fire_game(bot: Bot, message: Message) -> bool:
-    """Запустить игру, если сообщение начинается с её команды."""
+    """Запустить игру, если сообщение начинается с её команды, или жест,
+    если его команда стоит где-то в тексте."""
+    text = message.text or ""
     for pattern, handler in COMMANDS:
-        if pattern.match(message.text or ""):
+        if pattern.match(text):
             await handler(message, bot)
             return True
+    for pattern, bit in INLINE_GESTURES:
+        if pattern.search(text):
+            return await cmd_gesture(message, bot, bit, inline=True)
     return False

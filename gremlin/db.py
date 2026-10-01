@@ -180,6 +180,7 @@ CREATE TABLE IF NOT EXISTS settings(
     games_adm       INTEGER NOT NULL DEFAULT 0,
     rus_punish      TEXT    NOT NULL DEFAULT 'mute',
     rus_min         INTEGER NOT NULL DEFAULT 5,
+    rus_cd          INTEGER NOT NULL DEFAULT 360,
     duel_punish     TEXT    NOT NULL DEFAULT 'mute',
     duel_min        INTEGER NOT NULL DEFAULT 10,
     battle_punish   TEXT    NOT NULL DEFAULT 'mute',
@@ -189,13 +190,10 @@ CREATE TABLE IF NOT EXISTS settings(
     paste_min       INTEGER NOT NULL DEFAULT 1000,
     paste_cd        INTEGER NOT NULL DEFAULT 15,
     vanish_n        INTEGER NOT NULL DEFAULT 10,
+    gest_mute       INTEGER NOT NULL DEFAULT 5,
+    gest_off_punish INTEGER NOT NULL DEFAULT 1,
     nn_mode         INTEGER NOT NULL DEFAULT 1,
     nn_threshold    INTEGER NOT NULL DEFAULT 85,
-    sem_on          INTEGER NOT NULL DEFAULT 0,
-    sem_threshold   INTEGER NOT NULL DEFAULT 75,
-    sem_punish      TEXT    NOT NULL DEFAULT 'delete',
-    sem_mute_min    INTEGER NOT NULL DEFAULT 60,
-    sem_guests      INTEGER NOT NULL DEFAULT 0,
     burst_on        INTEGER NOT NULL DEFAULT 0,
     burst_users     INTEGER NOT NULL DEFAULT 3,
     burst_punish    TEXT    NOT NULL DEFAULT 'delete',
@@ -270,6 +268,15 @@ CREATE TABLE IF NOT EXISTS msg_stats(
     cnt     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (chat_id, user_id, day)
 );
+-- счёт жестов и дуэлей для !статус: love_got, love_gave, mog_got, mog_gave,
+-- duel_win, duel_loss
+CREATE TABLE IF NOT EXISTS tally(
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    key     TEXT    NOT NULL,
+    n       INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (chat_id, user_id, key)
+);
 CREATE TABLE IF NOT EXISTS access(
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id  INTEGER,
@@ -339,15 +346,6 @@ CREATE TABLE IF NOT EXISTS words(
     -- там совпало — наказали, весить нечего.
     weight  INTEGER NOT NULL DEFAULT 45
 );
-CREATE TABLE IF NOT EXISTS phrases(
-    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id INTEGER NOT NULL,
-    text    TEXT NOT NULL,
-    hits    INTEGER NOT NULL DEFAULT 0,   -- сколько раз поймала
-    created INTEGER NOT NULL DEFAULT 0,
-    vec     BLOB
-);
-CREATE INDEX IF NOT EXISTS idx_phrases_chat ON phrases(chat_id);
 CREATE TABLE IF NOT EXISTS punishments(
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id  INTEGER NOT NULL,
@@ -537,6 +535,7 @@ class Settings:
     games_adm: int = 0
     rus_punish: str = "mute"
     rus_min: int = 5
+    rus_cd: int = 360
     duel_punish: str = "mute"
     duel_min: int = 10
     battle_punish: str = "mute"
@@ -546,13 +545,10 @@ class Settings:
     paste_min: int = 1000
     paste_cd: int = 15
     vanish_n: int = 10
+    gest_mute: int = 5
+    gest_off_punish: int = 1
     nn_mode: int = 1
     nn_threshold: int = 85
-    sem_on: int = 0
-    sem_threshold: int = 75
-    sem_punish: str = "delete"
-    sem_mute_min: int = 60
-    sem_guests: int = 0
     burst_on: int = 0
     burst_users: int = 3
     burst_punish: str = "delete"
@@ -654,11 +650,6 @@ _SETTINGS_MIGRATIONS = {
     "trust_mask": "INTEGER NOT NULL DEFAULT 31",
     "nn_mode": "INTEGER NOT NULL DEFAULT 1",
     "nn_threshold": "INTEGER NOT NULL DEFAULT 85",
-    "sem_on": "INTEGER NOT NULL DEFAULT 0",
-    "sem_threshold": "INTEGER NOT NULL DEFAULT 75",
-    "sem_punish": "TEXT NOT NULL DEFAULT 'delete'",
-    "sem_mute_min": "INTEGER NOT NULL DEFAULT 60",
-    "sem_guests": "INTEGER NOT NULL DEFAULT 0",
     "burst_on": "INTEGER NOT NULL DEFAULT 0",
     "burst_users": "INTEGER NOT NULL DEFAULT 3",
     "burst_punish": "TEXT NOT NULL DEFAULT 'delete'",
@@ -698,6 +689,7 @@ _SETTINGS_MIGRATIONS = {
     "games_adm": "INTEGER NOT NULL DEFAULT 0",
     "rus_punish": "TEXT NOT NULL DEFAULT 'mute'",
     "rus_min": "INTEGER NOT NULL DEFAULT 5",
+    "rus_cd": "INTEGER NOT NULL DEFAULT 360",
     "duel_punish": "TEXT NOT NULL DEFAULT 'mute'",
     "duel_min": "INTEGER NOT NULL DEFAULT 10",
     "battle_punish": "TEXT NOT NULL DEFAULT 'mute'",
@@ -707,6 +699,8 @@ _SETTINGS_MIGRATIONS = {
     "paste_min": "INTEGER NOT NULL DEFAULT 1000",
     "paste_cd": "INTEGER NOT NULL DEFAULT 15",
     "vanish_n": "INTEGER NOT NULL DEFAULT 10",
+    "gest_mute": "INTEGER NOT NULL DEFAULT 5",
+    "gest_off_punish": "INTEGER NOT NULL DEFAULT 1",
     "links_guest_punish": "TEXT NOT NULL DEFAULT 'delete'",
     "links_guest_mute_min": "INTEGER NOT NULL DEFAULT 60",
     "lp_tg": "TEXT NOT NULL DEFAULT 'delete'",
@@ -749,7 +743,7 @@ _TABLE_MIGRATIONS = {
     "punishments": {"was_member": "INTEGER NOT NULL DEFAULT 1"},
     "answers": {"last_used": "INTEGER NOT NULL DEFAULT 0"},
     "chats": {"net_id": "INTEGER", "linked_id": "INTEGER",
-              "linked_title": "TEXT", "kind": "TEXT"},
+              "linked_title": "TEXT", "kind": "TEXT", "creator_id": "INTEGER"},
     "words": {"kind": "TEXT NOT NULL DEFAULT 'msg'",
               "weight": "INTEGER NOT NULL DEFAULT 45"},
     "watch_profiles": {"score": "INTEGER NOT NULL DEFAULT 0",
@@ -766,7 +760,6 @@ async def _migrate() -> None:
     cur = await _db.execute("SELECT v FROM kv WHERE k = 'mig_norm_vec'")
     if await cur.fetchone() is None:
         await _db.execute("UPDATE samples SET vec = NULL")
-        await _db.execute("UPDATE phrases SET vec = NULL")
         await _db.execute("INSERT INTO kv (k, v) VALUES ('mig_norm_vec', '1')")
         await _db.commit()
 
@@ -894,6 +887,27 @@ async def _migrate() -> None:
             if col in have:
                 await _db.execute(f"ALTER TABLE {table} DROP COLUMN {col}")
     await _db.execute("DROP TABLE IF EXISTS lore")
+    # «Фразы-образцы» убраны: ни одного срабатывания, а вектор на каждое сообщение
+    await _db.execute("DROP TABLE IF EXISTS phrases")
+
+    # Чаты, откуда бота убрали, и тестовый: их строки лежали во всех таблицах
+    # и ехали в каждый бэкап. Заодно мусор в kv — счётчики удалённого
+    # ИИ-собеседника, отметка чата, которого нет, зависшая карточка заявки —
+    # и настройки, заведённые на id без чата.
+    cur = await _db.execute("SELECT v FROM kv WHERE k = 'mig_dead_chats'")
+    if await cur.fetchone() is None:
+        await _purge_chats(_DEAD_CHATS)
+        marks = ",".join("?" * len(_ORPHAN_SETTINGS))
+        await _db.execute(f"DELETE FROM settings WHERE chat_id IN ({marks})",
+                          _ORPHAN_SETTINGS)
+        await _db.execute(
+            "DELETE FROM kv WHERE k LIKE 'ai_day:%' OR k IN (?, ?)",
+            ("setup_done:-5407097846", "subcard:-1001389201023:2009001088"))
+        # пропуск по ссылке разбана, до которого человек так и не дошёл
+        await _db.execute(
+            "DELETE FROM kv WHERE k LIKE 'unban_pass:%' AND CAST(v AS INTEGER) < ?",
+            (_now(),))
+        await _db.execute("INSERT INTO kv (k, v) VALUES ('mig_dead_chats', '1')")
 
     # ручные спам-профили, записанные раньше в базу чата, — в спам-базу, где
     # их видно и можно убрать. Человек уже есть там — чатовая запись лишняя.
@@ -922,12 +936,83 @@ async def _migrate() -> None:
 # колонки удалённых функций: чистятся при старте, если ещё остались
 _DROPPED_COLUMNS = {
     "settings": ("ai_on", "ai_persona", "ai_random", "ai_ctx", "ai_daily",
-                 "ai_names", "ai_free", "ai_len", "report_restrict"),
+                 "ai_names", "ai_free", "ai_len", "report_restrict",
+                 "sem_on", "sem_threshold", "sem_punish", "sem_mute_min",
+                 "sem_guests"),
     "triggers": ("src_msg",),
     # «заблокирован в боте»: выставить было нечем, а личку и так закрывает
     # список допуска
     "users": ("banned",),
 }
+
+
+# «жопный мир», «апва», «жопный лог» и тестовый «sdasdfas»: бота там больше нет
+_DEAD_CHATS = (-1004474772539, -1004317017699, -5003756599, -1004472112182)
+# строки настроек на id, под которыми чата никогда не было
+_ORPHAN_SETTINGS = (-2073179413117, -2071329961905)
+
+
+async def _purge_chats(chat_ids) -> None:
+    """Стереть чаты начисто: строки во всех таблицах, ответы триггеров и
+    счётчиков, их файлы и ключи kv с id чата.
+
+    Копилку улик не трогаем: она общая на все чаты, и размеченное в одном
+    чате учит фильтр для всех.
+    """
+    ids = tuple(chat_ids)
+    marks = ",".join("?" * len(ids))
+    # ответы висят не на чате, а на триггере или счётчике; у остальных
+    # заготовок (правила, приветствие, паста, письмо) хозяин — сам чат
+    cur = await _db.execute(
+        f"""SELECT id, file_path FROM answers
+            WHERE (owner = 'trig' AND owner_id IN
+                       (SELECT id FROM triggers WHERE chat_id IN ({marks})))
+               OR (owner = 'cmd' AND owner_id IN
+                       (SELECT id FROM chat_cmds WHERE chat_id IN ({marks})))
+               OR (owner NOT IN ('trig', 'cmd') AND owner_id IN ({marks}))""",
+        ids * 3)
+    for row in await cur.fetchall():
+        if row["file_path"]:
+            try:
+                os.remove(row["file_path"])
+            except OSError:
+                pass
+        await _db.execute("DELETE FROM answers WHERE id = ?", (row["id"],))
+    cur = await _db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    for (table,) in [tuple(r) for r in await cur.fetchall()]:
+        if table == "samples":
+            continue
+        cols = await _db.execute(f"PRAGMA table_info({table})")
+        if "chat_id" in {r["name"] for r in await cols.fetchall()}:
+            await _db.execute(f"DELETE FROM {table} WHERE chat_id IN ({marks})", ids)
+    for cid in ids:
+        await _db.execute("DELETE FROM kv WHERE k LIKE ? OR k LIKE ?",
+                          (f"%:{cid}", f"%:{cid}:%"))
+        shutil.rmtree(os.path.join(config.MEDIA_DIR, str(cid)), ignore_errors=True)
+
+
+async def _maybe_vacuum() -> None:
+    """Раз в VACUUM_EVERY пересобрать файл базы.
+
+    Удалённые строки оставляют в страницах дыры, и файл только растёт: на
+    13.7 МБ живой базы 4.7 МБ было пустотой. Бэкап (VACUUM INTO) и так
+    сжат — это про сам рабочий файл, который лежит на медленной папке 9p.
+    """
+    cur = await _db.execute("SELECT v FROM kv WHERE k = 'last_vacuum'")
+    row = await cur.fetchone()
+    if row is not None and _now() - int(row["v"]) < config.VACUUM_EVERY:
+        return
+    started = time.monotonic()
+    try:
+        await _db.execute("VACUUM")
+    except Exception:
+        logger.warning("VACUUM не прошёл", exc_info=True)
+        return
+    await _db.execute(
+        "INSERT INTO kv (k, v) VALUES ('last_vacuum', ?) "
+        "ON CONFLICT(k) DO UPDATE SET v = excluded.v", (str(_now()),))
+    await _db.commit()
+    logger.info("база пересобрана за %.1f с", time.monotonic() - started)
 
 
 def _healthy(path: str) -> bool:
@@ -1000,6 +1085,7 @@ async def init() -> None:
     await _db.executescript(_SCHEMA)
     await _db.commit()
     await _migrate()
+    await _maybe_vacuum()
 
 
 async def close() -> None:
@@ -1083,7 +1169,7 @@ async def set_chat_active(chat_id: int, active: bool) -> None:
 # меняет ей id, и без переноса чат для бота превращается в чужой
 _CHAT_TABLES = ("settings", "triggers", "chat_cmds", "watch_profiles", "whitelist",
                 "link_wl", "inline_wl", "chat_bots", "words", "punishments", "warns",
-                "samples", "events", "msg_stats", "phrases")
+                "samples", "events", "msg_stats", "tally")
 
 
 async def migrate_chat(old_id: int, new_id: int) -> bool:
@@ -1127,6 +1213,24 @@ async def migrate_chat(old_id: int, new_id: int) -> bool:
 async def get_chat(chat_id: int) -> aiosqlite.Row | None:
     cur = await _db.execute("SELECT * FROM chats WHERE chat_id = ?", (chat_id,))
     return await cur.fetchone()
+
+
+async def chat_creator(chat_id: int) -> int | None:
+    """Создатель чата в Telegram (статус creator). None — ещё не узнали."""
+    cur = await _db.execute("SELECT creator_id FROM chats WHERE chat_id = ?", (chat_id,))
+    row = await cur.fetchone()
+    return row["creator_id"] if row else None
+
+
+async def set_chat_creator(chat_id: int, user_id: int) -> None:
+    """Запомнить создателя. Пишем только при смене: список админов
+    перезапрашивается часто, а владелец меняется почти никогда."""
+    cur = await _db.execute(
+        "UPDATE chats SET creator_id = ? WHERE chat_id = ? AND creator_id IS NOT ?",
+        (user_id, chat_id, user_id),
+    )
+    if cur.rowcount:
+        await _db.commit()
 
 
 async def all_chats(active_only: bool = False) -> list[aiosqlite.Row]:
@@ -2104,46 +2208,6 @@ async def sample_set_vec(sample_id: int, vec: bytes) -> None:
     await _db.commit()
 
 
-async def phrases_list(chat_id: int) -> list[aiosqlite.Row]:
-    cur = await _db.execute(
-        "SELECT * FROM phrases WHERE chat_id = ? ORDER BY id", (chat_id,))
-    return await cur.fetchall()
-
-
-async def phrase_add(chat_id: int, text: str) -> int | None:
-    """Добавить фразу-образец. None — такая уже есть."""
-    text = " ".join((text or "").split())[:config.SAMPLE_TEXT_LIMIT]
-    if not text:
-        return None
-    cur = await _db.execute(
-        "SELECT id FROM phrases WHERE chat_id = ? AND lower(text) = lower(?)",
-        (chat_id, text))
-    if await cur.fetchone():
-        return None
-    cur = await _db.execute(
-        "INSERT INTO phrases (chat_id, text, created) VALUES (?,?,?)",
-        (chat_id, text, _now()))
-    await _db.commit()
-    return cur.lastrowid
-
-
-async def phrase_del(chat_id: int, phrase_id: int) -> None:
-    await _db.execute("DELETE FROM phrases WHERE chat_id = ? AND id = ?",
-                      (chat_id, phrase_id))
-    await _db.commit()
-
-
-async def phrase_hit(phrase_id: int) -> None:
-    """Счётчик срабатываний: по нему видно, какие фразы работают, а какие зря."""
-    await _db.execute("UPDATE phrases SET hits = hits + 1 WHERE id = ?", (phrase_id,))
-    await _db.commit()
-
-
-async def phrase_set_vec(phrase_id: int, vec: bytes) -> None:
-    await _db.execute("UPDATE phrases SET vec = ? WHERE id = ?", (vec, phrase_id))
-    await _db.commit()
-
-
 # ---------- общая копилка ----------
 #
 # Копилка одна на все чаты: сборщик, карточки, автобаны, случайные образцы
@@ -2580,6 +2644,20 @@ async def add_event(chat_id: int | None, kind: str, text: str) -> None:
     await _db.commit()
 
 
+async def last_net_lift(chat_id: int, user_id: int) -> int | None:
+    """Когда сетка последний раз снимала с человека наказание в этом чате.
+
+    Отдельной отметки нет — ищем событие, которое пишет net.lift. Нужно,
+    чтобы !разбан не отвечал «наказания не было» тому, кого сняли минуты назад.
+    """
+    cur = await _db.execute(
+        "SELECT ts FROM events WHERE chat_id = ? AND text = ? ORDER BY id DESC LIMIT 1",
+        (chat_id, f"снятие по сетке: {user_id}"),
+    )
+    row = await cur.fetchone()
+    return row["ts"] if row else None
+
+
 async def recent_events(limit: int = 20, chat_id: int | None = None) -> list[aiosqlite.Row]:
     if chat_id is None:
         cur = await _db.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,))
@@ -2881,6 +2959,36 @@ async def msg_inc(chat_id: int, user_id: int, username: str | None = None,
     # который пишет в чате каждый день, «последний раз» навсегда застывал на
     # дате первого сообщения
     await _db.commit()
+
+
+# ---------- счёт жестов и дуэлей ----------
+
+async def tally_add(chat_id: int, user_id: int, key: str) -> int:
+    """Прибавить единицу к счёту человека в чате. Вернуть новый счёт."""
+    cur = await _db.execute(
+        """INSERT INTO tally (chat_id, user_id, key, n) VALUES (?, ?, ?, 1)
+           ON CONFLICT(chat_id, user_id, key) DO UPDATE SET n = n + 1
+           RETURNING n""",
+        (chat_id, user_id, key),
+    )
+    n = (await cur.fetchone())[0]
+    await _db.commit()
+    return n
+
+
+async def tally_get(chat_id: int, user_id: int) -> dict[str, int]:
+    cur = await _db.execute(
+        "SELECT key, n FROM tally WHERE chat_id = ? AND user_id = ?",
+        (chat_id, user_id))
+    return {r["key"]: r["n"] for r in await cur.fetchall()}
+
+
+async def msg_total(chat_id: int, user_id: int) -> int:
+    """Сколько сообщений человек написал в чат за всё время при боте."""
+    cur = await _db.execute(
+        "SELECT SUM(cnt) FROM msg_stats WHERE chat_id = ? AND user_id = ?",
+        (chat_id, user_id))
+    return (await cur.fetchone())[0] or 0
 
 
 # ---------- лорбук ----------

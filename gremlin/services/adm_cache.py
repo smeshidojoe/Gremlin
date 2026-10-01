@@ -28,6 +28,16 @@ async def chat_admin_ids(bot: Bot, chat_id: int) -> set[int]:
                                 if m.user.is_bot and m.user.username}
     except Exception:
         ids = set()
+        members = []
+    # создатель — из того же ответа: отдельно Telegram ради него не спрашиваем
+    creator = next((m.user.id for m in members
+                    if getattr(m, "status", None) == "creator"), None)
+    if creator is not None:
+        from .. import db
+        try:
+            await db.set_chat_creator(chat_id, creator)
+        except Exception:
+            logger.debug("создатель %s не записался", chat_id, exc_info=True)
     _admins[chat_id] = (now + config.ADMIN_CACHE_TTL, ids)
     return ids
 

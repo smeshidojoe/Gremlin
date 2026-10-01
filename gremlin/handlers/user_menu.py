@@ -41,7 +41,6 @@ class Input(StatesGroup):
     mass_unban = State()        # ждём список id для массового разбана
     mass_kick = State()         # ждём список id для массового кика
     mass_ban = State()          # ждём список id для массового бана
-    phrase = State()            # ждём фразу-образец для смысловых стоп-слов
     seed_q = State()            # ждём слово для поиска по спам-базе
     sub_chat = State()          # ждём канал для проверки подписки
     prof_words = State()        # ждём слова для списка профилей
@@ -586,11 +585,6 @@ async def _render_widget(b: InlineKeyboardBuilder, cid: int, widget: str, s) -> 
             b.row(_btn(f"{mark} Сообщение в личку: {len(rows)}",
                        f"u:an:{cid}:s:{cid}:0"))
 
-    elif widget == "phrases":
-        rows = await db.phrases_list(cid)
-        b.row(_btn(f"📝 Фразы-образцы: {len(rows)}", f"u:ph:{cid}"))
-        b.row(_btn("➕ Добавить фразу", f"u:pha:{cid}"))
-
     elif widget == "read_stats":
         ocr = media.status()
         b.row(_btn(f"🖼 Картинки: {'tesseract готов' if ocr == 'ok' else ocr}",
@@ -653,11 +647,8 @@ async def _render_widget(b: InlineKeyboardBuilder, cid: int, widget: str, s) -> 
         b.row(_btn(note, f"u:s:{cid}:nn"))
 
     elif widget == "nn_subs":
-        # смысловые фразы и рассылки — тот же нейрофильтр, только с другой
-        # копилкой: держим их внутри него, а не отдельными пунктами меню
-        n = len(await db.phrases_list(cid))
-        b.row(_btn(f"{'✅' if s.sem_on else '🚫'} 🧠 Смысловые стоп-слова: {n}",
-                   f"u:s:{cid}:sem"))
+        # рассылки — тот же нейрофильтр, только с другой копилкой: держим их
+        # внутри него, а не отдельным пунктом меню
         b.row(_btn(f"{'✅' if s.burst_on else '🚫'} 📡 Рассылки",
                    f"u:s:{cid}:burst"))
 
@@ -1016,7 +1007,7 @@ async def view_wl_entry(cid: int, row_id: int,
 # callback пишем одной буквой: t — триггер, c — счётчик (лимит 64 байта).
 
 ANS_OWNER = {"t": "trig", "c": "cmd", "r": "rules", "w": "welcome",
-             "s": "sub", "p": "paste"}
+             "s": "sub", "p": "paste", "l": "love", "m": "mog"}
 # owner совпадает с названием папки медиа — это же и назначение файла
 ANS_LIMIT = 60   # ответов бывает много: списки-рулетки вроде !судимости
 
@@ -1056,7 +1047,7 @@ def _ans_back(cid: int, code: str, oid: int) -> str:
         return f"u:s:{cid}:welcome"
     if code == "s":
         return f"u:s:{cid}:sub"
-    if code == "p":
+    if code in ("p", "l", "m"):
         return f"u:games:{cid}"
     return f"u:cmv:{cid}:{oid}"
 
@@ -1068,18 +1059,21 @@ async def view_answers(cid: int, code: str, oid: int,
     chunk, page, pages = _page_slice(rows, page)
     title = {"t": "🎯 Триггер", "r": "📜 Правила", "w": "👋 Приветствие",
              "s": "📣 Сообщение о подписке",
-             "p": "📜 Ответ на пасты"}.get(code, "🔢 Счётчик")
+             "p": "📜 Ответ на пасты", "l": "💘 Любовь",
+             "m": "🗿 Мог"}.get(code, "🔢 Счётчик")
     lines = [
         f"<b>{title} · варианты ответа</b>\n",
         "Вариантов несколько — бот отвечает случайным. "
         + ("Можно текст, медиа или медиа с подписью."
-           if code != "c" else "Только текст: число в скобках дописывается само."),
+           if code != "c" else "Только текст: число в скобках дописывается само.")
+        + (GESTURE_TAGS if code in ("l", "m") else ""),
         f"\nВсего: <b>{len(rows)}</b> из {ANS_LIMIT}"
         + (f" · страница {page + 1} из {pages}" if pages > 1 else ""),
         "",
     ]
     if not rows:
-        lines.append("Пусто — добавьте хотя бы один, иначе бот не ответит.")
+        lines.append("Пусто — бот возьмёт встроенную фразу." if code in ("l", "m")
+                     else "Пусто — добавьте хотя бы один, иначе бот не ответит.")
     start = page * LIST_PER_PAGE
     for i, a in enumerate(chunk, start + 1):
         lines.append(f"{i}. {_ans_line(a)}")
@@ -1107,6 +1101,10 @@ async def view_answers(cid: int, code: str, oid: int,
 
 
 LIST_PER_PAGE = 10
+# подсказка к фразам жестов — и в списке, и при добавлении
+GESTURE_TAGS = ("\n\nМетки: <code>{кто}</code> — кто кинул, <code>{кому}</code> — "
+                "кому, <code>{сколько}</code> — сколько раз ему уже кидали этот "
+                "жест. Имена бот подставит ссылками на профиль.")
 
 
 def _pager(b: InlineKeyboardBuilder, cid: int, prefix: str, page: int, pages: int) -> None:
@@ -1333,30 +1331,6 @@ async def view_words(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup
     return "\n".join(lines), b.as_markup()
 
 
-async def view_phrases(cid: int) -> tuple[str, InlineKeyboardMarkup]:
-    """Фразы-образцы: список с числом срабатываний и кнопками удаления."""
-    rows = await db.phrases_list(cid)
-    s = await db.get_settings(cid)
-    lines = [
-        "<b>🧠 Смысловые стоп-слова</b>\n",
-        "Бот ловит сообщения, похожие по смыслу на эти фразы, даже если ни одно "
-        "слово не совпало.",
-        f"\nПохожесть: <b>{s.sem_threshold}%</b> · фраз: <b>{len(rows)}</b> "
-        f"из {config.SEM_LIMIT}",
-        "",
-    ]
-    b = InlineKeyboardBuilder()
-    if not rows:
-        lines.append("Пусто. Добавьте пару фраз из того, что уже ловили руками.")
-    for i, r in enumerate(rows, 1):
-        lines.append(f"{i}. {utils.esc(utils.chunk(r['text'], 90))} "
-                     f"— <i>поймала {r['hits']}</i>")
-        b.row(_btn(f"❌ {i}. {utils.chunk(r['text'], 28)}", f"u:phd:{cid}:{r['id']}"))
-    b.row(_btn("➕ Добавить фразу", f"u:pha:{cid}"))
-    b.row(_btn("⬅️ Назад", f"u:s:{cid}:sem"))
-    return "\n".join(lines), b.as_markup()
-
-
 async def view_doubt(cid: int) -> tuple[str, InlineKeyboardMarkup]:
     """Улики, на которых фильтр колеблется. Ответы здесь дороже всего."""
     ch = await db.get_chat(cid)
@@ -1410,6 +1384,8 @@ async def view_games(cid: int) -> tuple[str, InlineKeyboardMarkup]:
             prize_line = ("бан" if kind == "ban"
                           else f"мут на {utils.fmt_minutes(minutes)}")
             prize_line = f" · приз: <b>{prize_line}</b>"
+        if bit == config.GAME_RUS:
+            prize_line += f" · перезарядка {utils.fmt_minutes(s.rus_cd)}"
         if bit == config.GAME_PASTE:
             prize_line = f" · от <b>{s.paste_min}</b> знаков"
             if s.paste_cd:
@@ -1431,6 +1407,9 @@ async def view_games(cid: int) -> tuple[str, InlineKeyboardMarkup]:
             prize = "бан" if kind == "ban" else utils.fmt_minutes(minutes)
             b.row(toggle, _btn("🛡 админы" if adm else "👥 все", f"u:ga:{cid}:{bit}"),
                   _btn(f"🔨 {prize}", f"u:gp:{cid}:{bit}"))
+            if bit == config.GAME_RUS:
+                b.row(_btn(f"🔄 Перезарядка: {utils.fmt_minutes(s.rus_cd)}",
+                           f"u:rcd:{cid}"))
         elif bit == config.GAME_PASTE:
             b.row(toggle,
                   _btn(f"📏 {s.paste_min}", f"u:pl:{cid}"),
@@ -1443,6 +1422,37 @@ async def view_games(cid: int) -> tuple[str, InlineKeyboardMarkup]:
                   _btn(f"🧹 {s.vanish_n}", f"u:vn:{cid}"))
         else:
             b.row(toggle)
+
+    # жесты — отдельным блоком: приза и «кому можно» у них нет, кидает любой
+    mute = (utils.fmt_minutes(s.gest_mute) if s.gest_mute else "без мута")
+    lines += [
+        "<b>🤗 Жесты</b>\n",
+        "Кинуть можно ответом на сообщение или по нику: "
+        "<code>!любовь @ник</code>, в том числе посреди текста. Один и тот же жест — не чаще раза в минуту: "
+        "за повтор раньше бот молча стирает команду и 5 последних сообщений "
+        f"и даёт мут — <b>{mute}</b>. Админов это не касается.\n",
+        "Выключенный жест: команду бот удаляет"
+        + (f" и даёт тот же мут — <b>{mute}</b>." if s.gest_off_punish and s.gest_mute
+           else "." if s.gest_off_punish
+           else " — нет, наказание за выключенные жесты отключено.")
+        + "\n",
+    ]
+    for bit, label, how, about in config.GESTURE_BITS:
+        on = bool(s.games_on & bit)
+        lines.append(f"{'✅' if on else '🚫'} <b>{label}</b> · <code>{how}</code>"
+                     f"\n<i>{about}</i>\n")
+        toggle = _btn(f"{'✅' if on else '🚫'} {label}", f"u:gb:{cid}:{bit}")
+        owner = config.GESTURE_OWNER.get(bit)
+        if owner:
+            n = len(await db.ans_list(owner, cid))
+            code = next(c for c, o in ANS_OWNER.items() if o == owner)
+            b.row(toggle, _btn(f"{'✏️' if n else '⚠️'} Фразы: {n}",
+                               f"u:an:{cid}:{code}:{cid}:0"))
+        else:
+            b.row(toggle)
+    b.row(_btn(f"🔇 Мут за спам жестами: {mute}", f"u:gmu:{cid}"))
+    b.row(_btn(f"{'✅' if s.gest_off_punish else '🚫'} Наказывать за выключенные жесты",
+               f"u:gof:{cid}"))
     b.row(_btn("⬅️ Назад", f"u:c:{cid}"))
     return "\n".join(lines), b.as_markup()
 
@@ -1465,6 +1475,9 @@ async def cb_game_toggle(cb: CallbackQuery) -> None:
         return
     s = await db.get_settings(cid)
     await db.set_setting(cid, "games_on", s.games_on ^ bit)
+    if not s.games_on & bit:
+        from . import games
+        await games.seed_gesture(cid, bit)
     text, kb = await view_games(cid)
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer()
@@ -1558,9 +1571,24 @@ async def cb_paste_cd(cb: CallbackQuery) -> None:
     await _paste_cycle(cb, "paste_cd", config.PASTE_CD_PRESETS)
 
 
+@router.callback_query(F.data.startswith("u:rcd:"))
+async def cb_rus_cd(cb: CallbackQuery) -> None:
+    await _paste_cycle(cb, "rus_cd", config.RUS_CD_PRESETS)
+
+
 @router.callback_query(F.data.startswith("u:vn:"))
 async def cb_vanish_n(cb: CallbackQuery) -> None:
     await _paste_cycle(cb, "vanish_n", config.VANISH_PRESETS)
+
+
+@router.callback_query(F.data.startswith("u:gmu:"))
+async def cb_gest_mute(cb: CallbackQuery) -> None:
+    await _paste_cycle(cb, "gest_mute", config.GESTURE_MUTE_PRESETS)
+
+
+@router.callback_query(F.data.startswith("u:gof:"))
+async def cb_gest_off(cb: CallbackQuery) -> None:
+    await _paste_cycle(cb, "gest_off_punish", (1, 0))
 
 
 @router.callback_query(F.data.startswith("u:ga:"))
@@ -3310,6 +3338,8 @@ async def cb_answer_add(cb: CallbackQuery, state: FSMContext) -> None:
             "Форматирование и премиум-эмодзи сохраняются; вставить премиум-эмодзи "
             "может только человек с Telegram Premium."
             if code != "c" else "Пришлите текст ответа. Число в скобках бот допишет сам.")
+    if code in ("l", "m"):
+        hint += GESTURE_TAGS
     await _ask(
         cb, state, Input.ans_new,
         f"<b>🎲 Новый вариант ответа</b>\n\n{hint}",
@@ -4398,76 +4428,6 @@ async def cb_inline_wl_del(cb: CallbackQuery) -> None:
 
 
 # ---------- добавление: стоп-слова (FSM) ----------
-
-@router.callback_query(F.data.startswith("u:ph:"))
-async def cb_phrases(cb: CallbackQuery, state: FSMContext) -> None:
-    cid = int(cb.data.split(":")[2])
-    if not await _guard(cb, cid):
-        return
-    await state.clear()
-    text, kb = await view_phrases(cid)
-    await cb.message.edit_text(text, reply_markup=kb)
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("u:phd:"))
-async def cb_phrase_del(cb: CallbackQuery) -> None:
-    _, _, cid, rid = cb.data.split(":")
-    cid = int(cid)
-    if not await _guard(cb, cid):
-        return
-    await db.phrase_del(cid, int(rid))
-    nn.invalidate_phrases(cid)
-    text, kb = await view_phrases(cid)
-    await cb.message.edit_text(text, reply_markup=kb)
-    await cb.answer("Удалено")
-
-
-@router.callback_query(F.data.startswith("u:pha:"))
-async def cb_phrase_add(cb: CallbackQuery, state: FSMContext) -> None:
-    cid = int(cb.data.split(":")[2])
-    if not await _guard(cb, cid):
-        return
-    await _ask(
-        cb, state, Input.phrase,
-        "<b>🧠 Смысловые стоп-слова</b>\n\nПришлите фразу-образец — так, как "
-        "пишут спамеры. Можно несколько, каждую с новой строки.\n\n"
-        "Например: <code>заработок от 5000 в день, пиши в личку</code>",
-        f"u:ph:{cid}", cid=cid,
-    )
-
-
-@router.message(StateFilter(Input.phrase))
-async def phrase_input(message: Message, state: FSMContext, bot: Bot) -> None:
-    text = (message.text or "").strip()
-    data = await state.get_data()
-    cid = data["cid"]
-    if text == "/cancel":
-        await _done(message, bot, state, await view_phrases(cid))
-        return
-    have = len(await db.phrases_list(cid))
-    added = dupes = 0
-    for raw in text.split("\n"):
-        line = raw.strip()
-        if len(line) < 10:              # из трёх слов смысла не выжать
-            continue
-        if have + added >= config.SEM_LIMIT:
-            break
-        if await db.phrase_add(cid, line):
-            added += 1
-        else:
-            dupes += 1
-    if not added and not dupes:
-        await _retry(message, bot, state,
-                     "<b>🧠 Смысловые стоп-слова</b>\n\n⚠️ Нужна фраза, а не пара слов "
-                     "— от десяти символов.")
-        return
-    nn.invalidate_phrases(cid)
-    note = f"✅ Добавлено фраз: {added}."
-    if dupes:
-        note += f" Уже были: {dupes}."
-    await _done(message, bot, state, await view_phrases(cid), note + "\n\n")
-
 
 @router.callback_query(F.data.startswith("u:nnd:"))
 async def cb_doubt(cb: CallbackQuery) -> None:

@@ -59,6 +59,125 @@ async def test_net_spreads_the_term_not_the_swapped_ban(chat, members,
     assert len(await db.active_punishments(PEER)) == 1
 
 
+async def test_net_leaves_old_ban_alone(chat, members, monkeypatch):
+    """Забаненного до бота сетка не перебанивает своим — и прощение в
+    соседнем чате не выпускает его вместе с сетевым баном."""
+    import types
+    monkeypatch.setattr(config, "NET_DELAY", 0)
+    await db.upsert_chat(PEER, "Соседний", None, OWNER, "supergroup")
+    await db.get_settings(PEER)
+    nid = await db.net_create(OWNER, "Сетка")
+    await db.net_assign(chat, nid)
+    await db.net_assign(PEER, nid)
+    await db.net_set(nid, "sync_mask", config.NET_BAN | config.NET_LIFT)
+
+    class OldBan(FakeBot):
+        async def get_chat_member(self, cid, uid):
+            return types.SimpleNamespace(status="kicked" if cid == PEER else "member")
+
+    bot = OldBan()
+    user = make_user(4343, "Спамер", "old_spammer")
+    done, skipped, _, _ = await net.spread(bot, chat, user, "ban", 0, "стоп-слово", None)
+    assert (done, skipped) == (0, 1)
+    assert bot.banned == []
+    assert await db.active_punishments(PEER) == []
+    await net.lift(bot, chat, user.id)
+    assert bot.unbanned == []
+
+
+async def _net_with_peer(chat):
+    await db.upsert_chat(PEER, "Соседний", None, OWNER, "supergroup")
+    await db.get_settings(PEER)
+    nid = await db.net_create(OWNER, "Сетка")
+    await db.net_assign(chat, nid)
+    await db.net_assign(PEER, nid)
+    await db.net_set(nid, "sync_mask", config.NET_BAN | config.NET_MUTE)
+
+
+async def test_autoban_spares_member_of_other_net_chat(chat, members, cards,
+                                                       monkeypatch):
+    """Комментатора, который сидит в соседнем чате сетки, автомат не банит:
+    сообщение удалено, карточка с «Забанить» — решает админ."""
+    from gremlin.services import adm_cache
+    from conftest import Msg
+    await _net_with_peer(chat)
+
+    async def is_member(bot, cid, uid):
+        return cid == PEER                  # здесь не участник, в соседнем свой
+
+    monkeypatch.setattr(adm_cache, "is_member", is_member)
+    bot = FakeBot()
+    await moderation.violation(bot, Msg("казино тут", author=make_user(4545)),
+                               config.BIT_WORDS, "стоп-слово", "ban", 0, "казино")
+    assert bot.banned == []
+    assert await db.active_punishments(chat) == []
+    assert "Не забанен: состоит в «Соседний»" in cards[-1]["text"]
+
+
+async def test_auto_spread_skips_where_member_manual_does_not(chat, members,
+                                                              monkeypatch):
+    import types
+    monkeypatch.setattr(config, "NET_DELAY", 0)
+    await _net_with_peer(chat)
+
+    class Member(FakeBot):
+        async def get_chat_member(self, cid, uid):
+            return types.SimpleNamespace(status="member")
+
+    bot = Member()
+    user = make_user(4646, "Свой", "svoy")
+    auto = await net.spread(bot, chat, user, "ban", 0, "стоп-слово", None)
+    assert auto[:2] == (0, 1) and bot.banned == []
+    manual = await net.spread(bot, chat, user, "ban", 0, "вручную", OWNER)
+    assert manual[0] == 1 and bot.banned[-1][:2] == (PEER, user.id)
+
+
+async def test_creator_ban_passes_whitelist(chat, monkeypatch):
+    """Ручной бан создателя чата доходит и до вайтлиста соседних чатов;
+    бан обычного админа — нет. Создатель берётся из списка админов."""
+    import types
+    from gremlin.services import adm_cache
+    monkeypatch.setattr(config, "NET_DELAY", 0)
+    monkeypatch.setattr(adm_cache, "_admins", {})
+    monkeypatch.setattr(adm_cache, "_members", {})
+    await _net_with_peer(chat)
+    user = make_user(4747, "В вайтлисте", "listed")
+    await db.wl_set_scopes(PEER, user.id, None, None, {"all"})
+    creator, admin = 111, 222
+
+    class Owner(FakeBot):
+        async def get_chat_administrators(self, cid):
+            return [types.SimpleNamespace(status="creator", user=make_user(creator)),
+                    types.SimpleNamespace(status="administrator", user=make_user(admin))]
+
+        async def get_chat_member(self, cid, uid):
+            return types.SimpleNamespace(status="member")
+
+    bot = Owner()
+    by_admin = await net.spread(bot, chat, user, "ban", 0, "вручную", admin)
+    assert by_admin[:2] == (0, 1) and bot.banned == []
+    by_creator = await net.spread(bot, chat, user, "ban", 0, "вручную", creator)
+    assert by_creator[0] == 1 and bot.banned[-1][:2] == (PEER, user.id)
+    assert await db.chat_creator(chat) == creator
+
+
+async def test_card_lift_answers(chat, members, monkeypatch):
+    """«Снять» на карточке падало на последней строке: нажатие без ответа."""
+    from conftest import CB, Sent
+    from gremlin.handlers import cards
+
+    async def no_net(*a, **kw):
+        pass
+
+    monkeypatch.setattr(net, "lift_and_note", no_net)
+    pid, _ = await moderation.punish_ex(FakeBot(), chat, make_user(4444), "ban",
+                                        0, "спам", OWNER)
+    cb = CB(f"k:lift:{pid}", message=Sent("⛔ Бан"))
+    cb.bot = FakeBot()
+    await cards.card_lift(cb, cb.bot)
+    assert cb.alerts == ["Разбанен"]
+
+
 def test_swapped_ban_is_shown_as_mute():
     """Мут не-участнику применён баном, но везде показывается мутом."""
     reason = "не будешь · мут не-участнику невозможен, заменён баном"

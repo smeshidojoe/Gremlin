@@ -547,7 +547,12 @@ async def cmd_lift(message: Message, bot: Bot) -> None:
     await deleting.one(message.delete, message.chat.id)
 
     kind = "🔓 Разбан" if unban else "🔊 Размут"
-    tail = "" if done else "\n<i>Наказания не было — снимать нечего.</i>"
+    tail = ""
+    if not done:
+        # сетка могла снять его раньше, по прощению в соседнем чате
+        lifted = await db.last_net_lift(message.chat.id, uid)
+        tail = (f"\n<i>Уже снято сеткой {utils.fmt_ts(lifted)} — снимать нечего.</i>"
+                if lifted else "\n<i>Наказания не было — снимать нечего.</i>")
     card = (
         f"{kind} · {utils.esc(message.chat.title)}\n"
         f"👤 {who} (<code>{uid}</code>)\n"
@@ -1466,8 +1471,28 @@ async def moderate(message: Message, bot: Bot) -> None:
         # опционально: @упоминания каналов/групп (упоминания людей всегда ок)
         if s.mentions_check:
             known = {u.lower() for u in own_names if u}
+            guest = None              # статус спросим, только если попался бот
             for uname in filters.mentions_in(message):
                 if uname.lower() in known:
+                    continue
+                if uname.lower().endswith("bot"):
+                    # Бота Telegram отдаёт типом private, как человека, и он
+                    # проходил насквозь: «я проходила тест у @…bot, попробуй и
+                    # ты» от комментатора. Участников не трогаем — они зовут
+                    # игровых ботов чата.
+                    if guest is None:
+                        guest = not await adm_cache.is_member(bot, chat.id, user.id)
+                    if (guest
+                            and uname.lower() not in {
+                                b.lower() for b in await watch.known_bots(
+                                    bot, chat.id, f"@{uname}")}
+                            and not await db.inline_wl_allowed(chat.id, uname, None)):
+                        await moderation.violation(
+                            bot, message, config.BIT_LINKS, "упоминание стороннего чата",
+                            *await _link_punish(bot, chat.id, user.id, s, "men"),
+                            f"@{uname} (бот)",
+                        )
+                        return
                     continue
                 ctype = await adm_cache.username_chat_type(bot, uname)
                 if ctype in ("channel", "supergroup", "group"):
@@ -1507,25 +1532,6 @@ async def moderate(message: Message, bot: Bot) -> None:
             await moderation.violation(
                 bot, message, config.BIT_WORDS, "стоп-слово",
                 kind, s.words_mute_min, word,
-            )
-            return
-
-    # --- смысловые стоп-слова: тот же смысл другими словами ---
-    if s.sem_on and text and "words" not in scopes:
-        hit = await nn.match_phrase(chat.id, text, s.sem_threshold)
-        if hit and s.sem_guests and await adm_cache.is_member(bot, chat.id, user.id):
-            hit = None
-        if hit:
-            phrase, score = hit
-            kind = s.sem_punish
-            if s.trust_on:
-                kind = trust.soften(kind, await trust.level(bot, chat.id, user.id, s),
-                                    s, config.TRUST_S_WORDS)
-            await db.phrase_hit(phrase["id"])
-            await moderation.violation(
-                bot, message, config.BIT_WORDS, "смысловое совпадение",
-                kind, s.sem_mute_min,
-                f"похоже на «{utils.chunk(phrase['text'], 60)}» ({score}%)",
             )
             return
 

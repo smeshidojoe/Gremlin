@@ -39,13 +39,72 @@ async def enabled(chat_id: int, kind: str) -> list:
     return peers
 
 
-async def _skip(bot: Bot, chat_id: int, user_id: int) -> str | None:
-    """Причина не трогать человека в этом чате, либо None."""
+async def _skip(bot: Bot, chat_id: int, user_id: int,
+                wl: bool = True) -> str | None:
+    """Причина не трогать человека в этом чате, либо None.
+
+    wl=False — вайтлист не в счёт: так бывает, когда наказал создатель чата.
+    """
     from . import adm_cache
     if user_id in await adm_cache.chat_admin_ids(bot, chat_id):
         return "админ"
-    if await db.wl_scopes_for(chat_id, user_id, None):
+    if wl and await db.wl_scopes_for(chat_id, user_id, None):
         return "вайтлист"
+    return None
+
+
+async def _by_creator(bot: Bot, chat_id: int, by_id: int | None) -> bool:
+    """Наказал создатель чата (статус creator). Его ручному наказанию вайтлист
+    соседних чатов не помеха: вайтлист бережёт от правил и админов, не от него.
+
+    Создателя берём из базы; не знаем — узнаём из списка админов, который
+    заодно его и запишет. Анонимный создатель приходит как GroupAnonymousBot
+    и тут не узнаётся.
+    """
+    if by_id is None:
+        return False
+    creator = await db.chat_creator(chat_id)
+    if creator is None:
+        from . import adm_cache
+        await adm_cache.chat_admin_ids(bot, chat_id)
+        creator = await db.chat_creator(chat_id)
+    return creator == by_id
+
+
+async def _status_there(bot: Bot, chat_id: int, user_id: int) -> str | None:
+    """Кто человек в чате: 'kicked' — в чёрном списке (неважно, чей это бан),
+    'member' — участник, 'out' — не состоит. None — Telegram не ответил.
+
+    В базе видны только баны бота. Бан, выданный руками до бота, сетка
+    перезаписывала своим, а прощение в соседнем чате потом снимало его
+    вместе с сетевым: так вышел на свободу забаненный полтора года назад.
+    """
+    from . import adm_cache
+    try:
+        m = await bot.get_chat_member(chat_id, user_id)
+    except Exception:
+        return None
+    status = m.status
+    if status == "kicked":
+        return "kicked"
+    member = status != "left" and (
+        status != "restricted" or bool(getattr(m, "is_member", True)))
+    # ответ уже есть — apply_punishment не станет спрашивать его второй раз
+    adm_cache.note_member(chat_id, user_id, member)
+    return "member" if member else "out"
+
+
+async def home_chat(bot: Bot, chat_id: int, user_id: int) -> str | None:
+    """Название чата сетки, где человек участник, либо None.
+
+    Галочки сетки тут ни при чём: вопрос не «куда рассылать», а «свой ли он
+    нам». Сбой Telegram считается участием — лучше не забанить спамера,
+    чем забанить своего.
+    """
+    from . import adm_cache
+    for peer in await db.net_peers(chat_id):
+        if await adm_cache.is_member(bot, peer["chat_id"], user_id):
+            return peer["title"] or str(peer["chat_id"])
     return None
 
 
@@ -62,10 +121,16 @@ async def spread(bot: Bot, src_chat: int, user, kind: str, mute_min: int,
 
     Мут в каждом чате решается заново: участнику — мут, не-участнику — бан на
     тот же срок. Что вышло в исходном чате, соседей не касается.
+
+    Автоматическое наказание (by_id=None) уходит только туда, где человека нет:
+    там, где он свой, правило скорее ошиблось или аккаунт взломали — решит
+    админ. Ручное — везде. Чужих ботов это не касается: своими они не бывают.
     """
+    auto = by_id is None and not getattr(user, "is_bot", False)
     peers = await enabled(src_chat, kind)
     if not peers:
         return 0, 0, 0, 0
+    creator = await _by_creator(bot, src_chat, by_id)
     src = await db.get_chat(src_chat)
     src_title = (src["title"] if src else str(src_chat)) or str(src_chat)
     note = f"сетка · {src_title}: {reason}"
@@ -75,12 +140,19 @@ async def spread(bot: Bot, src_chat: int, user, kind: str, mute_min: int,
         cid = peer["chat_id"]
         await asyncio.sleep(config.NET_DELAY)
         try:
-            if await _skip(bot, cid, user.id):
+            if await _skip(bot, cid, user.id, wl=not creator):
                 skipped += 1
                 continue
             if any([await db.active_punishment_of(cid, user.id, k) is not None
                     for k in _ALREADY.get(kind, (kind,))]):
                 skipped += 1          # уже наказан там не мягче — не дублируем
+                continue
+            there = await _status_there(bot, cid, user.id)
+            if there == "kicked":
+                skipped += 1          # чужой бан не перезаписываем своим
+                continue
+            if auto and there != "out":
+                skipped += 1          # там он свой — автомату не решать
                 continue
             from . import moderation
             # в чужих чатах сетки человек мог ничего и не писать — убирать

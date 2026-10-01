@@ -11,8 +11,8 @@ def run(signals, **ctx):
 
 
 def test_one_phrase_found_three_ways_is_one_piece_of_evidence():
-    triple = v.content_signals(stopword="в лс", phrase="да", nn_score=90,
-                               outward=True)
+    triple = v.content_signals(stopword="в лс", nn_score=90, text_hard=45,
+                               text_why=["telegra.ph"], outward=True)
     assert len(triple) == 3
     tops = sorted((s.score for s in triple), reverse=True)
     # сильнейший плюс четверть второго, а не сумма

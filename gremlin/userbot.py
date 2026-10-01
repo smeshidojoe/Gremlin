@@ -186,7 +186,12 @@ async def _handle_bot_spam(bot: Bot, chat_id: int, message, sender) -> None:
         who = utils.mention(uid, name, uname)
         lines.append(f"👤 Позвал: {who} (<code>{uid}</code>)")
         kind, mute_min = await _caller_punish(bot, chat_id, s, uid, uname, score)
-        if kind != "delete":
+        # свой в соседнем чате сетки — автомат не банит, решит админ кнопкой
+        home = (await moderation.shield(bot, chat_id, uid)
+                if kind in ("ban", "mute") else None)
+        if home:
+            lines.append(moderation.shield_note(home))
+        elif kind != "delete":
             from .services import net
             user = await net.user_stub(uid)
             user.username, user.full_name = uname or user.username, name or user.full_name
@@ -219,8 +224,10 @@ async def _handle_bot_spam(bot: Bot, chat_id: int, message, sender) -> None:
     )
     if pid:
         from .services import net
+        # в сетку — задуманное, а не подменённое здесь: мут не-участнику стал
+        # баном, и под видом «ban» он уходил к соседям баном навсегда
         runtime.spawn(net.spread_and_note(
-            bot, sent, chat_id, await net.user_stub(uid), applied, mute_min,
+            bot, sent, chat_id, await net.user_stub(uid), kind, mute_min,
             f"вызов спам-бота @{bot_uname}", None))
 
 

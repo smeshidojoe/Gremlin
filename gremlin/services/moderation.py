@@ -456,6 +456,26 @@ async def apply_punishment(bot: Bot, chat_id: int, user: User, kind: str,
     return pid
 
 
+async def shield(bot: Bot, chat_id: int, user_id: int) -> str | None:
+    """Чат сетки, где свой тот, кого автомат собрался забанить здесь. None —
+    бан можно выдавать.
+
+    Спрашиваем только про не-участников: под постами канала пишут те, кто в
+    группу не вступал, и мут им Telegram превращает в бан. Если такой человек
+    сидит в соседнем чате сетки, это скорее ошибка правила, чем спамер, —
+    сообщение удаляем, а банить или нет, решает админ кнопкой в карточке.
+    Участника этого чата правило наказывает как обычно.
+    """
+    if await adm_cache.is_member(bot, chat_id, user_id):
+        return None
+    from . import net
+    return await net.home_chat(bot, chat_id, user_id)
+
+
+def shield_note(home: str) -> str:
+    return f"🛡 Не забанен: состоит в «{home}»"
+
+
 async def game_punish(bot: Bot, chat_id: int, user, kind: str, minutes: int,
                       reason: str, by_id: int | None
                       ) -> tuple[int | None, int | None, str | None]:
@@ -760,7 +780,6 @@ async def leave_chat(bot: Bot, chat_id: int) -> tuple[bool, str]:
 FORGIVE_SCOPES = (
     ("инлайн-бот", "inline"),
     ("стоп-слово", "words"),
-    ("смысловое совпадение", "words"),
     ("внешняя ссылка", "links"),
     ("ссылка на сторонний чат", "links"),
     ("упоминание стороннего чата", "links"),
@@ -932,7 +951,6 @@ def _album_sweep(now: float) -> None:
 # только то, что видит сама, — так и видно, справилась бы она без них.
 _UNI_FAMILY = {
     "стоп-слово": "stopword",
-    "смысловое совпадение": "phrase",
     "рассылка": "burst",
 }
 
@@ -956,7 +974,6 @@ async def _uni_shadow(bot: Bot, chat, user, s, message, feature_label: str,
     signals = vd.content_signals(
         stopword=(detail or "совпадение") if kind == "stopword" else None,
         stopword_weight=weight,
-        phrase=(detail or "да") if kind == "phrase" else None,
         text_hard=hard, text_cosmetic=cosmetic, text_why=why, outward=outward)
     signals += vd.behavior_signals(burst=kind == "burst")
     p_hard, _p_cos, p_why = watch_svc.profile_parts(
@@ -1001,7 +1018,14 @@ async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
     await deleting.one(message.delete, chat.id)
 
     reason = f"{feature_label}: {detail}" if detail else feature_label
-    pid = await apply_punishment(bot, chat.id, user, punish_kind, mute_min, reason, None)
+    home = (await shield(bot, chat.id, user.id)
+            if punish_kind in ("ban", "mute") else None)
+    pid = None
+    if home:
+        reason += f" · {shield_note(home)}"
+    else:
+        pid = await apply_punishment(bot, chat.id, user, punish_kind, mute_min,
+                                     reason, None)
     applied = punish_kind if pid else "delete"
     until_ts = utils.until_ts(mute_min) if applied == "mute" else None
     if pid:

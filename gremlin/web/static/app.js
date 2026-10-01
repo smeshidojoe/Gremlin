@@ -257,6 +257,20 @@ const clusterState = (g) => {
   return 'из них помечено: ' + parts.join(', ');
 };
 
+// Улики по одной, с кнопками оценки: внутри кучки и списком, пока на кучки мало.
+const sampleRows = (items) => {
+  const mark = { spam: '⛔', ok: '🕊', unknown: '✋' };
+  return items.map((it) => `<div class="item" data-sample="${it.id}">
+      <div class="body"><span data-mark>${mark[it.label] || '?'}</span> ${esc((it.text || '').slice(0, 200))}</div>
+      <div class="wrap" style="flex:none">
+        <button class="chip ${it.label === 'spam' ? 'on' : 'off'}" data-act="nn-sample"
+          data-id="${it.id}" data-label="spam">⛔</button>
+        <button class="chip ${it.label === 'ok' ? 'on' : 'off'}" data-act="nn-sample"
+          data-id="${it.id}" data-label="ok">🕊</button>
+      </div>
+    </div>`).join('') || '<div class="empty">Пусто.</div>';
+};
+
 // Подсветка вкладки живёт в разметке, поэтому переставляем её сами:
 // раньше «Без оценки» горела всегда, что бы ни было открыто.
 const markTab = (tab) => {
@@ -569,20 +583,6 @@ function widgetHtml(name, w, cid, d) {
           <button class="btn small" data-act="set-log">Изменить</button></div>
       </div>`;
 
-    case 'phrases':
-      return `<div class="card">
-        <h2>🧠 Фразы-образцы</h2>
-        <div class="muted">Бот ловит сообщения, похожие по смыслу на эти фразы,
-          даже если ни одно слово не совпало.</div>
-        ${w.items.map((r) => `
-          <div class="row">
-            <div class="label">${esc(r.text)}<small>поймала ${r.hits}</small></div>
-            <button class="x" data-act="phrase-del" data-id="${r.id}">✕</button>
-          </div>`).join('') || '<div class="empty">Пусто.</div>'}
-        <button class="btn wide" style="margin-top:10px" data-act="phrase-add">
-          ➕ Добавить фразу</button>
-      </div>`;
-
     case 'read_stats':
       return `<div class="card">
         <h2>🔍 Что бот умеет читать</h2>
@@ -660,11 +660,9 @@ function widgetHtml(name, w, cid, d) {
       </div>`;
 
     case 'nn_subs':
-      // смысловые фразы и рассылки — тот же нейрофильтр, другая копилка;
-      // отдельными пунктами меню они выглядели как три разных механизма
+      // рассылки — тот же нейрофильтр, другая копилка; отдельным пунктом
+      // меню они выглядели как другой механизм
       return `<div class="card">
-        ${tile(`#/chat/${cid}/s/sem`, '🧠 Смысловые стоп-слова',
-               { dot: w.sem_on, sub: w.phrases + ' ' + num(w.phrases, 'фраза', 'фразы', 'фраз') })}
         ${tile(`#/chat/${cid}/s/burst`, '📡 Рассылки', { dot: w.burst_on })}
       </div>`;
 
@@ -1269,6 +1267,9 @@ const ANS_BACK = {
   welcome: (cid) => `#/chat/${cid}/s/welcome`,
   rules: (cid) => `#/chat/${cid}/s/rules`,
   sub: (cid) => `#/chat/${cid}/s/sub`,
+  paste: (cid) => `#/chat/${cid}/games`,
+  love: (cid) => `#/chat/${cid}/games`,
+  mog: (cid) => `#/chat/${cid}/games`,
 };
 
 async function answersView(cid, owner, oid) {
@@ -1279,12 +1280,16 @@ async function answersView(cid, owner, oid) {
     back: ANS_BACK[owner](cid, oid),
     html: `<div class="card">
       <div class="intro">Вариантов несколько — бот отвечает случайным.
-        ${media ? 'Можно текст, медиа или медиа с подписью.' : 'Только текст: число в скобках дописывается само.'}</div>
+        ${media ? 'Можно текст, медиа или медиа с подписью.' : 'Только текст: число в скобках дописывается само.'}
+        ${owner === 'love' || owner === 'mog' ? `<br><br>Метки: <span class="mono">{кто}</span> — кто кинул,
+          <span class="mono">{кому}</span> — кому, <span class="mono">{сколько}</span> — сколько раз ему
+          уже кидали этот жест. Имена бот подставит ссылками на профиль.` : ''}</div>
       <div style="margin-top:10px">
         ${d.items.map((a) => `<div class="item">
             <div class="body">${a.has_media ? `🖼 медиа (${esc(a.media_type)})<br>` : ''}${esc(a.plain) || '<span class="muted">без подписи</span>'}</div>
             <button class="x" data-act="ans-del" data-id="${a.id}">✕</button></div>`).join('')
-          || '<div class="empty">Пусто — бот промолчит.</div>'}
+          || `<div class="empty">${owner === 'love' || owner === 'mog'
+            ? 'Пусто — бот возьмёт встроенную фразу.' : 'Пусто — бот промолчит.'}</div>`}
       </div>
       <div class="muted" style="margin-top:8px">Всего: ${d.items.length} из ${d.limit}</div>
       <button class="btn wide" style="margin-top:10px" data-act="ans-add"
@@ -1426,6 +1431,7 @@ async function gamesView(cid) {
           ${g.admins ? '🛡 только админы' : '👥 все'}</button>
         <button class="chip" data-act="game-kind" data-bit="${g.bit}">🔨 ${esc(g.kind === 'ban' ? 'бан' : 'мут')}</button>
         ${g.kind === 'mute' ? `<button class="chip" data-act="game-min" data-bit="${g.bit}">⏰ ${esc(g.prize.replace('мут на ', ''))}</button>` : ''}
+        ${g.reload ? `<button class="chip" data-act="rus-cd" data-bit="${g.bit}">🔄 перезарядка ${esc(g.reload_label)}</button>` : ''}
       </div>` : ''}
       ${g.vanish ? `<div class="wrap" style="margin-top:10px">
         <button class="chip ${g.admins ? 'on' : ''}" data-act="game-who" data-bit="${g.bit}">
@@ -1438,6 +1444,26 @@ async function gamesView(cid) {
       </div>
       ${g.on && !g.answers ? '<div class="intro">⚠️ Заготовок нет — отвечать нечем.</div>' : ''}
       ${linkRow(`#/chat/${cid}/answers/paste/${cid}`, '🎲 Заготовки ответов', g.answers)}` : ''}
+    </div>`).join('')}
+    <div class="card">
+      <div class="row"><div class="label"><b>🤗 Жесты</b></div></div>
+      <div class="intro">Кинуть можно ответом на сообщение или по нику: <span class="mono">!любовь @ник</span>, в том числе посреди текста.
+        Один и тот же жест — не чаще раза в минуту: за повтор раньше бот молча стирает команду
+        и 5 последних сообщений и даёт мут. Админов это не касается.
+        Выключенный жест: команду бот удаляет и даёт тот же мут — это можно отключить.</div>
+      <div class="wrap" style="margin-top:10px">
+        <button class="chip" data-act="gest-mute">🔇 мут за спам: ${esc(d.gest_mute_label)}</button>
+        <button class="chip ${d.gest_off_punish ? 'on' : ''}" data-act="gest-off">
+          ${d.gest_off_punish ? '✅' : '🚫'} наказывать за выключенные жесты</button>
+      </div>
+    </div>
+    ${d.gestures.map((g) => `<div class="card">
+      <div class="row">
+        <div class="label"><b>${esc(g.label)}</b><small class="mono">${esc(g.how)}</small></div>
+        <label class="switch"><input type="checkbox" data-game="${g.bit}" ${g.on ? 'checked' : ''}><span></span></label>
+      </div>
+      <div class="intro">${introHtml(esc(g.about))}</div>
+      ${g.owner ? linkRow(`#/chat/${cid}/answers/${g.owner}/${cid}`, '✏️ Фразы', g.answers) : ''}
     </div>`).join('')}`,
   };
 }
@@ -2097,20 +2123,6 @@ const ACT = {
     render();
   },
 
-  async 'phrase-add'() {
-    const v = await ask({ title: 'Фраза-образец',
-      hint: 'Так, как пишут спамеры. Несколько — каждая с новой строки.' });
-    if (!v) return;
-    const r = await api(`/chat/${curChat()}/phrases`, { json: { text: v } });
-    toast(`Добавлено: ${r.added}${r.dupes ? ', уже были: ' + r.dupes : ''}`);
-    render();
-  },
-
-  async 'phrase-del'(el) {
-    await api(`/chat/${curChat()}/phrases/${el.dataset.id}`, { method: 'DELETE' });
-    render();
-  },
-
   async 'nn-doubt'() {
     const box = document.getElementById('clusters');
     markTab('doubt');
@@ -2148,6 +2160,11 @@ const ACT = {
     markTab(scope);
     box.innerHTML = '<div class="muted" style="margin-top:12px">Считаю…</div>';
     const r = await api(`/chat/${curChat()}/nn/clusters?scope=${scope}`);
+    if (!r.items.length && r.flat.length) {
+      box.innerHTML = `<div class="muted" style="margin-top:12px">На кучки пока мало
+        (нужно ${r.min}) — размечайте по одному.</div>${sampleRows(r.flat)}`;
+      return;
+    }
     if (!r.items.length) {
       box.innerHTML = `<div class="muted" style="margin-top:12px">${
         r.model === 'ok' ? `Улик пока мало — нужно хотя бы ${r.min}.`
@@ -2175,16 +2192,7 @@ const ACT = {
   async 'nn-items'(el) {
     const box = document.querySelector(`[data-items="${el.dataset.i}"]`);
     const r = await api(`/chat/${curChat()}/nn/clusters/${el.dataset.i}`);
-    const mark = { spam: '⛔', ok: '🕊', unknown: '✋' };
-    box.innerHTML = r.items.map((it) => `<div class="item" data-sample="${it.id}">
-        <div class="body"><span data-mark>${mark[it.label] || '?'}</span> ${esc(it.text.slice(0, 200))}</div>
-        <div class="wrap" style="flex:none">
-          <button class="chip ${it.label === 'spam' ? 'on' : 'off'}" data-act="nn-sample"
-            data-id="${it.id}" data-label="spam">⛔</button>
-          <button class="chip ${it.label === 'ok' ? 'on' : 'off'}" data-act="nn-sample"
-            data-id="${it.id}" data-label="ok">🕊</button>
-        </div>
-      </div>`).join('') || '<div class="empty">Пусто.</div>';
+    box.innerHTML = sampleRows(r.items);
   },
 
   async 'nn-sample'(el) {
@@ -2417,6 +2425,28 @@ const ACT = {
     const v = await pick({ title: 'Срок мута', options: d.mutes });
     if (v === null) return;
     await api(`/chat/${curChat()}/games/prize`, { json: { bit: +el.dataset.bit, minutes: +v } });
+    render();
+  },
+
+  async 'rus-cd'(el) {
+    const d = await api(`/chat/${curChat()}/games`);
+    const v = await pick({ title: 'Перезарядка револьвера', options: d.rus_cds });
+    if (v === null) return;
+    await api(`/chat/${curChat()}/games/prize`, { json: { bit: +el.dataset.bit, reload: +v } });
+    render();
+  },
+
+  async 'gest-off'() {
+    const d = await api(`/chat/${curChat()}/games`);
+    await api(`/chat/${curChat()}/games/gesture`, { json: { off_punish: !d.gest_off_punish } });
+    render();
+  },
+
+  async 'gest-mute'() {
+    const d = await api(`/chat/${curChat()}/games`);
+    const v = await pick({ title: 'Мут за спам жестами', options: d.gest_mutes });
+    if (v === null) return;
+    await api(`/chat/${curChat()}/games/gesture`, { json: { mute: +v } });
     render();
   },
 

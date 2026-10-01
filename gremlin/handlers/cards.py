@@ -6,7 +6,7 @@ from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from .. import db, runtime
+from .. import db, runtime, utils
 
 logger = logging.getLogger("gremlin.cards")
 

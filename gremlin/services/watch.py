@@ -448,6 +448,11 @@ async def _profile_punish(bot, chat, user, settings, message, data, why) -> bool
     from . import moderation
 
     kind = settings.prof_punish
+    if kind in ("ban", "mute"):
+        # свой в соседнем чате сетки — не баним автоматом, решит админ
+        home = await moderation.shield(bot, chat.id, user.id)
+        if home:
+            kind, why = "delete", f"{why} · {moderation.shield_note(home)}"
     if message is not None:
         from . import deleting
         await deleting.one(message.delete, message.chat.id)
@@ -771,8 +776,18 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None,
                        "cas": cas_pts, "face": face_sim, "nn": nn_hit,
                        "total": total, "event": event}}
 
-    # автобан по порогу
+    # автобан по порогу. Своего в соседнем чате сетки не баним: сообщение
+    # убираем, а карточка выходит подозрением с кнопками — решит админ
+    shielded = ""
     if ban_at and total >= ban_at:
+        home = await moderation.shield(bot, chat.id, user.id)
+        if home:
+            shielded = "\n" + moderation.shield_note(home)
+            if message is not None:
+                from . import deleting
+                await deleting.one(message.delete, message.chat.id)
+            body = body_gone
+    if ban_at and total >= ban_at and not shielded:
         if message is not None:
             from . import deleting
             await deleting.one(message.delete, message.chat.id)
@@ -811,7 +826,7 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None,
         f"👤 {who} (<code>{user.id}</code>)\n"
         f"📎 Сигналы: {utils.esc(why)} — <b>{total} очков</b>"
         + ("\n🔄 Профиль изменился" if row is not None and profile_changed else "")
-        + body
+        + shielded + body
     )
     await db.add_event(chat.id, "watch", f"suspect: {user.full_name} ({user.id}) — {why} ({total})")
     # случай ждёт исхода: «Забанить» сделает его спамом, «Не трогать» — нормой

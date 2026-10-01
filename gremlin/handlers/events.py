@@ -289,6 +289,8 @@ async def member_updated(update: ChatMemberUpdated, bot: Bot) -> None:
     # считал участником того, кого сам же выгнал.
     adm_cache.invalidate_admins(chat.id)
     adm_cache.invalidate_member(chat.id, target.id)
+    if new.status == "creator":
+        await db.set_chat_creator(chat.id, target.id)   # чат передали другому
     if target.is_bot and target.id != bot.id:
         from ..services import watch
         if new.status in ("member", "administrator"):

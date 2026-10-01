@@ -372,11 +372,6 @@ async def _widget(cid: int, widget: str, s) -> dict:
     if widget == "logsel":
         return {"chat_id": s.log_chat_id, "title": await _log_label(s.log_chat_id)}
 
-    if widget == "phrases":
-        return {"items": [{"id": r["id"], "text": r["text"], "hits": r["hits"]}
-                          for r in await db.phrases_list(cid)],
-                "limit": config.SEM_LIMIT, "model": nn.status()}
-
     if widget == "read_stats":
         return {"ocr": media.status(), "asr": media.asr_status(),
                 "asr_url": bool(config.ASR_URL)}
@@ -402,8 +397,7 @@ async def _widget(cid: int, widget: str, s) -> dict:
         return {"size": size, "on": s.nn_mode > 1, "path": path}
 
     if widget == "nn_subs":
-        return {"sem_on": bool(s.sem_on), "burst_on": bool(s.burst_on),
-                "phrases": len(await db.phrases_list(cid))}
+        return {"burst_on": bool(s.burst_on)}
 
     if widget == "watch_subs":
         return {"cas_on": bool(s.cas_on), "prof_on": bool(s.prof_on)}
@@ -494,33 +488,6 @@ async def _after_set(cid: int, key: str, value) -> None:
         flt.invalidate_words(cid)
 
 
-@routes.post("/api/chat/{cid}/phrases")
-async def api_phrase_add(request: web.Request) -> web.Response:
-    """Добавить фразу-образец. Каждая строка — отдельная фраза."""
-    cid = await cid_of(request)
-    data = await body(request)
-    have = len(await db.phrases_list(cid))
-    added = dupes = 0
-    for raw in str(data.get("text") or "").split("\n"):
-        line = raw.strip()
-        if len(line) < 10 or have + added >= config.SEM_LIMIT:
-            continue
-        if await db.phrase_add(cid, line):
-            added += 1
-        else:
-            dupes += 1
-    nn.invalidate_phrases(cid)
-    return js({"added": added, "dupes": dupes})
-
-
-@routes.delete("/api/chat/{cid}/phrases/{rid}")
-async def api_phrase_del(request: web.Request) -> web.Response:
-    cid = await cid_of(request)
-    await db.phrase_del(cid, int(request.match_info["rid"]))
-    nn.invalidate_phrases(cid)
-    return js({"ok": True})
-
-
 @routes.get("/api/chat/{cid}/nn/doubt")
 async def api_nn_doubt(request: web.Request) -> web.Response:
     """Улики, на которых фильтр колеблется, — их и стоит разметить руками."""
@@ -550,7 +517,14 @@ async def api_nn_clusters(request: web.Request) -> web.Response:
     scope = request.query.get("scope", "unknown")
     if scope not in ("unknown", "profile"):
         raise web.HTTPBadRequest(text="bad scope")
-    return js({"scope": scope, "items": await nn.clusters(cid, scope),
+    items = await nn.clusters(cid, scope)
+    # Кучки строятся от NN_MIN_SAMPLES улик. Пока их меньше, ручные наказания
+    # было не разметить вовсе — отдаём их списком, по одной
+    flat = []
+    if not items and scope == "unknown":
+        flat = [{"id": r["id"], "text": r["text"], "label": r["label"]}
+                for r in await db.samples_unknown(cid, config.NN_MIN_SAMPLES)]
+    return js({"scope": scope, "items": items, "flat": flat,
                "model": nn.status(), "min": config.NN_MIN_SAMPLES})
 
 
@@ -605,6 +579,9 @@ async def api_bit(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="bad mask")
     s = await db.get_settings(cid)
     await db.set_setting(cid, key, getattr(s, key) ^ bit)
+    if key == "games_on" and not s.games_on & bit:
+        from ..handlers import games
+        await games.seed_gesture(cid, bit)
     return js({"value": getattr(await db.get_settings(cid), key)})
 
 
@@ -994,9 +971,9 @@ async def api_cmd_del(request: web.Request) -> web.Response:
 
 # ---------- варианты ответов (триггеры, счётчики, приветствие, правила) ----------
 
-_ANS_OWNERS = {"trig", "cmd", "welcome", "rules", "sub", "paste"}
+_ANS_OWNERS = {"trig", "cmd", "welcome", "rules", "sub", "paste", "love", "mog"}
 # у этих владелец варианта — сам чат
-_ANS_CHAT_OWNED = ("welcome", "rules", "sub", "paste")
+_ANS_CHAT_OWNED = ("welcome", "rules", "sub", "paste", "love", "mog")
 
 
 async def _ans_owner_ok(owner: str, oid: int, cid: int) -> bool:
@@ -1565,15 +1542,37 @@ async def api_games(request: web.Request) -> web.Response:
             item["kind"] = kind
             item["minutes"] = minutes
             item["prize"] = "бан" if kind == "ban" else f"мут на {utils.fmt_minutes(minutes)}"
+        if bit == config.GAME_RUS:
+            item["reload"] = s.rus_cd
+            item["reload_label"] = utils.fmt_minutes(s.rus_cd)
         items.append(item)
+    gestures = []
+    for bit, label, how, about in config.GESTURE_BITS:
+        item = {"bit": bit, "label": label, "how": how, "about": about,
+                "on": bool(s.games_on & bit)}
+        owner = config.GESTURE_OWNER.get(bit)
+        if owner:
+            item["owner"] = owner
+            item["answers"] = len(await db.ans_list(owner, cid))
+        gestures.append(item)
     return js({"items": items,
+               "gestures": gestures,
+               "gest_mute": s.gest_mute,
+               "gest_off_punish": bool(s.gest_off_punish),
+               "gest_mute_label": (utils.fmt_minutes(s.gest_mute) if s.gest_mute
+                                   else "без мута"),
+               "gest_mutes": [{"value": m,
+                               "label": utils.fmt_minutes(m) if m else "без мута"}
+                              for m in config.GESTURE_MUTE_PRESETS],
                "mutes": [{"value": m, "label": utils.fmt_minutes(m)}
                          for m in config.MUTE_PRESETS],
                "paste_mins": list(config.PASTE_MIN_PRESETS),
                "vanish_ns": list(config.VANISH_PRESETS),
                "paste_cds": [{"value": c,
                               "label": utils.fmt_minutes(c) if c else "без паузы"}
-                             for c in config.PASTE_CD_PRESETS]})
+                             for c in config.PASTE_CD_PRESETS],
+               "rus_cds": [{"value": c, "label": utils.fmt_minutes(c)}
+                           for c in config.RUS_CD_PRESETS]})
 
 
 @routes.post("/api/chat/{cid}/games/prize")
@@ -1593,6 +1592,11 @@ async def api_game_prize(request: web.Request) -> web.Response:
         if minutes not in config.MUTE_PRESETS:
             raise web.HTTPBadRequest(text="bad minutes")
         await db.set_setting(cid, min_field, minutes)
+    if "reload" in data:
+        value = int(data["reload"])
+        if bit != config.GAME_RUS or value not in config.RUS_CD_PRESETS:
+            raise web.HTTPBadRequest(text="bad reload")
+        await db.set_setting(cid, "rus_cd", value)
     return js({"ok": True})
 
 
@@ -1622,6 +1626,22 @@ async def api_game_paste(request: web.Request) -> web.Response:
         if value not in config.PASTE_CD_PRESETS:
             raise web.HTTPBadRequest(text="bad cd")
         await db.set_setting(cid, "paste_cd", value)
+    return js({"ok": True})
+
+
+@routes.post("/api/chat/{cid}/games/gesture")
+async def api_game_gesture(request: web.Request) -> web.Response:
+    """Мут за спам жестами (0 — без мута, только стираем) и наказание за
+    жесты, когда они выключены."""
+    cid = await cid_of(request)
+    data = await body(request)
+    if "mute" in data:
+        value = int(data["mute"] or 0)
+        if value not in config.GESTURE_MUTE_PRESETS:
+            raise web.HTTPBadRequest(text="bad mute")
+        await db.set_setting(cid, "gest_mute", value)
+    if "off_punish" in data:
+        await db.set_setting(cid, "gest_off_punish", 1 if data["off_punish"] else 0)
     return js({"ok": True})
 
 

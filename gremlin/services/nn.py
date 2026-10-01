@@ -40,8 +40,6 @@ _load_lock = asyncio.Lock()
 _profile: dict[int, tuple] = {}
 # посчитанная разбивка на кучки: chat_id -> (когда, [список id в кучке], [описания])
 _clusters: dict[int, tuple] = {}
-# фразы-образцы: chat_id -> (когда собраны, матрица, [строки таблицы])
-_phrases: dict[int, tuple] = {}
 # последние сообщения чата для поиска всплесков: chat_id -> deque[(ts, uid, вектор)]
 _recent: dict[int, deque] = {}
 # профили для сравнения: chat_id -> (когда собраны, матрица спама, матрица нормы)
@@ -214,11 +212,6 @@ def invalidate(chat_id: int | None = None) -> None:
         _clusters.clear()
     else:
         _clusters.pop(chat_id, None)
-
-
-def invalidate_phrases(chat_id: int) -> None:
-    """Список фраз изменился — пересчитаем их векторы при следующей проверке."""
-    _phrases.pop(chat_id, None)
 
 
 def _fit(matrix, labels):
@@ -572,53 +565,6 @@ async def label_cluster(chat_id: int, index: int, label: str,
     logger.info("кучка %s в чате %s размечена как %s: %d улик",
                 index, chat_id, label, moved)
     return moved
-
-
-async def _phrase_matrix(chat_id: int):
-    """Матрица векторов фраз-образцов чата. Считается один раз и лежит в базе."""
-    cached = _phrases.get(chat_id)
-    rows = await db.phrases_list(chat_id)
-    if cached and cached[0] == len(rows) and all(
-            r["id"] == old["id"] for r, old in zip(rows, cached[2])):
-        return cached[1], cached[2]
-    if not rows:
-        _phrases[chat_id] = (0, None, [])
-        return None, []
-
-    fresh = [r for r in rows if not r["vec"]]
-    vecs = {r["id"]: _np.frombuffer(r["vec"], dtype=_np.float32)
-            for r in rows if r["vec"]}
-    if fresh:
-        got = await embed([r["text"] for r in fresh])
-        for r, v in zip(fresh, got):
-            v = v.astype(_np.float32)
-            vecs[r["id"]] = v
-            await db.phrase_set_vec(r["id"], v.tobytes())
-    matrix = _np.stack([vecs[r["id"]] for r in rows])
-    _phrases[chat_id] = (len(rows), matrix, list(rows))
-    return matrix, list(rows)
-
-
-async def match_phrase(chat_id: int, text: str, threshold: int):
-    """Похоже ли сообщение на одну из фраз-образцов чата.
-
-    Список слов ловит буквы, и спам переписывают под него быстрее, чем список
-    пополняют. Фраза-образец ловит смысл: «заработок от 5000 в день» поймает
-    и «доход десять тысяч ежедневно, пиши в личку».
-
-    Возвращает (строка фразы, близость в процентах) или None.
-    """
-    text = (text or "").strip()
-    if len(text) < 10 or not await ensure():
-        return None
-    matrix, rows = await _phrase_matrix(chat_id)
-    if matrix is None:
-        return None
-    vec = (await embed([text]))[0]
-    sims = matrix @ vec
-    best = int(sims.argmax())
-    score = int(round(100 * float(sims[best])))
-    return (rows[best], score) if score >= threshold else None
 
 
 async def burst(chat_id: int, user_id: int, text: str, min_users: int):

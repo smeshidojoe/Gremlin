@@ -66,14 +66,12 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
                                      "prof_mute_min", "prof_score",
                                      "prof_words", "prof_members", "prof_photo",
                                      "prof_photo_min", "prof_photo_score")),
-    "games": ("🎪 Приколы", ("games_on", "games_adm", "rus_punish", "rus_min",
+    "games": ("🎪 Приколы", ("games_on", "games_adm", "rus_punish", "rus_min", "rus_cd", "gest_mute", "gest_off_punish",
                "duel_punish", "duel_min", "battle_punish", "battle_min",
                "court_punish", "court_min", "paste_min", "paste_cd",
                "vanish_n")),
     "service": ("🧹 Системные", ("service_join", "service_leave", "service_other")),
     "read": ("🔍 Распознавание", ("ocr_on", "ocr_langs", "asr_on", "asr_max_sec")),
-    "sem": ("🧠 Смысловые стоп-слова", ("sem_on", "sem_threshold", "sem_punish",
-                                        "sem_mute_min", "sem_guests")),
     "burst": ("📡 Рассылки", ("burst_on", "burst_users", "burst_punish",
                               "burst_mute_min")),
     # копилка улик не переносится: она про конкретный чат и его норму
@@ -151,7 +149,8 @@ def _place(data: bytes, ref: str, dst_chat: int, purpose: str) -> str:
 # копией той же логики, которая неизбежно разошлась бы с первой.
 
 # владелец заготовок в answers -> (группа, папка медиа)
-_ANSWER_GROUPS = (("welcome", "welcome"), ("rules", "rules"), ("paste", "games"))
+_ANSWER_GROUPS = (("welcome", "welcome"), ("rules", "rules"), ("paste", "games"),
+                  ("love", "games"), ("mog", "games"))
 
 
 def _answer(a) -> dict:
@@ -169,8 +168,6 @@ async def snapshot(src: int, groups: set[str] | None = None) -> dict:
     if "words" in picked:
         snap["words"] = [{"word": r["word"], "mode": r["mode"]}
                          for r in await db.words_list(src)]
-    if "sem" in picked:
-        snap["phrases"] = [r["text"] for r in await db.phrases_list(src)]
     if "wl" in picked:
         snap["whitelist"] = [{"user_id": e["user_id"], "username": e["username"],
                               "title": e["title"], "scopes": sorted(e["scopes"])}
@@ -238,14 +235,6 @@ async def apply(dst: int, snap: dict, groups: set[str],
                 have.add(w["word"])
                 stats["стоп-слов"] += 1
 
-    if "sem" in picked:
-        have = {r["text"].lower() for r in await db.phrases_list(dst)}
-        for text in snap.get("phrases", ()):
-            if text.lower() not in have:
-                await db.phrase_add(dst, text)
-                have.add(text.lower())
-                stats["фраз"] = stats.get("фраз", 0) + 1
-
     if "wl" in picked:
         for e in snap.get("whitelist", ()):
             if await db.wl_entry_by_key(dst, e["user_id"], e["username"]) is None:
@@ -273,7 +262,8 @@ async def apply(dst: int, snap: dict, groups: set[str],
             stats["триггеров"] += 1
 
     labels = {"welcome": "заготовок приветствия", "rules": "заготовок правил",
-              "paste": "заготовок на пасты"}
+              "paste": "заготовок на пасты", "love": "фраз любви",
+              "mog": "фраз мога"}
     for owner, group in _ANSWER_GROUPS:
         if group not in picked:
             continue
@@ -378,7 +368,7 @@ def export_name(chat_id: int) -> str:
 def describe(snap: dict) -> dict[str, int]:
     """Что лежит в снимке — для экрана «что загрузить»."""
     out = {}
-    for key, label in (("words", "стоп-слов"), ("phrases", "фраз"),
+    for key, label in (("words", "стоп-слов"),
                        ("whitelist", "вайтлист"), ("link_wl", "чатов для ссылок"),
                        ("inline_wl", "инлайн-ботов"), ("triggers", "триггеров"),
                        ("counters", "счётчиков")):
@@ -509,7 +499,6 @@ def parse_archive(raw: bytes) -> tuple[dict, dict[str, bytes]]:
         snap["words"] = _items(manifest, "words", lambda w: {
             "word": _str(w["word"], 200),
             "mode": w["mode"] if w.get("mode") in ("strict", "stem") else "strict"})
-        snap["phrases"] = _items(manifest, "phrases", lambda p: _str(p, 500))
 
         def wl(e) -> dict:
             scopes = [x for x in e["scopes"] if x in config.WL_SCOPES]

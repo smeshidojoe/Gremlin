@@ -15,7 +15,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .. import config, db, runtime, utils
-from ..services import adm_cache, deleting, moderation, raid
+from ..services import adm_cache, deleting, moderation
 from . import group
 
 logger = logging.getLogger("gremlin.events")
@@ -299,6 +299,13 @@ async def member_updated(update: ChatMemberUpdated, bot: Bot) -> None:
             await watch.forget_bot(chat.id, target.id)
 
     actor = update.from_user
+    # Вход без служебного сообщения виден только здесь: в больших чатах
+    # Telegram их прячет. Встречаем и тех, кого впустил сам бот (заявка по
+    # подписке, возврат после разбана), — поэтому до проверки на actor
+    if (_joined(old, new) and not group.stale(update)
+            and await db.get_chat(chat.id) is not None):
+        s = await db.get_settings(chat.id)
+        await group.joined(bot, chat, [target], s, actor)
     if actor is None or actor.id == bot.id:
         return  # свои действия уже закарточены в moderation
     if _joined(old, new):
@@ -314,15 +321,6 @@ async def member_updated(update: ChatMemberUpdated, bot: Bot) -> None:
         await moderation.revoke_unban_link(bot, chat.id, target.id)
     if target.is_bot:
         return
-
-    # Вход без служебного сообщения виден только здесь: в больших чатах
-    # Telegram их прячет. Набег считаем по обоим путям, иначе половина
-    # входов прошла бы мимо счёта
-    if new.status == "member" and old.status in ("left", "kicked"):
-        s = await db.get_settings(chat.id)
-        action = await raid.note_join(bot, chat, target, s)
-        if action:
-            await raid.apply(bot, chat, target, s, action)
 
     def _muted(m) -> bool:
         return m.status == "restricted" and getattr(m, "can_send_messages", True) is False

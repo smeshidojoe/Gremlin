@@ -1122,104 +1122,135 @@ async def captcha_pass(cb: CallbackQuery, bot: Bot) -> None:
 async def on_join(message: Message, bot: Bot) -> None:
     if stale(message):
         return  # новичок зашёл, пока бот лежал — встречать поздно
-    s = await db.get_settings(message.chat.id)
     for user in message.new_chat_members or []:
         adm_cache.invalidate_member(message.chat.id, user.id)
+    s = await db.get_settings(message.chat.id)
+    await joined(bot, message.chat, message.new_chat_members or [], s,
+                 message.from_user)
+    if s.service_join:
+        await deleting.one(message.delete, message.chat.id)
+
+
+# Кого уже встретили: (chat_id, user_id) -> monotonic. Вход приходит двумя
+# путями — служебным сообщением и chat_member, — а в больших чатах Telegram
+# служебное прячет и остаётся только второй. Встречает тот, кто пришёл первым
+_met: dict[tuple[int, int], float] = {}
+_MET_TTL = 120
+
+
+def _first_meet(chat_id: int, user_id: int) -> bool:
+    now = time.monotonic()
+    if len(_met) > 1000:
+        for key in [k for k, t in _met.items() if now - t > _MET_TTL]:
+            del _met[key]
+    key = (chat_id, user_id)
+    if key in _met and now - _met[key] < _MET_TTL:
+        return False
+    _met[key] = now
+    return True
+
+
+async def joined(bot: Bot, chat, users, s, adder) -> None:
+    """Всё, что делаем с новичками: набег, приветствие, наблюдение, капча.
+
+    Зовут и служебное сообщение о входе, и chat_member — кто первым. adder —
+    кто добавил (для чужих ботов: добавил не-админ — бан).
+    """
+    users = [u for u in users if _first_meet(chat.id, u.id)]
+    if not users:
+        return
+    for user in users:
         if not user.is_bot:
-            await db.add_event(message.chat.id, "join", f"{user.full_name} ({user.id})")
+            await db.add_event(chat.id, "join", f"{user.full_name} ({user.id})")
     # Набег смотрит не на человека, а на скорость входов. С тем, кого режим
     # уже обработал, дальше не здороваемся и капчей не мучаем: с ним решено
     raided = set()
-    for user in message.new_chat_members or []:
-        action = await raid.note_join(bot, message.chat, user, s)
-        if action and await raid.apply(bot, message.chat, user, s, action):
+    for user in users:
+        action = await raid.note_join(bot, chat, user, s)
+        if action and await raid.apply(bot, chat, user, s, action):
             raided.add(user.id)
     if s.welcome_on:
-        humans = [u for u in message.new_chat_members or []
-                  if not u.is_bot and u.id not in raided]
+        humans = [u for u in users if not u.is_bot and u.id not in raided]
         if humans:
             names = ", ".join(
                 utils.mention(u.id, u.first_name, u.username) for u in humans
             )
-            old = _last_welcome.pop(message.chat.id, None)
+            old = _last_welcome.pop(chat.id, None)
             if old:
-                await deleting.one(lambda: bot.delete_message(message.chat.id, old), message.chat.id)
-            sent = await _welcome(message, s, names)
+                await deleting.one(lambda: bot.delete_message(chat.id, old), chat.id)
+            sent = await _welcome(bot, chat.id, s, names)
             if sent is not None:
-                _last_welcome[message.chat.id] = sent
+                _last_welcome[chat.id] = sent
     if s.watch_on:
-        admins = await adm_cache.chat_admin_ids(bot, message.chat.id)
-        adder = message.from_user
+        admins = await adm_cache.chat_admin_ids(bot, chat.id)
         adder_is_admin = adder is not None and (
             adder.id in admins or adder.id in config.ADMIN_IDS
         )
-        for user in message.new_chat_members or []:
+        for user in users:
             if user.id in raided:
                 continue
             # чужие боты: банить, если добавил не-админ
             if user.is_bot and user.id != bot.id:
                 if s.watch_bots and not adder_is_admin:
                     try:
-                        await bot.ban_chat_member(message.chat.id, user.id)
+                        await bot.ban_chat_member(chat.id, user.id)
                     except Exception:
-                        logger.warning("bot ban failed in %s", message.chat.id, exc_info=True)
+                        logger.warning("bot ban failed in %s", chat.id, exc_info=True)
                         continue
                     pid = await db.add_punishment(
-                        message.chat.id, user.id, user.username, user.full_name,
+                        chat.id, user.id, user.username, user.full_name,
                         "ban", "чужой бот добавлен не-админом", None, None,
                     )
                     card = (
-                        f"⛔ <b>Бан бота</b> · {utils.esc(message.chat.title)}\n"
+                        f"⛔ <b>Бан бота</b> · {utils.esc(chat.title)}\n"
                         f"🤖 @{user.username or user.id}\n"
                         f"📎 Причина: добавлен не-админом\n"
                         f"🤖 Кем: Gremlin (автомод)"
                     )
-                    await db.add_event(message.chat.id, "watch", f"бан бота @{user.username} ({user.id})")
+                    await db.add_event(chat.id, "watch", f"бан бота @{user.username} ({user.id})")
                     sent = await moderation.send_card(
-                        bot, message.chat.id, config.BIT_WATCH, card, pid, "ban")
+                        bot, chat.id, config.BIT_WATCH, card, pid, "ban")
                     runtime.spawn(net.spread_and_note(
-                        bot, sent, message.chat.id, user, "ban", 0,
+                        bot, sent, chat.id, user, "ban", 0,
                         "чужой бот добавлен не-админом", None))
                 else:
-                    await watch.note_bot(message.chat.id, user)
+                    await watch.note_bot(chat.id, user)
                 continue
             # профиль новичка-человека
             if not user.is_bot and user.id not in admins and user.id not in config.ADMIN_IDS:
-                scopes = await db.free_scopes(message.chat.id, user.id, user.username)
+                scopes = await db.free_scopes(chat.id, user.id, user.username)
                 if not scopes & {"all", "watch"}:
-                    await watch.check_user(bot, message.chat, user, s,
-                                           event="join")
+                    await watch.check_user(bot, chat, user, s, event="join")
     if s.captcha_on:
-        admins = await adm_cache.chat_admin_ids(bot, message.chat.id)
-        for user in message.new_chat_members or []:
+        admins = await adm_cache.chat_admin_ids(bot, chat.id)
+        for user in users:
             if (user.is_bot or user.id in admins or user.id in config.ADMIN_IDS
                     or user.id in raided):
                 continue
-            scopes = await db.free_scopes(message.chat.id, user.id, user.username)
+            scopes = await db.free_scopes(chat.id, user.id, user.username)
             if "all" in scopes:
                 continue
-            await ask_captcha(bot, message.chat, user, s)
-    if s.service_join:
-        await deleting.one(message.delete, message.chat.id)
+            await ask_captcha(bot, chat, user, s)
 
 
-async def _welcome(message: Message, s, names: str) -> int | None:
+async def _welcome(bot: Bot, chat_id: int, s, names: str) -> int | None:
     """Поздороваться: вариант из списка, а если его нет — старый простой текст.
 
     Заготовки лежат там же, где ответы триггеров, поэтому умеют медиа и
-    несколько вариантов — бот берёт случайный.
+    несколько вариантов — бот берёт случайный. Шлём в чат, а не ответом:
+    служебного сообщения, к которому можно прицепиться, может и не быть.
     """
-    ans = await db.ans_pick("welcome", message.chat.id)
+    ans = await db.ans_pick("welcome", chat_id)
     try:
         if ans is not None:
-            sent = await triggers.send_answer(message, ans, reply=False,
-                                              subs={"{name}": names})
+            sent = await triggers.send_answer_to(bot, chat_id, ans,
+                                                 subs={"{name}": names})
             return sent.message_id if sent else None
         if s.welcome_text:
-            sent = await message.answer(s.welcome_text.replace("{name}", names))
+            sent = await bot.send_message(chat_id, s.welcome_text.replace("{name}", names))
             return sent.message_id
     except Exception:
-        logger.warning("welcome failed in %s", message.chat.id, exc_info=True)
+        logger.warning("welcome failed in %s", chat_id, exc_info=True)
     return None
 
 

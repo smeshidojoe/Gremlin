@@ -221,13 +221,31 @@ async def test_collect(chat, monkeypatch):
     assert "✉️ 42 сообщения" in other
     assert "⚠️ Telegram этого наказания не видит" in other   # мут в базе, в TG нет
 
-    assert [e["kind"] if "kind" in e else e["label"] for e in d["events"]] == ["Наблюдение"]
-    assert d["events"][0]["body"] == "бан: Катя — профиль (80)"
+    # наказания — из списка наказаний; запись лога про тот же бан не задваивает
+    assert sorted((e["label"], e["chat"]) for e in d["events"]) == [
+        ("Бан", "Второй"), ("Бан", "Первый"), ("Мут", "Второй"), ("Мут", "Первый")]
+    lifted = next(e for e in d["events"] if (e["label"], e["chat"]) == ("Мут", "Первый"))
+    assert lifted["ended"] and lifted["body"].startswith("🔓 снято ")
+    assert " · флуд · кем: " in lifted["body"]
 
     text = st.render(d)
     assert "💬 <b>Второй</b>\n├ ✅ состоит" in text
     assert "🔇 Муты: <b>2</b> · ⛔ Баны: <b>1</b>" in text
     assert "<blockquote expandable>" in text and text.endswith("</blockquote>")
+
+
+async def test_log_line_without_the_person():
+    """Имя и id человека из строки лога уходят, чужие числа — нет."""
+    async def name(uid):
+        return {OWNER: "Админ"}[uid]
+
+    assert await st._clean(f"ban: Катя ({U}) — флуд | by {OWNER}", U, name) \
+        == "бан: флуд · кем: Админ"
+    assert await st._clean(f"игра: проиграл дуэль — {U}", U, name) == "игра: проиграл дуэль"
+    assert await st._clean(f"бан-рулетка: {U} уцелел | by {OWNER}", U, name) \
+        == "бан-рулетка: уцелел · кем: Админ"
+    assert await st._clean(f"delete: Катя ({U}) — ссылка: t.me/{U}1", U, name) \
+        == f"🗑 удалено · ссылка: t.me/{U}1"
 
 
 async def test_collect_unknown_person(chat):

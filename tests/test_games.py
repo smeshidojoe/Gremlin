@@ -99,6 +99,24 @@ async def test_reload_expires_and_drum_is_loaded_again(roulette, monkeypatch,
     assert roulette == [VICTIM]
 
 
+async def test_admin_ignores_reload_and_keeps_it(roulette, monkeypatch, chat):
+    """Админ крутит сколько угодно — за себя и за другого. Его выстрел
+    чат на перезарядку не ставит, а идущую не сбрасывает."""
+    bullet_at(monkeypatch, 0)
+    await spin(make_user(ADMIN), reply_from=make_user(VICTIM))
+    assert roulette == [VICTIM]
+    m = await spin(make_user(PLAIN))
+    assert roulette == [VICTIM, PLAIN] and "перезарядке" not in str(m.replies)
+
+    roulette.clear()                            # теперь чат на перезарядке
+    for _ in range(2):
+        await spin(make_user(ADMIN), reply_from=make_user(VICTIM))
+    await spin(make_user(ADMIN))                # за себя: пуля не берёт
+    assert roulette == [VICTIM, VICTIM]
+    m = await spin(make_user(PLAIN))
+    assert roulette == [VICTIM, VICTIM] and "перезарядке" in m.replies[0]
+
+
 async def test_drum_survives_between_calls(roulette, monkeypatch, chat):
     """Барабан в базе: перезапуск не должен обнулять набитые щелчки."""
     bullet_at(monkeypatch, 3)
@@ -141,16 +159,6 @@ async def test_admin_spins_for_replied_user(roulette, monkeypatch):
     m = await spin(make_user(ADMIN), reply_from=make_user(VICTIM, "Жертва"))
     assert "Барабан крутят за" in m.replies[0]
     assert roulette == [VICTIM]
-
-
-async def test_bullet_spent_even_on_admin(roulette, monkeypatch):
-    """Админа пуля не берёт, но патрон потрачен: иначе админ разряжал бы
-    барабан без последствий."""
-    bullet_at(monkeypatch, 0)
-    await spin(make_user(ADMIN))
-    assert roulette == []
-    m = await spin(make_user(PLAIN))
-    assert "перезарядке" in m.replies[0]
 
 
 async def test_disabled_game_silent(roulette, chat):

@@ -45,7 +45,9 @@ def test_edits_fit_telegram_limit():
         for start in range(seconds):
             window = [x for x in m if start - 60 < seconds - x <= start]
             assert len(window) <= 20, (seconds, start)
-    assert len(countdown.marks(config.BATTLE_TICK, fine=0)) * 60 // config.BATTLE_TICK < 20
+    # матч: отметки таймера плюс правка с самим событием
+    battle = [m for m in config.BATTLE_MARKS if m < config.BATTLE_TICK]
+    assert (len(battle) + 1) * 60 // config.BATTLE_TICK <= 18
 
 
 @pytest.mark.parametrize("left,text", [(45, "45 сек"), (59, "59 сек"),

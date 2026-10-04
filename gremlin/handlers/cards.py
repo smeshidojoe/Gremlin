@@ -335,7 +335,7 @@ async def card_ban(cb: CallbackQuery, bot: Bot) -> None:
     except Exception as e:
         await cb.answer(f"Не получилось: {e}", show_alert=True)
         return
-    await db.deactivate_user_punishments(chat_id, user_id)
+    await db.deactivate_user_punishments(chat_id, user_id, "replaced")
     await db.add_punishment(
         chat_id, user_id, None, None, "ban", "бан из карточки", None, cb.from_user.id,
         was_member=member,

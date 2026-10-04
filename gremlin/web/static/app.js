@@ -1332,9 +1332,9 @@ function statusHtml(cid) {
     : '<div class="empty">Ни в одном из ваших чатов не встречался.</div>';
   const events = !d.events.length ? '' : `<div class="card">
       <h2>📜 Последние события</h2>
-      ${d.events.map((e) => `<div class="item"><div class="body">
+      ${d.events.map((e) => `<div class="item${e.ended ? ' done' : ''}"><div class="body">
           ${esc(e.icon)} <b>${esc(e.label)}</b> · ${esc(e.chat)}
-          <small>${esc(e.when)} · ${esc(e.body)}</small>
+          <small>${esc(e.when)}${e.body ? ' · ' + esc(e.body) : ''}</small>
         </div></div>`).join('')}
     </div>`;
   return `<div class="card">
@@ -1398,9 +1398,14 @@ async function activeView(cid) {
       </div>
     </div>
     <div class="card">
-      <h2>📋 Активные (${d.items.length})</h2>
+      <h2>📋 Активные (${d.items.filter((p) => !p.ended).length})</h2>
+      <div class="intro">Завершённые за сутки — в том же списке, бледнее и с пометкой.</div>
       <div>
-        ${d.items.map((p) => `<div class="item">
+        ${d.items.map((p) => p.ended
+          ? `<div class="item done">
+            <div class="body"><a href="${esc(p.link)}" target="_blank" rel="noopener">${esc(p.who)}</a><small><b>${esc(p.ended_label)}</b> · ${esc(p.kind_label)}${p.since ? ` · выдан ${esc(p.since)}` : ''} · ${esc(p.reason)}</small></div>
+          </div>`
+          : `<div class="item">
             <div class="body"><a href="${esc(p.link)}" target="_blank" rel="noopener">${esc(p.who)}</a><small>${esc(p.kind_label)} · ${esc(p.until)}${p.since ? ` · выдан ${esc(p.since)}` : ''} · ${esc(p.reason)}</small></div>
             <button class="btn small ghost" data-act="lift" data-id="${p.id}">🔓 Снять</button>
           </div>`).join('') || '<div class="empty">Все чисты.</div>'}

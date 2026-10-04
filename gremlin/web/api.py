@@ -1147,12 +1147,25 @@ async def api_warn_reset(request: web.Request) -> web.Response:
 
 # ---------- наказания ----------
 
+# как закончилось наказание — пометка в списке панели
+RECENT_ENDED = 86400   # завершённые показываем за последние сутки
+
+
 @routes.get("/api/chat/{cid}/active")
 async def api_active(request: web.Request) -> web.Response:
+    """Действующие наказания и вперемешку с ними, по времени выдачи, — те,
+    что закончились за сутки: короткий мут от игры иначе исчезал раньше, чем
+    его успевали увидеть."""
     cid = await cid_of(request, "punish")
+    now = int(time.time())
     items = []
-    for r in await db.active_punishments(cid, limit=ACTIVE_LIMIT):
+    for r in await db.recent_punishments(cid, now - RECENT_ENDED, ACTIVE_LIMIT):
+        how, ended = db.punishment_end(r, now)
+        if how is not None and (ended or r["created"]) < now - RECENT_ENDED:
+            continue
         items.append({
+            "ended": how is not None,
+            "ended_label": utils.ended_label(how, ended) if how else None,
             "id": r["id"], "user_id": r["user_id"],
             "who": r["name"] or await db.user_label(r["user_id"], r["username"]),
             # ник отдаём отдельно: панель вешает его ссылкой на само имя,

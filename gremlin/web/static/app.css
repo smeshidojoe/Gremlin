@@ -141,6 +141,7 @@ main { padding: 12px; max-width: 720px; margin: 0 auto; }
 
 .item { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--line); }
 .item:last-child { border-bottom: 0; }
+.item.done { opacity: .55; }
 .item .body { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .item .body small { display: block; color: var(--hint); font-size: 12px; }
 

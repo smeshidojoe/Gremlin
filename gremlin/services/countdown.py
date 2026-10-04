@@ -48,7 +48,8 @@ def label(left: int) -> str:
 
 
 async def run(seconds: int, draw: Callable[[int], Awaitable[object]],
-              stop: Callable[[], bool] | None = None, fine: int = FINE) -> None:
+              stop: Callable[[], bool] | None = None, fine: int = FINE,
+              at: list[int] | None = None) -> None:
     """Отсчитать seconds, перерисовывая сообщение через draw(сколько осталось).
 
     Время меряем от старта, а не суммой пауз: правка идёт сотни миллисекунд, и
@@ -60,11 +61,12 @@ async def run(seconds: int, draw: Callable[[int], Awaitable[object]],
 
     stop() — вернуть True, если отсчёт больше не нужен (дуэль уже приняли).
     fine — сколько последних секунд показывать посекундно.
+    at — свои отметки по убыванию вместо marks(), когда правок надо меньше.
     """
     loop = asyncio.get_running_loop()
     start = loop.time()
     quiet_until = 0.0
-    for left in marks(seconds, fine):
+    for left in at if at is not None else marks(seconds, fine):
         await asyncio.sleep(max(0.0, (seconds - left) - (loop.time() - start)))
         if stop is not None and stop():
             return

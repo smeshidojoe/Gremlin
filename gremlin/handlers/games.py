@@ -56,10 +56,13 @@ async def _drum_save(chat_id: int, drum: dict) -> None:
     await db.kv_set(_RUS_KEY.format(chat_id), json.dumps(drum))
 
 
-async def _pull(chat_id: int, reload_min: int) -> tuple[str, int]:
+async def _pull(chat_id: int, reload_min: int,
+                admin: bool = False) -> tuple[str, int]:
     """Нажать на спуск. Вернуть (что вышло, число).
 
     reload_min — перезарядка после выстрела, из настроек чата.
+    admin — крутит админ: перезарядка его не держит, а его выстрел только
+    заряжает барабан заново — чат из-за админа ждать не должен.
 
     ('reload', секунд до готовности) — револьвер на перезарядке;
     ('miss', сколько гнёзд осталось) — щелчок, барабан провернулся;
@@ -69,13 +72,18 @@ async def _pull(chat_id: int, reload_min: int) -> tuple[str, int]:
     async with lock:
         now = int(time.time())
         drum = await _drum_load(chat_id)
-        if drum.get("reload_until", 0) > now:
-            return "reload", drum["reload_until"] - now
+        until = drum.get("reload_until", 0)
+        if until > now and not admin:
+            return "reload", until - now
+        # идущую перезарядку участников выстрелы админа не трогают
+        keep = {"reload_until": until} if until > now else {}
         if "bullet" not in drum:
             # заряжаем: патрон в случайное гнездо, крутим с нуля
-            drum = {"bullet": random.randrange(config.RUS_CHANCE), "pulls": 0}
+            drum = {"bullet": random.randrange(config.RUS_CHANCE), "pulls": 0,
+                    **keep}
         if drum["pulls"] >= drum["bullet"]:
-            await _drum_save(chat_id, {"reload_until": now + reload_min * 60})
+            await _drum_save(chat_id, keep if admin
+                             else {"reload_until": now + reload_min * 60})
             return "hit", 0
         drum["pulls"] += 1
         await _drum_save(chat_id, drum)
@@ -139,10 +147,17 @@ def _replied(message: Message):
     её первое, служебное сообщение — без этой проверки команда без ответа
     доставалась бы автору темы: его вызывали на дуэль, судили, ему кидали
     жест.
+
+    То же в комментариях под постом: там всё — ответ на сам пост, а его в
+    чат приносит служебный аккаунт Telegram. Без проверки на дуэль вызывали
+    «Telegram». Сообщения от имени канала или анонимного админа — тоже не
+    человек, с ними не играют.
     """
     reply = message.reply_to_message
     if (reply is None or reply.from_user is None
-            or getattr(reply, "forum_topic_created", None) is not None):
+            or getattr(reply, "forum_topic_created", None) is not None
+            or getattr(reply, "sender_chat", None) is not None
+            or reply.from_user.id in config.SERVICE_IDS):
         return None
     return reply
 
@@ -172,17 +187,15 @@ async def _punish(bot: Bot, chat_id: int, user_id: int, kind: str, minutes: int,
 
 
 async def _can_target(bot: Bot, chat_id: int, user_id: int) -> bool:
-    """Кому игра вправе выдать наказание.
+    """Кому игра вправе выдать наказание: всем, кроме админов и самого бота.
 
-    Админов и самого бота — нельзя. Тех, кто в чате не состоит, — тоже: под
-    постами привязанного канала пишут и жмут кнопки люди, которые в группу не
-    вступали, и приз им вручать некуда.
+    Под постами привязанного канала играют и те, кто в группу не вступал.
+    Мут им Telegram не даёт — punish_ex заменит его баном на тот же срок, и
+    писать в комментариях человек так же не сможет, пока срок не выйдет.
     """
     if user_id in await adm_cache.chat_admin_ids(bot, chat_id):
         return False
-    if user_id == (await bot.me()).id:
-        return False
-    return await adm_cache.is_member(bot, chat_id, user_id)
+    return user_id != (await bot.me()).id
 
 
 # ---------- русская рулетка ----------
@@ -228,7 +241,8 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
     # Щелчок считаем сразу, до паузы: пока барабан «крутится» две секунды,
     # следующий игрок уже должен видеть его провёрнутым.
     s = await db.get_settings(message.chat.id)
-    outcome, value = await _pull(message.chat.id, s.rus_cd)
+    admin = await _is_admin(bot, message.chat.id, message.from_user.id)
+    outcome, value = await _pull(message.chat.id, s.rus_cd, admin)
     if outcome == "reload":
         sent = await message.reply(
             f"🔫 Револьвер на перезарядке. Будет готов через "
@@ -249,8 +263,9 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
             f"🔫 {who}: {random.choice(_RUS_SAFE)}\n"
             f"<i>В барабане {value} {word} — шанс 1 из {value}.</i>")
         return
-    reload_note = (f"<i>Револьвер ушёл на перезарядку на "
-                   f"{utils.fmt_minutes(s.rus_cd)}.</i>")
+    reload_note = ("<i>Барабан заряжен заново.</i>" if admin
+                   else f"<i>Револьвер ушёл на перезарядку на "
+                        f"{utils.fmt_minutes(s.rus_cd)}.</i>")
     # патрон потрачен в любом случае: иначе админ разряжал бы барабан без
     # последствий, а перезарядку чату всё равно пришлось бы ждать
     if not await _can_target(bot, message.chat.id, player.id):
@@ -330,11 +345,13 @@ async def cmd_duel(message: Message, bot: Bot) -> None:
         await _quiet_penalty(bot, message, config.DUEL_CD_MUTE,
                              "вызов на дуэль раньше срока")
         return
-    if _replied(message) is None:
-        sent = await message.reply("⚔️ Вызывать на дуэль надо ответом на сообщение.")
+    foe = await _target(message, bot)
+    if foe is None or foe == "unknown":
+        sent = await message.reply(
+            _UNKNOWN if foe else
+            "⚔️ Вызывать на дуэль надо ответом на сообщение или @ником.")
         _later(bot, message.chat.id, sent.message_id, 60)
         return
-    foe = _replied(message).from_user
     me = message.from_user
     if foe.id == me.id or foe.is_bot:
         sent = await message.reply("⚔️ С собой и с ботами не дерутся.")
@@ -563,12 +580,13 @@ async def _battle_run(bot: Bot, key: tuple[int, int]) -> None:
            f"{utils.plural(len(fighters), 'боец', 'бойца', 'бойцов')}."]
     first_out = None
     while len(fighters) > 1:
-        # Живой таймер до следующего события — без посекундного хвоста:
-        # события идут подряд весь матч, и секунды в конце каждого дали бы
+        # Живой таймер до следующего события. Отметки реже, чем на сборе:
+        # события идут подряд весь матч, и полный отсчёт (15, 10, 5…1) дал бы
         # больше правок в минуту, чем Telegram разрешает
         await countdown.run(
             config.BATTLE_TICK,
-            lambda left: _battle_edit(bot, chat_id, msg_id, log, left), fine=0)
+            lambda left: _battle_edit(bot, chat_id, msg_id, log, left),
+            at=[m for m in config.BATTLE_MARKS if m < config.BATTLE_TICK])
         dead = fighters.pop()
         first_out = first_out or dead
         log.append(f"💀 {await _who(dead)} {_death(used)}")

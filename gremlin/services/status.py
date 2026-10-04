@@ -83,6 +83,33 @@ def _term(ts: int | None) -> str:
     return f"до {utils.fmt_ts(ts)}" if ts else "навсегда"
 
 
+# Права на отправку, которые снимают по одному: поле Telegram -> что пропало.
+# Закреплять, приглашать, менять инфо не берём — их часто закрывают всему
+# чату, и строка у каждого второго твердила бы про них
+_SEND_RIGHTS = (
+    ("can_send_photos", "фото"),
+    ("can_send_videos", "видео"),
+    ("can_send_audios", "аудио"),
+    ("can_send_voice_notes", "голосовых"),
+    ("can_send_video_notes", "кружков"),
+    ("can_send_documents", "файлов"),
+    ("can_send_polls", "опросов"),
+    ("can_send_other_messages", "стикеров/GIF/инлайна"),
+    ("can_add_web_page_previews", "превью ссылок"),
+)
+
+
+def _limits(m) -> str:
+    """Что именно снято у того, кто писать может. «Ограничен» без пояснения
+    читался как наказание, а там бывает одна галка «стикеры и GIF»."""
+    off = [word for field, word in _SEND_RIGHTS if getattr(m, field, True) is False]
+    if not off:
+        return "⚠️ ограничен в правах"
+    if len(off) == len(_SEND_RIGHTS):
+        return "⚠️ только текст"
+    return "⚠️ без " + ", ".join(off)
+
+
 def _state(m) -> tuple[str, bool, str | None]:
     """(подпись, состоит ли в чате, какое наказание видит Telegram)."""
     status = m.status
@@ -97,7 +124,7 @@ def _state(m) -> tuple[str, bool, str | None]:
     if status == "restricted":
         inside = bool(getattr(m, "is_member", False))
         muted = not getattr(m, "can_send_messages", True)
-        what = "🔇 мут" if muted else "⚠️ ограничен"
+        what = "🔇 мут" if muted else _limits(m)
         tail = "" if inside else " · в чате не состоит"
         return f"{what} {_term(_until(m))}{tail}", inside, "mute" if muted else None
     return "🚪 в чате нет", False, None
@@ -219,6 +246,90 @@ _SEEN_ONLY = (
 )
 
 
+HISTORY = 10        # строк в «Последних событиях»
+# Запись лога в эти секунды от выдачи наказания в том же чате — про него же:
+# лог пишут сразу за наказанием. Сама запись тогда не нужна, строка из
+# списка наказаний то же самое говорит понятнее
+_SAME_CASE = 10
+# что рядом с наказанием стоит само по себе: вошёл, заявка, капча, жалоба
+_OWN_EVENTS = {"join", "leave", "sub", "captcha", "report"}
+_KIND_ICON = {"mute": "🔇", "ban": "⛔", "kick": "👢", "banchan": "📛"}
+# кто сделал: «| by 123», «юзером 123» — в конец строки и именем
+_ACTOR = re.compile(r"\s*\|?\s*(?:\bby|юзером)\s+(\d+)")
+_TAGS = re.compile(r"<[^>]+>")
+
+
+def _when(ts: int) -> str:
+    return utils._local(ts).strftime("%d.%m %H:%M")
+
+
+async def _clean(text: str | None, user_id: int, name) -> str:
+    """Строка лога про человека — без него самого.
+
+    Лог писался годами в разном виде: «бан: Имя (id) — причина | by 123»,
+    «игра: причина — id», «бан-рулетка: mute для id». Человек на странице
+    один, его имя и id в каждой строке — шум, а админ числом ничего не говорит.
+    """
+    text = text or ""
+    actors = [int(m.group(1)) for m in _ACTOR.finditer(text)]
+    text, _swapped = utils.split_swap(_ACTOR.sub("", text))
+    own = text.find(f" ({user_id})")
+    if own >= 0:
+        colon = text.find(": ")
+        start = colon + 2 if 0 <= colon < own else 0
+        text = text[:start] + text[own + len(f" ({user_id})"):]
+    text = re.sub(rf"(?:\s+—|\s+для)?\s*(?<!\d){user_id}(?!\d)", "", text)
+    text = re.sub(r":\s*—\s*", ": ", text).strip(" —:")
+    _icon, _label, text = utils.event_parts("", text)
+    text = re.sub(r"^удаление:\s*", "🗑 удалено · ", text)
+    for uid in actors:
+        text += (" · " if text else "") + f"кем: {await name(uid)}"
+    return text
+
+
+async def _history(user_id: int, ids: list[int], titles: dict) -> list[dict]:
+    """Последние события: наказания — из списка наказаний и в том же виде,
+    с пометкой, чем кончились; остальное — из лога, почищенное."""
+    now = int(time.time())
+    names: dict[int, str] = {}
+
+    async def name(uid: int) -> str:
+        if uid not in names:
+            names[uid] = await db.user_label(uid)
+        return names[uid]
+
+    def chat(cid: int) -> str:
+        return utils.chunk(titles.get(cid, str(cid)), 24)
+
+    out = []
+    given = await db.user_punishments(user_id, ids, HISTORY)
+    for p in given:
+        shown = utils.shown_kind(p["kind"], p["reason"])
+        how, ended = db.punishment_end(p, now)
+        why, _swapped = utils.short_reason(_TAGS.sub("", p["reason"] or ""))
+        body = [utils.ended_label(how, ended) if how else _term(p["until_ts"]), why]
+        if p["by_id"]:
+            body.append(f"кем: {await name(p['by_id'])}")
+        word = _KIND_WORD.get(shown, shown)
+        out.append({"ts": p["created"], "when": _when(p["created"]),
+                    "chat": chat(p["chat_id"]), "icon": _KIND_ICON.get(shown, "🔨"),
+                    "label": word[:1].upper() + word[1:], "ended": how is not None,
+                    "body": utils.chunk(" · ".join(body), 90)})
+    for e in await db.user_events(user_id, ids, HISTORY * 2):
+        if e["kind"] not in _OWN_EVENTS and any(
+                p["chat_id"] == e["chat_id"] and abs(p["created"] - e["ts"]) <= _SAME_CASE
+                for p in given):
+            continue
+        icon, label, _body = utils.event_parts(e["kind"], "")
+        out.append({"ts": e["ts"], "when": _when(e["ts"]), "chat": chat(e["chat_id"]),
+                    "icon": icon, "label": label, "ended": False,
+                    "body": utils.chunk(await _clean(e["text"], user_id, name), 90)})
+    out.sort(key=lambda r: r["ts"], reverse=True)
+    for r in out:
+        del r["ts"]
+    return out[:HISTORY]
+
+
 async def collect(bot: Bot, user_id: int, chats, first: int | None = None) -> dict:
     """Всё о человеке по списку чатов. Текущий чат — первым."""
     chats = sorted(chats, key=lambda c: c["chat_id"] != first)
@@ -268,16 +379,7 @@ async def collect(bot: Bot, user_id: int, chats, first: int | None = None) -> di
         facts.append("🧪 профиль в спам-базе")
 
     titles = {c["chat_id"]: c["title"] or str(c["chat_id"]) for c in chats}
-    events = []
-    for e in await db.user_events(user_id, ids):
-        icon, label, body = utils.event_parts(e["kind"], e["text"])
-        # имя с id в каждой строке лога про одного человека — лишний шум
-        body = body.replace(f" ({user_id})", "")
-        events.append({
-            "when": utils._local(e["ts"]).strftime("%d.%m %H:%M"),
-            "chat": utils.chunk(titles.get(e["chat_id"], str(e["chat_id"])), 24),
-            "icon": icon, "label": label, "body": utils.chunk(body, 90),
-        })
+    events = await _history(user_id, ids, titles)
 
     return {
         "user_id": user_id, "name": name, "username": username,
@@ -318,8 +420,8 @@ def render(d: dict) -> str:
 
     # Лог — в конце и свёрнутой цитатой, как сообщение в карточках. Режем его,
     # а не карточку: обрезка посреди HTML сломала бы разметку всего сообщения
-    events = [utils.esc(f"{e['when']} · {e['chat']} · {e['icon']} {e['label']}: "
-                        f"{e['body']}") for e in d["events"]]
+    events = [utils.esc(f"{e['when']} · {e['chat']} · {e['icon']} {e['label']}"
+                        + (f": {e['body']}" if e["body"] else "")) for e in d["events"]]
     while events:
         tail = ("\n\n<b>📜 Последние события</b>\n<blockquote expandable>"
                 + "\n".join(events) + "</blockquote>")

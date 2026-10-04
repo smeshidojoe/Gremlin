@@ -1016,12 +1016,18 @@ async def _own_forward(bot: Bot, chat_id: int, origin_chat) -> bool:
 _CAPTCHA_KEY = "captcha:{}:{}"
 
 
-async def _captcha_timeout(bot: Bot, chat_id: int, user_id: int, timeout: int, msg_id: int) -> None:
+async def _captcha_timeout(bot: Bot, chat_id: int, user_id: int, timeout: int,
+                           msg_id: int, pid: int | None = None) -> None:
     await asyncio.sleep(timeout)
     if _captcha_pending.pop((chat_id, user_id), None) is None:
         return  # уже прошёл
     await db.kv_set(_CAPTCHA_KEY.format(chat_id, user_id), None)
     await deleting.one(lambda: bot.delete_message(chat_id, msg_id), chat_id)
+    if pid is not None:
+        p = await db.get_punishment(pid)
+        if p is not None and p["ended_how"] == "lifted":
+            return  # мут капчи сняли руками — значит, человека пустили
+        await db.deactivate_punishment(pid, "failed")
     try:  # кик с возможностью вернуться (ban+unban)
         await bot.ban_chat_member(chat_id, user_id)
         # пауза перед снятием: отправленный вплотную разбан иногда приходит
@@ -1051,11 +1057,13 @@ async def resume_captcha(bot: Bot) -> int:
             chat_id, user_id = int(chat_id), int(user_id)
             data = json.loads(raw)
             msg_id, until = int(data["msg"]), int(data["until"])
-        except (ValueError, KeyError, TypeError):
+            pid = int(data["pid"]) if data.get("pid") else None
+        except (ValueError, KeyError, TypeError, AttributeError):
             await db.kv_set(key, None)       # битая запись — ждать нечего
             continue
         _captcha_pending[(chat_id, user_id)] = msg_id
-        runtime.spawn(_captcha_timeout(bot, chat_id, user_id, max(0, until - now), msg_id))
+        runtime.spawn(_captcha_timeout(bot, chat_id, user_id, max(0, until - now),
+                                       msg_id, pid))
         count += 1
     return count
 
@@ -1066,6 +1074,7 @@ async def ask_captcha(bot: Bot, chat, user, s) -> bool:
     Зовут её и обычный вход, и защита от набегов, поэтому сообщение уходит
     через bot, а не ответом на служебное: при набеге служебного может не быть.
     """
+    until = int(time.time()) + s.captcha_timeout + 60
     try:
         # Мут со сроком: снятие висит на задаче в памяти, и перезапуск бота
         # во время капчи оставлял человека немым навсегда. Срок ставим с
@@ -1073,11 +1082,19 @@ async def ask_captcha(bot: Bot, chat, user, s) -> bool:
         await bot.restrict_chat_member(
             chat.id, user.id,
             permissions=await moderation.mute_perms(bot, chat.id, s.mute_reactions),
-            until_date=int(time.time()) + s.captcha_timeout + 60,
+            until_date=until,
         )
     except Exception:
         logger.warning("captcha restrict failed in %s", chat.id, exc_info=True)
         return False
+    # мут капчи — тоже наказание: без записи его не видно в списке и не снять
+    # оттуда, если человек застрял. Уже наказанного не трогаем: запись капчи
+    # погасила бы в базе его настоящий мут
+    pid = None
+    if (await db.active_punishment_of(chat.id, user.id, "mute") is None
+            and await db.active_punishment_of(chat.id, user.id, "ban") is None):
+        pid = await db.add_punishment(chat.id, user.id, user.username, user.full_name,
+                                      "mute", "капча: ждём «Я не бот»", until, None)
     b = InlineKeyboardBuilder()
     b.button(text="✅ Я не бот", callback_data=f"capt:{chat.id}:{user.id}")
     # время в минутах: пресеты теперь до часа, «3600 сек» никто не считает
@@ -1091,9 +1108,10 @@ async def ask_captcha(bot: Bot, chat, user, s) -> bool:
     )
     _captcha_pending[(chat.id, user.id)] = sent.message_id
     await db.kv_set(_CAPTCHA_KEY.format(chat.id, user.id), json.dumps(
-        {"msg": sent.message_id, "until": int(time.time()) + s.captcha_timeout}))
+        {"msg": sent.message_id, "until": int(time.time()) + s.captcha_timeout,
+         "pid": pid}))
     runtime.spawn(_captcha_timeout(bot, chat.id, user.id, s.captcha_timeout,
-                                   sent.message_id))
+                                   sent.message_id, pid))
     return True
 
 
@@ -1111,6 +1129,9 @@ async def captcha_pass(cb: CallbackQuery, bot: Bot) -> None:
             chat_id, user_id, permissions=await moderation.unmute_perms(bot, chat_id))
     except Exception:
         logger.warning("captcha unmute failed in %s", chat_id, exc_info=True)
+    p = await db.active_punishment_of(chat_id, user_id, "mute")
+    if p is not None and (p["reason"] or "").startswith("капча"):
+        await db.deactivate_punishment(p["id"], "passed")
     await deleting.one(cb.message.delete, cb.message.chat.id)
     await cb.answer("Добро пожаловать!")
     await db.add_event(chat_id, "captcha", f"прошёл капчу: {user_id}")

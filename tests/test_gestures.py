@@ -66,6 +66,24 @@ async def test_duel_once_an_hour_per_caller(chat, penalties):
     assert len(penalties["mutes"]) == 1
 
 
+async def test_duel_in_comments_ignores_channel_post(chat, penalties):
+    """В комментариях всё — ответ на пост канала, его приносит Telegram
+    (777000). Соперником он стать не должен; @ник в команде — должен."""
+    await db.set_setting(chat, "games_on", config.GAME_DUEL)
+    post = msg(A, "!дуэль", reply_to=make_user(777000, name="Telegram"))
+    post.reply_to_message.sender_chat = object()
+    await games.cmd_duel(post, FakeBot())
+    assert "Telegram" not in post.replies[0] and "@ником" in post.replies[0]
+
+    await db.msg_inc(chat, C, "bobby", "Боб")
+    text = "!дуэль @bobby"
+    m = msg(B, text, reply_to=make_user(777000, name="Telegram"),
+            entities=[MessageEntity(type="mention", offset=7, length=6)])
+    await games.cmd_duel(m, FakeBot())
+    assert "Telegram" not in m.replies[0]
+    assert {"caller": B, "foe": C} in games._duels.values()
+
+
 @pytest.fixture
 def answers(monkeypatch):
     sent = []

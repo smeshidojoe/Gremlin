@@ -438,7 +438,7 @@ async def kick(bot: Bot, chat_id: int, user: User,
         chat_id, user.id, user.username, user.full_name, "kick", reason, None,
         by_id, was_member=member,
     )
-    await db.deactivate_punishment(pid)
+    await db.deactivate_punishment(pid, "kick")
     # сообщения не убираем: человека попросили выйти, а не вычистили за спамера
     return pid, None
 

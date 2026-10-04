@@ -358,7 +358,9 @@ CREATE TABLE IF NOT EXISTS punishments(
     by_id    INTEGER,                -- кто наказал (NULL = бот сам)
     created  INTEGER NOT NULL,
     active   INTEGER NOT NULL DEFAULT 1,
-    was_member INTEGER NOT NULL DEFAULT 1   -- состоял ли в чате на момент наказания
+    was_member INTEGER NOT NULL DEFAULT 1,  -- состоял ли в чате на момент наказания
+    ended_ts  INTEGER,               -- когда закончилось раньше срока
+    ended_how TEXT                   -- как: lifted | replaced | passed | failed
 );
 CREATE TABLE IF NOT EXISTS warns(
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -740,7 +742,8 @@ _TABLE_MIGRATIONS = {
     "triggers": {"file_path": "TEXT", "media_type": "TEXT",
                  "cooldown": "INTEGER NOT NULL DEFAULT 30"},
     "whitelist": {"title": "TEXT"},
-    "punishments": {"was_member": "INTEGER NOT NULL DEFAULT 1"},
+    "punishments": {"was_member": "INTEGER NOT NULL DEFAULT 1",
+                    "ended_ts": "INTEGER", "ended_how": "TEXT"},
     "answers": {"last_used": "INTEGER NOT NULL DEFAULT 0"},
     "chats": {"net_id": "INTEGER", "linked_id": "INTEGER",
               "linked_title": "TEXT", "kind": "TEXT", "creator_id": "INTEGER"},
@@ -1860,10 +1863,7 @@ async def add_punishment(chat_id: int, user_id: int, username: str | None, name:
     """was_member — состоял ли человек в чате. Комментатор под постом канала в
     чате не состоит, и при разбане ссылка на возврат ему ни к чему."""
     # прошлые активные наказания того же юзера в этом чате гасим
-    await _db.execute(
-        "UPDATE punishments SET active = 0 WHERE chat_id = ? AND user_id = ? AND active = 1",
-        (chat_id, user_id),
-    )
+    await _end("chat_id = ? AND user_id = ?", (chat_id, user_id), "replaced")
     cur = await _db.execute(
         """INSERT INTO punishments (chat_id, user_id, username, name, kind, reason,
                                     until_ts, by_id, created, active, was_member)
@@ -1972,17 +1972,77 @@ async def set_until(pid: int, until_ts: int | None) -> None:
     await _db.commit()
 
 
-async def deactivate_punishment(pid: int) -> None:
-    await _db.execute("UPDATE punishments SET active = 0 WHERE id = ?", (pid,))
-    await _db.commit()
+async def _end(where: str, args: tuple, how: str) -> None:
+    """Погасить наказания и запомнить, как они закончились.
 
-
-async def deactivate_user_punishments(chat_id: int, user_id: int) -> None:
+    Помечаем только те, что ещё шли: у истёкшего конец и так виден по сроку,
+    а пометка «снято» на нём, погашенном позже заодно, была бы неправдой.
+    Коммит — за вызвавшим.
+    """
+    now = _now()
     await _db.execute(
-        "UPDATE punishments SET active = 0 WHERE chat_id = ? AND user_id = ? AND active = 1",
-        (chat_id, user_id),
-    )
+        f"""UPDATE punishments SET active = 0,
+               ended_ts = CASE WHEN until_ts IS NULL OR until_ts > ? THEN ? END,
+               ended_how = CASE WHEN until_ts IS NULL OR until_ts > ? THEN ? END
+           WHERE active = 1 AND {where}""", (now, now, now, how, *args))
+
+
+async def deactivate_punishment(pid: int, how: str = "lifted") -> None:
+    await _end("id = ?", (pid,), how)
     await _db.commit()
+
+
+async def deactivate_user_punishments(chat_id: int, user_id: int,
+                                      how: str = "lifted") -> None:
+    await _end("chat_id = ? AND user_id = ?", (chat_id, user_id), how)
+    await _db.commit()
+
+
+async def recent_punishments(chat_id: int, since: int,
+                             limit: int = 300) -> list[aiosqlite.Row]:
+    """Действующие наказания и те, что могли закончиться после since.
+    Точно, закончилось ли и когда, решает punishment_end."""
+    now = _now()
+    cur = await _db.execute(
+        """SELECT * FROM punishments WHERE chat_id = ? AND (
+               (active = 1 AND (until_ts IS NULL OR until_ts > ?))
+               OR created >= ? OR ended_ts >= ? OR (until_ts >= ? AND until_ts <= ?))
+           ORDER BY created DESC LIMIT ?""",
+        (chat_id, now, since, since, since, now, limit))
+    return await cur.fetchall()
+
+
+async def user_punishments(user_id: int, chat_ids: list[int],
+                           limit: int = 10) -> list[aiosqlite.Row]:
+    """Последние наказания человека в этих чатах, свежие сверху — и снятые."""
+    if not chat_ids:
+        return []
+    ph = ",".join("?" * len(chat_ids))
+    cur = await _db.execute(
+        f"""SELECT * FROM punishments WHERE user_id = ? AND chat_id IN ({ph})
+            ORDER BY created DESC, id DESC LIMIT ?""",
+        (user_id, *chat_ids, limit))
+    return await cur.fetchall()
+
+
+def punishment_end(row, now: int) -> tuple[str | None, int | None]:
+    """Как и когда закончилось наказание: (как, когда). (None, None) — идёт.
+
+    Кик разовый и кончается сразу. Снятое раньше срока помечено при снятии;
+    остальное, у чего срок вышел, — истекло. Старые записи, снятые до того,
+    как бот начал помечать, считаем снятыми, время у них неизвестно.
+    """
+    until = row["until_ts"]
+    if row["kind"] == "kick":
+        return "kick", row["created"]
+    if row["active"] and (until is None or until > now):
+        return None, None
+    how, ts = row["ended_how"], row["ended_ts"]
+    if how and ts and (until is None or ts < until):
+        return how, ts
+    if until is not None and until <= now:
+        return "expired", until
+    return "lifted", None
 
 
 async def active_punishments(chat_id: int, limit: int = 10, offset: int = 0) -> list[aiosqlite.Row]:

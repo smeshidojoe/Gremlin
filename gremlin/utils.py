@@ -173,6 +173,7 @@ EVENT_KINDS = {
     "admin_action": ("👮", "Действие админа"),
     "watch": ("👁", "Наблюдение"),
     "captcha": ("🤖", "Капча"),
+    "sub": ("📨", "Подписка"),
     "report": ("🚨", "Жалоба"),
     "anon": ("📛", "Аноним"),
     "card": ("🪪", "Карточка"),
@@ -271,6 +272,22 @@ def shown_kind(kind: str, reason: str | None) -> str:
     if kind == "ban" and split_swap(reason)[1]:
         return "mute"
     return kind
+
+
+# как закончилось наказание (db.punishment_end) -> пометка в списках
+ENDED_LABELS = {
+    "expired": "⏱ завершено",
+    "lifted": "🔓 снято",
+    "replaced": "🔁 заменено новым",
+    "passed": "✅ капча пройдена",
+    "failed": "👢 капча не пройдена",
+    "kick": "👢 разово",
+}
+
+
+def ended_label(how: str, ts: int | None) -> str:
+    """Пометка законченного наказания со временем, если оно известно."""
+    return ENDED_LABELS.get(how, how) + (f" {fmt_ts(ts)}" if ts and how != "kick" else "")
 
 
 def name_link(user_id: int, name: str | None, username: str | None = None) -> str:

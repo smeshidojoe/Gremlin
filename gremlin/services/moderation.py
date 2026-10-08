@@ -129,6 +129,20 @@ def with_spam_button(markup: InlineKeyboardMarkup | None, chat_id: int,
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def with_profile_button(markup: InlineKeyboardMarkup | None, chat_id: int,
+                        user_id: int) -> InlineKeyboardMarkup:
+    """Добавить под карточку «Профиль»: кто это, где ещё был, что на нём висит.
+
+    Профиль открывается в самой карточке, а «Назад» возвращает её прежний вид —
+    отдельными сообщениями лог-чат забивался бы.
+    """
+    from aiogram.types import InlineKeyboardButton
+    rows = list(markup.inline_keyboard) if markup is not None else []
+    rows.append([InlineKeyboardButton(text="🔎 Профиль",
+                                      callback_data=f"k:pf:{chat_id}:{user_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 # подписи типов вложений для строки «Сообщение»
 _MEDIA_LABELS = {
     "photo": "фото", "video": "видео", "animation": "гифка", "sticker": "стикер",
@@ -671,12 +685,14 @@ async def card_sweeper(bot: Bot) -> None:
                 await clear_unban_card(bot, int(chat_id), int(uid))
                 await db.kv_set(unban_link_key(int(chat_id), int(uid)), None)
             # связки копий живут ровно столько, сколько Telegram даёт править
-            for key, raw in await db.kv_prefix("twin:"):
-                try:
-                    if now >= json.loads(raw).get("until", 0):
+            # и прежний вид карточек, открытых на профиле, — тоже
+            for prefix in ("twin:", "cardview:"):
+                for key, raw in await db.kv_prefix(prefix):
+                    try:
+                        if now >= json.loads(raw).get("until", 0):
+                            await db.kv_set(key, None)
+                    except ValueError:
                         await db.kv_set(key, None)
-                except ValueError:
-                    await db.kv_set(key, None)
         except Exception:
             logger.warning("card sweeper tick failed", exc_info=True)
         await asyncio.sleep(300)
@@ -815,14 +831,19 @@ def forgive_scope(reason: str | None) -> str | None:
 async def send_card(bot: Bot, chat_id: int, bit: int, text: str,
                     pid: int | None = None, kind: str = "delete",
                     user_id: int | None = None,
-                    markup: InlineKeyboardMarkup | None = None) -> list:
+                    markup: InlineKeyboardMarkup | None = None,
+                    profile: int | None = None) -> list:
     """Карточка события: в лог-чат этого чата и в глобальный лог владельца бота.
 
     Лог чата слушается настройками самого чата, глобальный — нет: он общий и
     собирает всё подряд, иначе смысла в нём мало.
+
+    profile — про кого карточка: под ней будет кнопка «Профиль».
     """
     s = await db.get_settings(chat_id)
     kb = markup if markup is not None else card_kb(pid, kind, chat_id, user_id)
+    if profile:
+        kb = with_profile_button(kb, chat_id, profile)
     no_preview = LinkPreviewOptions(is_disabled=True)
     # Оба лога слушают одни и те же переключатели чата. Раньше глобальный
     # получал всё подряд, и в нём висели типы, выключенные в самом чате
@@ -1083,7 +1104,8 @@ async def violation(bot: Bot, message, feature_bit: int, feature_label: str,
                        origin="auto", feature=feature_label, message=message,
                        pid=pid)
 
-    sent = await send_card(bot, chat.id, feature_bit, card, pid, applied, user.id)
+    sent = await send_card(bot, chat.id, feature_bit, card, pid, applied, user.id,
+                           profile=user.id)
     if applied != "delete":
         from . import net
         # в сетку уходит задуманное наказание, а не подменённое здесь: у соседей

@@ -386,6 +386,10 @@ async def _widget(cid: int, widget: str, s) -> dict:
             title = row["title"] if row and row["title"] else str(s.sub_chat_id)
         return {"chat_id": s.sub_chat_id, "title": title}
 
+    if widget == "sub_refused":
+        return {"count": len(await db.refused_list(cid)),
+                "on": bool(s.sub_refused_skip)}
+
     if widget == "sub_text":
         # в режиме отказа письма нет — прячем и заготовку
         return {"count": len(await db.ans_list("sub", cid)),
@@ -1237,6 +1241,34 @@ async def api_forgiven(request: web.Request) -> web.Response:
     return js({"items": items})
 
 
+@routes.get("/api/chat/{cid}/refused")
+async def api_refused(request: web.Request) -> web.Response:
+    """Кому отказали в заявке кнопкой: при включённой настройке им карточки нет."""
+    cid = await cid_of(request)
+    s = await db.get_settings(cid)
+    items = [{
+        "user_id": r["user_id"],
+        "who": r["name"] or str(r["user_id"]),
+        "link": f"tg://user?id={r['user_id']}",
+        "since": utils.fmt_ts(r["created"]),
+    } for r in await db.refused_list(cid)]
+    return js({"items": items, "on": bool(s.sub_refused_skip)})
+
+
+@routes.delete("/api/chat/{cid}/refused/{uid}")
+async def api_refused_del(request: web.Request) -> web.Response:
+    cid = await cid_of(request)
+    uid = int(request.match_info["uid"])
+    if not await db.refused_remove(cid, uid):
+        raise web.HTTPNotFound(text="его уже нет в списке")
+    # следующая заявка — снова карточкой, а не «повторной» без неё
+    from ..services import subscribe as sub
+    sub.forget_tries(cid, uid)
+    await db.add_event(cid, "sub", f"убран из отказанных: {uid} "
+                                   f"by {uid_of(request)} (панель)")
+    return js({"ok": True})
+
+
 @routes.delete("/api/chat/{cid}/forgiven/{rid}")
 async def api_forgiven_del(request: web.Request) -> web.Response:
     cid = await cid_of(request, "punish")
@@ -1303,6 +1335,9 @@ async def api_log(request: web.Request) -> web.Response:
         target = int(str(raw).strip())
     except ValueError:
         raise web.HTTPBadRequest(text="Нужен числовой id чата.")
+    # сам себе лог — карточки с профилями увидели бы все участники
+    if target == cid:
+        raise web.HTTPBadRequest(text="Чат не может быть сам себе лог-чатом.")
     # чужой рабочий чат логом быть не может: туда полетели бы чужие сообщения
     if not await db.owns_chat(uid_of(request), target) and await db.get_chat(target):
         raise web.HTTPForbidden(text="Этот чат принадлежит другому владельцу.")
@@ -1971,6 +2006,8 @@ async def api_roulette_spin(request: web.Request) -> web.Response:
     cfg = await fun_h._cfg(uid)
     if not cfg["chat_id"]:
         raise web.HTTPBadRequest(text="Сначала выберите чат.")
+    if fun_h.rolling(cfg["chat_id"]):
+        raise web.HTTPConflict(text=fun_h.BUSY_NOTE)
     bot = bot_of(request)
     try:
         note = (await fun_h._run_opt(bot, cfg, uid) if cfg["mode"] == "opt"

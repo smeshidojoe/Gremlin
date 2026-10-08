@@ -1,7 +1,7 @@
 """Проверка статуса человека, права бота в чате и длинные кулдауны."""
 import time
 import types
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -10,7 +10,7 @@ from gremlin.handlers import user_menu as um
 from gremlin.services import adm_cache, profile, resolve
 from gremlin.services import status as st
 
-from conftest import CHAT, OWNER, FakeBot
+from conftest import CB, CHAT, OWNER, FakeBot, Sent
 
 U = 9100
 OTHER, THIRD, QUIET, FOREIGN = CHAT - 1, CHAT - 2, CHAT - 3, CHAT - 4
@@ -267,3 +267,56 @@ def test_render_trims_log_not_card():
     text = st.render(d)
     assert len(text) <= st.TEXT_LIMIT
     assert text.count("<blockquote") == text.count("</blockquote>")
+
+
+def test_render_trims_chats_not_first():
+    """Человек из многих чатов: хвост чатов сводится в строку, текущий — на месте."""
+    many = [{"title": f"Чат {i}", "state": "✅ состоит", "lines": ["x" * 150] * 3}
+            for i in range(40)]
+    d = {"user_id": U, "name": "Катя", "username": None, "premium": False,
+         "about": [], "facts": [], "counts": [], "chats": many, "events": []}
+    text = st.render(d)
+    assert len(text) <= st.TEXT_LIMIT
+    assert "<b>Чат 0</b>" in text and "…и ещё" in text and "полностью в панели" in text
+
+
+async def test_owner_scope_skips_foreign_chats(chat, monkeypatch):
+    """В карточку — только чаты владельца того чата, даже если он владелец бота."""
+    monkeypatch.setattr(config, "ADMIN_IDS", {OWNER})
+    await db.upsert_chat(OTHER, "Второй", None, OWNER, "supergroup")
+    await db.upsert_chat(FOREIGN, "Чужой", None, 777, "supergroup")
+    got = {c["chat_id"] for c in await db.owner_scope(CHAT)}
+    assert got == {CHAT, OTHER}
+    assert {c["chat_id"] for c in await db.owner_scope(FOREIGN)} == {FOREIGN}
+
+
+async def test_card_profile_and_back(chat, monkeypatch):
+    """Профиль в карточке и обратно: текст и кнопки возвращаются как были."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    from gremlin.handlers import cards as cards_h
+
+    async def collect(bot, uid, chats, first=None):
+        return {"uid": uid}
+
+    monkeypatch.setattr(st, "collect", collect)
+    monkeypatch.setattr(st, "render", lambda d: f"ПРОФИЛЬ {d['uid']}")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⛔ Забанить", callback_data=f"k:ban:{CHAT}:{U}")],
+        [InlineKeyboardButton(text="🔎 Профиль", callback_data=f"k:pf:{CHAT}:{U}")]])
+    card = Sent("<b>Карточка</b>")
+    card.reply_markup = kb
+
+    await cards_h.card_profile(CB(f"k:pf:{CHAT}:{U}", message=card), FakeBot())
+    assert card.text == f"ПРОФИЛЬ {U}"
+    assert card.reply_markup.inline_keyboard[0][0].callback_data == f"k:pfb:{CHAT}"
+
+    await cards_h.card_profile_back(CB(f"k:pfb:{CHAT}", message=card))
+    assert card.text == "<b>Карточка</b>" and card.reply_markup == kb
+    assert await db.kv_get(f"cardview:{CHAT}:{card.message_id}") is None
+
+    # на исходе двух суток профиль не открываем: «Назад» уже не сработал бы
+    card.date = datetime.now(timezone.utc) - timedelta(hours=47)
+    cb = CB(f"k:pf:{CHAT}:{U}", message=card)
+    await cards_h.card_profile(cb, FakeBot())
+    assert card.text == "<b>Карточка</b>" and "двое суток" in cb.alerts[0]
+

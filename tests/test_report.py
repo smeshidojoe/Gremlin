@@ -52,7 +52,7 @@ async def test_card_has_message_and_buttons(reports, chat):
     buttons = [b.callback_data for row in card["markup"].inline_keyboard for b in row]
     assert buttons == [f"k:rdel:{chat}:555", f"k:rmute:{chat}:{VICTIM}:555",
                        f"k:rban:{chat}:{VICTIM}:555", f"k:sp:{chat}:{VICTIM}",
-                       f"k:rno:{chat}"]
+                       f"k:rno:{chat}", f"k:pf:{chat}:{VICTIM}"]
 
 
 async def test_reason_is_optional(reports):

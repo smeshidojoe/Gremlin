@@ -358,7 +358,11 @@ SECTIONS: list[Section] = [
         "\n"
         "Сообщение в личку — обычная заготовка: текст, эмодзи, картинка. Telegram "
         "разрешает боту написать тому, кто подал заявку, даже если он боту раньше "
-        "не писал.",
+        "не писал.\n"
+        "\n"
+        "«Отказанных не показывать» — кому вы отказали кнопкой «Отказать» в "
+        "карточке, тому бот дальше молча отклоняет заявки, без карточки. Список "
+        "отказанных — в панели, оттуда человека можно убрать.",
         fields=[
             Field("sub_on", "toggle", "Статус"),
             Field("sub_pass", "cycle", "Подписан",
@@ -367,8 +371,9 @@ SECTIONS: list[Section] = [
                   list(config.SUB_ACTIONS), config.SUB_ACTION_LABELS),
             Field("sub_dm", "toggle", "Написать в личку с объяснением",
                   show_if=("sub_action", "hold")),
+            Field("sub_refused_skip", "toggle", "Отказанных не показывать"),
         ],
-        widgets=["sub_chat", "sub_text"],
+        widgets=["sub_chat", "sub_text", "sub_refused"],
     ),
     Section(
         "raid", "🛡 Защита от набегов",

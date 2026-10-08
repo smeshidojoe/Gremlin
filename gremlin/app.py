@@ -131,6 +131,30 @@ async def _fix_forever_mute(bot: Bot) -> None:
     await db.kv_set(db.FOREVER_MUTE_KEY, "1")
 
 
+async def _test_join_card(bot: Bot) -> None:
+    """Разово: карточка заявки с пометкой «уже был» в лог-чат овощехранилища.
+
+    Человек настоящий, кикнутый (пироманьяк), — чтобы пометку было видно.
+    Кнопок нет: «Забанить» на тестовой карточке сработала бы по-настоящему.
+    Отметку ставим и при неудаче — пробовать на каждом старте незачем.
+    """
+    if await db.kv_get(db.TEST_JOIN_CARD_KEY):
+        return
+    await db.kv_set(db.TEST_JOIN_CARD_KEY, "1")
+    from .services import net
+    cid, uid = -1001389201023, 1124098108
+    row = await db.get_chat(cid)
+    s = await db.get_settings(cid)
+    if row is None or not s.log_chat_id:
+        return
+    user = await net.user_stub(uid, bot, cid)
+    lines = await events.ask_card_lines(bot, events._Chat(cid, row["title"]), user, s)
+    await bot.send_message(
+        s.log_chat_id,
+        "🧪 <b>Тест</b> · так выглядит заявка того, кто уже был в чате. "
+        "Заявки нет, кнопок тоже\n\n" + "\n".join(lines))
+
+
 async def main() -> None:
     _setup_logging()
     if not config.BOT_TOKEN:
@@ -298,6 +322,10 @@ async def main() -> None:
         await _fix_forever_mute(bot)
     except Exception:
         logger.warning("разовый бессрочный мут не выдан", exc_info=True)
+    try:
+        await _test_join_card(bot)
+    except Exception:
+        logger.warning("тестовая карточка заявки не ушла", exc_info=True)
     # разовый переезд медиа в папки по чатам: до первой отправки заготовки
     try:
         await triggers.migrate_layout()

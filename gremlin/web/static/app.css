@@ -396,3 +396,4 @@ pre.log {
   transition: width .35s var(--ease-out);
 }
 .bar-num { flex: 0 0 auto; font-size: 13px; color: var(--hint); min-width: 28px; text-align: right; }
+.item[hidden], .empty[hidden] { display: none; }

@@ -157,6 +157,9 @@ def _age(seconds: int) -> str:
             + (f" {months} мес" if months else ""))
 
 
+_GONE = ("member not found", "PARTICIPANT_ID_INVALID")
+
+
 async def _chat(bot: Bot, chat, uid: int) -> dict:
     cid = chat["chat_id"]
     out = {"chat_id": cid, "title": chat["title"] or str(cid),
@@ -164,8 +167,11 @@ async def _chat(bot: Bot, chat, uid: int) -> dict:
            "tg": False}
     try:
         m = await bot.get_chat_member(cid, uid)
-    except Exception:
+    except Exception as e:
         m = None
+        # так Telegram отвечает про удалённый аккаунт: человека он не знает вовсе
+        if any(s in str(e) for s in _GONE):
+            out["state"] = "👻 Telegram его не находит — похоже, аккаунт удалён"
     in_chat, tg_kind = False, None
     if m is not None:
         out["state"], in_chat, tg_kind = _state(m)
@@ -411,9 +417,22 @@ def render(d: dict) -> str:
               " · ".join(f"{c['label']}: <b>{c['n']}</b>" for c in d["counts"])
               or "Не было."]
     if d["chats"]:
-        for c in d["chats"]:
-            lines += ["", f"💬 <b>{utils.esc(c['title'])}</b>"]
-            lines += _tree([c["state"]] + c["lines"])
+        # Чаты добавляем, пока влезают: человек из двадцати чатов иначе
+        # выводил текст за лимит Telegram, и карточка не открывалась вовсе.
+        # Первый (текущий) — всегда, хвост сводим в одну строку
+        size = len("\n".join(lines))
+        for i, c in enumerate(d["chats"]):
+            block = ["", f"💬 <b>{utils.esc(c['title'])}</b>"] + _tree(
+                [c["state"]] + c["lines"])
+            more = len(d["chats"]) - i
+            room = TEXT_LIMIT - (80 if more > 1 else 0)
+            if i and size + len("\n".join(block)) + 1 > room:
+                lines += ["", f"💬 …и ещё {more} "
+                          f"{utils.plural(more, 'чат', 'чата', 'чатов')} — "
+                          "полностью в панели"]
+                break
+            lines += block
+            size += len("\n".join(block)) + 1
     else:
         lines += ["", "💬 Ни в одном из ваших чатов не встречался."]
     text = "\n".join(lines)

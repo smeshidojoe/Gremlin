@@ -133,3 +133,46 @@ async def test_decision_card_buttons(gate, members):
     assert 23 in [u for _c, u, _t in bot.banned]
     assert [r["reason"] for r in await db.active_punishments(CHAT)] \
         == ["заявка на вступление"]
+
+
+async def test_past_visit_counts_each_kick_once(chat):
+    """Кик командой пишет и наказание, и строку лога — считаем раз.
+    Чужой id, где этот стоит внутри, в счёт не идёт."""
+    U = 4242
+    pid = await db.add_punishment(chat, U, None, "Гость", "kick", "флуд", None, 1)
+    await db.deactivate_punishment(pid, "kick")
+    await db.add_event(chat, "manual", f"kick: Гость ({U}) — флуд | by 1")
+    await db.add_event(chat, "admin_action", f"kick: Гость ({U}) by 1")
+    await db.add_event(chat, "captcha", f"не прошёл капчу, кик: {U}")
+    await db.add_event(chat, "admin_action", f"kick: Другой ({U}9) by 1")
+    await db.add_punishment(chat, U, None, "Гость", "ban",
+                            "флуд · мут не-участнику невозможен, заменён баном", None, 1)
+    past = await db.past_visit(chat, U)
+    assert (past["was"], past["kicks"], past["bans"]) == (True, 3, 0)
+    assert not (await db.past_visit(chat, U + 1))["was"]
+
+
+async def test_refused_by_button_then_declined_silently(gate, cards, members):
+    """Отказали кнопкой — при включённой настройке следующая заявка уходит
+    без карточки. Убрали из списка — карточка возвращается, хоть заявка и
+    не первая за окно."""
+    await db.set_setting(CHAT, "sub_pass", "skip")
+    bot = FakeBot()
+    await events._sub_join_request(request(31), bot)
+    await events.sub_drop(CB(f"sub:no:{CHAT}:31", message=Sent("🙋 Заявка")), bot)
+    assert await db.refused_has(CHAT, 31)
+
+    # настройка выключена — список копится, но не применяется
+    await events._sub_join_request(request(31), bot)
+    assert bot.declined == [31]
+
+    await db.set_setting(CHAT, "sub_refused_skip", 1)
+    before = len(cards)
+    await events._sub_join_request(request(31), bot)
+    assert bot.declined == [31, 31] and len(cards) == before
+
+    await db.refused_remove(CHAT, 31)
+    sub.forget_tries(CHAT, 31)
+    await events._sub_join_request(request(31), bot)
+    assert bot.declined == [31, 31] and "Заявка на вступление" in cards[-1]["text"]
+

@@ -3758,6 +3758,13 @@ async def log_chat_shared(message: Message, state: FSMContext, bot: Bot) -> None
         await _finish_log_pick(message, bot, state, cid,
                                "✅ Глобальный лог обновлён.\n\n")
         return
+    # Сам себе лог чат быть не может: карточки с профилями и историей
+    # наказаний видели бы все его участники
+    if picked == cid:
+        await _finish_log_pick(message, bot, state, cid,
+                               "⚠️ Чат не может быть сам себе лог-чатом — "
+                               "карточки увидели бы все участники.\n\n")
+        return
     # чужой рабочий чат логом быть не может: туда полетели бы карточки с чужими
     # сообщениями. Свои и незнакомые боту чаты — пожалуйста.
     if not await db.owns_chat(message.from_user.id, picked) and await db.get_chat(picked):

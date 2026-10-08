@@ -41,7 +41,7 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
     "captcha": ("🤖 Капча", ("captcha_on", "captcha_timeout")),
     # канал не переносим: он свой у каждого чата, как и лог-чат
     "sub": ("📣 Вход только по подписке", ("sub_on", "sub_action", "sub_pass",
-                                           "sub_dm")),
+                                           "sub_dm", "sub_refused_skip")),
     "watch": ("👁 Наблюдение", ("watch_on", "watch_bots", "watch_suspect",
                              "watch_ban", "watch_nn", "watch_react")),
     "welcome": ("👋 Приветствие", ("welcome_on", "welcome_text")),

@@ -245,3 +245,70 @@ async def test_vanish_by_reply_admin_only(vanish, chat):
     # админ ответом — сообщения автора того, на что ответил
     await games.fire_game(FakeBot(), vanish_msg(ADMIN, reply_from=make_user(VICTIM), mid=998))
     assert sorted(vanish) == [202, 203, 204, 998]
+
+
+# ---------- одна битва, один суд, одна бан-рулетка на чат ----------
+
+@pytest.fixture
+def spawned(monkeypatch):
+    """Фоновые игры не запускаем, а складываем: тест сам решает, когда им кончиться."""
+    from gremlin import runtime
+    got = []
+    monkeypatch.setattr(runtime, "spawn", got.append)
+    monkeypatch.setattr(games, "_battle_on", set())
+    monkeypatch.setattr(games, "_court_on", set())
+    return got
+
+
+async def _quick(*a, **kw):
+    return None
+
+
+async def test_second_battle_dropped_until_first_ends(roulette, spawned, chat,
+                                                      monkeypatch):
+    await db.set_setting(chat, "games_on", config.GAME_BATTLE)
+    monkeypatch.setattr(games, "_battle_match", _quick)
+    await games.cmd_battle(Msg(author=make_user(PLAIN)), FakeBot())
+    again = Msg(author=make_user(VICTIM))
+    await games.cmd_battle(again, FakeBot())
+    assert again.deleted and len(spawned) == 1
+
+    await spawned.pop()                   # матч кончился — чат свободен
+    third = Msg(author=make_user(VICTIM))
+    await games.cmd_battle(third, FakeBot())
+    assert not third.deleted and len(spawned) == 1
+    spawned.pop().close()
+
+
+async def test_second_court_dropped_until_verdict(roulette, spawned, chat,
+                                                  monkeypatch):
+    await db.set_setting(chat, "games_on", config.GAME_COURT)
+    monkeypatch.setattr(games, "_court_session", _quick)
+    await games.cmd_court(Msg("!суд", author=make_user(PLAIN),
+                              reply_from=make_user(VICTIM)), FakeBot())
+    # тот же подсудимый или другой — второй суд не начинается
+    again = Msg("!суд", author=make_user(VICTIM), reply_from=make_user(PLAIN))
+    await games.cmd_court(again, FakeBot())
+    assert again.deleted and len(spawned) == 1
+
+    await spawned.pop()
+    third = Msg("!суд", author=make_user(VICTIM), reply_from=make_user(PLAIN))
+    await games.cmd_court(third, FakeBot())
+    assert not third.deleted and len(spawned) == 1
+    spawned.pop().close()
+
+
+async def test_ban_roulette_one_at_a_time(chat, spawned, monkeypatch):
+    from gremlin.handlers import fun
+    monkeypatch.setattr(fun, "_rolling", set())
+    monkeypatch.setattr(fun, "_collect_and_spin", _quick)
+    cfg = {"chat_id": chat, "kind": "mute", "minutes": 60, "mode": "opt", "timer": 30}
+    assert "запущен" in await fun._run_opt(FakeBot(), cfg, 1)
+    assert fun.rolling(chat)
+    assert await fun._run_opt(FakeBot(), cfg, 1) == fun.BUSY_NOTE
+    assert await fun._run_all(FakeBot(), dict(cfg, mode="all"), 1) == fun.BUSY_NOTE
+
+    await spawned.pop()                   # розыгрыш кончился
+    assert not fun.rolling(chat)
+    assert "запущен" in await fun._run_opt(FakeBot(), cfg, 1)
+    spawned.pop().close()

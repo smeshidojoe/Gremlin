@@ -232,7 +232,7 @@ async def _manual_punish(message: Message, bot: Bot, kind: str) -> None:
         moderation.card_kb(pid, kind, message.chat.id, kb_user),
         message.chat.id, target.id)
     sent = await moderation.send_card(bot, message.chat.id, bit, card, pid, kind,
-                                      kb_user, markup=markup)
+                                      kb_user, markup=markup, profile=target.id)
     if kind != "kick":
         # кик по сетке не расходится: выгнать человека из шести чатов за то,
         # что он мешал в одном, — не то, о чём просили
@@ -315,7 +315,8 @@ async def _misuse(message: Message, bot: Bot, s) -> None:
         utils.until_ts(s.misuse_mute), user,
         moderation.body_block(message.text or message.caption),
     ).replace("👮 Кем:", "🤖 Кем: Gremlin (автомод) ·")
-    await moderation.send_card(bot, message.chat.id, config.BIT_MUTE, card, pid, "mute")
+    await moderation.send_card(bot, message.chat.id, config.BIT_MUTE, card, pid, "mute",
+                               profile=user.id)
     await db.add_event(message.chat.id, "manual",
                        f"мут за чужую команду: {user.full_name} ({user.id})")
 
@@ -416,7 +417,7 @@ async def cmd_warn(message: Message, bot: Bot) -> None:
         f"👮 Кем: {admin}" + body
     )
     sent = await moderation.send_card(bot, message.chat.id, config.BIT_WARN, card,
-                                      user_id=target.id)
+                                      user_id=target.id, profile=target.id)
     runtime.spawn(net.warn_and_note(bot, sent, message.chat.id, target, reason,
                                     message.from_user.id))
     await db.add_event(
@@ -447,7 +448,8 @@ async def cmd_warn(message: Message, bot: Bot) -> None:
         kind, message.chat.title, target, f"набрано {s.warns_limit} варнов",
         until, message.from_user,
     )
-    sent = await moderation.send_card(bot, message.chat.id, bit, punish_card, pid, kind)
+    sent = await moderation.send_card(bot, message.chat.id, bit, punish_card, pid, kind,
+                                      profile=target.id)
     runtime.spawn(net.spread_and_note(
         bot, sent, message.chat.id, target, kind, s.warns_mute_min,
         f"набрано {s.warns_limit} варнов", message.from_user.id,
@@ -692,7 +694,8 @@ async def cmd_report(message: Message, bot: Bot) -> None:
     b.row(_report_btn("⛔ Бан", f"k:rban:{chat.id}:{target.id}:{reply.message_id}"),
           _report_btn(moderation.SPAM_PROFILE_BUTTON, f"k:sp:{chat.id}:{target.id}"))
     b.row(_report_btn("✅ Отклонить", f"k:rno:{chat.id}"))
-    markup = b.as_markup()
+    # «Профиль» — в саму разметку: её же повторяет карточка, когда жалоб прибавилось
+    markup = moderation.with_profile_button(b.as_markup(), chat.id, target.id)
     sent = await moderation.send_card(bot, chat.id, config.BIT_REPORT, card,
                                       markup=markup)
     _forget_old_reports(time.time())
@@ -732,7 +735,7 @@ async def cmd_delete(message: Message, bot: Bot) -> None:
         "delete", message.chat.title, target, reason, None, message.from_user, body
     )
     await moderation.send_card(bot, message.chat.id, config.BIT_ADMIN, card,
-                               None, "delete", target.id)
+                               None, "delete", target.id, profile=target.id)
     await db.add_event(
         message.chat.id, "admin_action",
         f"удаление сообщения: {target.full_name} ({target.id}) — {reason} "

@@ -87,6 +87,12 @@ def note_request(chat_id: int, user_id: int) -> int:
     return count
 
 
+def forget_tries(chat_id: int, user_id: int) -> None:
+    """Начать счёт заявок заново: человека убрали из списка отказанных, и
+    его следующая заявка должна прийти карточкой, а не потонуть в «повторных»."""
+    _tries.pop((chat_id, user_id), None)
+
+
 def card_due(count: int) -> bool:
     """Показывать ли карточку на эту по счёту заявку."""
     return count == 1 or count == config.SUB_REPEAT_ALERT

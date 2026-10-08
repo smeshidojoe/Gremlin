@@ -483,7 +483,8 @@ async def _profile_punish(bot, chat, user, settings, message, data, why) -> bool
                        origin="auto", feature="профиль", message=message, pid=pid,
                        pdata=data, facts={"why": why})
     await moderation.send_card(bot, chat.id, config.BIT_WATCH, card, pid,
-                               kind if kind != "delete" else None, user.id)
+                               kind if kind != "delete" else None, user.id,
+                               profile=user.id)
     return True
 
 
@@ -809,7 +810,8 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None,
                            msg_label="spam" if hard else "unknown", prof_label="spam",
                            origin="auto", feature="наблюдение", message=message,
                            pid=pid, pdata=pdata, facts=facts)
-        await moderation.send_card(bot, chat.id, config.BIT_WATCH, card, pid, "ban", user.id)
+        await moderation.send_card(bot, chat.id, config.BIT_WATCH, card, pid, "ban", user.id,
+                                   profile=user.id)
         return
 
     # Подозрение: карточку не повторяем на каждое сообщение, но и не замолкаем
@@ -842,7 +844,7 @@ async def check_user(bot, chat, user, settings, message=None, lvl=None,
     # через send_card: он сам сверится с настройками карточек, отправит копию
     # в глобальный лог и свяжет обе, чтобы кнопки гасли разом
     await moderation.send_card(bot, chat.id, config.BIT_WATCH, card,
-                               markup=b.as_markup())
+                               markup=b.as_markup(), profile=user.id)
 
 
 if __name__ == "__main__":

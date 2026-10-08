@@ -1,5 +1,7 @@
 """Кнопки на карточках в лог-чате: снять наказание / подтвердить."""
+import json
 import logging
+import time
 import types
 
 from aiogram import Bot, F, Router
@@ -58,6 +60,88 @@ async def may_act(cb: CallbackQuery, chat_id: int) -> bool:
         return True
     await cb.answer("Эти кнопки — для админов чата.", show_alert=True)
     return False
+
+
+# ---------- профиль прямо в карточке ----------
+#
+# Карточка на время превращается в профиль, «Назад» возвращает её как была.
+# Прежний вид храним в базе, а не в памяти: перезапуск бота между двумя
+# нажатиями не должен оставлять карточку профилем навсегда.
+
+EDIT_LIMIT = 48 * 3600          # дольше Telegram не даёт править своё сообщение
+# Открывать — с запасом в два часа: открыли на исходе срока, и «Назад» уже
+# не вернул бы карточку
+PROFILE_OPEN_LIMIT = EDIT_LIMIT - 2 * 3600
+
+
+def _view_key(chat_id: int, msg_id: int) -> str:
+    return f"cardview:{chat_id}:{msg_id}"
+
+
+def _card_age(cb: CallbackQuery) -> float:
+    date = getattr(cb.message, "date", None)
+    return time.time() - date.timestamp() if date else 0
+
+
+@router.callback_query(F.data.startswith("k:pf:"))
+async def card_profile(cb: CallbackQuery, bot: Bot) -> None:
+    from ..services import status
+    _, _, chat_id, user_id = cb.data.split(":")
+    chat_id, user_id = int(chat_id), int(user_id)
+    if not await may_act(cb, chat_id):
+        return
+    if _card_age(cb) > PROFILE_OPEN_LIMIT:
+        await cb.answer("Карточке почти двое суток — Telegram скоро перестанет "
+                        "давать её править, и вернуть её было бы нельзя. "
+                        "Профиль: «Проверка статуса» в меню или в панели.",
+                        show_alert=True)
+        return
+    msg = cb.message
+    key = _view_key(msg.chat.id, msg.message_id)
+    kb = msg.reply_markup.model_dump(mode="json", exclude_none=True) \
+        if msg.reply_markup else None
+    # чаты владельца того чата, откуда карточка, — кто бы ни нажал
+    d = await status.collect(bot, user_id, await db.owner_scope(chat_id),
+                             first=chat_id)
+    back = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text="◀ Назад", callback_data=f"k:pfb:{chat_id}")]])
+    await db.kv_set(key, json.dumps({
+        "text": msg.html_text, "kb": kb,
+        "until": int(time.time()) + EDIT_LIMIT}, ensure_ascii=False))
+    try:
+        await msg.edit_text(status.render(d), reply_markup=back,
+                            disable_web_page_preview=True)
+    except Exception as e:
+        await db.kv_set(key, None)
+        logger.warning("профиль в карточке не открыть", exc_info=True)
+        await cb.answer(f"Не вышло: {e}", show_alert=True)
+        return
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("k:pfb:"))
+async def card_profile_back(cb: CallbackQuery) -> None:
+    chat_id = int(cb.data.split(":")[2])
+    if not await may_act(cb, chat_id):
+        return
+    msg = cb.message
+    key = _view_key(msg.chat.id, msg.message_id)
+    raw = await db.kv_get(key)
+    if not raw:
+        await cb.answer("Прежний вид карточки не сохранился.", show_alert=True)
+        return
+    saved = json.loads(raw)
+    kb = InlineKeyboardMarkup.model_validate(saved["kb"]) if saved["kb"] else None
+    try:
+        await msg.edit_text(saved["text"], reply_markup=kb,
+                            disable_web_page_preview=True)
+    except Exception:
+        logger.warning("карточку из профиля не вернуть", exc_info=True)
+        await cb.answer("Telegram не дал вернуть карточку: ей больше двух суток.",
+                        show_alert=True)
+        return
+    await db.kv_set(key, None)
+    await cb.answer()
 
 
 @router.callback_query(F.data.startswith("k:lift:"))

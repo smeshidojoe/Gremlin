@@ -39,6 +39,15 @@ _DEFAULTS = {"chat_id": 0, "kind": "mute", "minutes": 60, "mode": "all", "timer"
 # идущие розыгрыши «по кнопке»: (chat_id, message_id) -> set(user_id)
 _joined: dict[tuple[int, int], set[int]] = {}
 
+# Чаты, где рулетка идёт прямо сейчас — от запуска до итога. Вторая поверх
+# первой наказала бы двоих за раз
+_rolling: set[int] = set()
+BUSY_NOTE = "В этом чате рулетка уже идёт — дождитесь итога."
+
+
+def rolling(chat_id: int) -> bool:
+    return chat_id in _rolling
+
 
 def _key(owner_id: int) -> str:
     return f"roulette:{owner_id}"
@@ -338,6 +347,17 @@ async def _finish(bot: Bot, chat_id: int, msg_id: int, winner: int, cfg: dict,
 async def _run_all(bot: Bot, cfg: dict, by_id: int) -> str:
     """Режим «весь чат»: крутим сразу среди писавших."""
     chat_id = cfg["chat_id"]
+    if chat_id in _rolling:
+        return BUSY_NOTE
+    _rolling.add(chat_id)
+    try:
+        return await _spin_all(bot, cfg, by_id)
+    finally:
+        _rolling.discard(chat_id)
+
+
+async def _spin_all(bot: Bot, cfg: dict, by_id: int) -> str:
+    chat_id = cfg["chat_id"]
     people = await _candidates(bot, chat_id)
     if not people:
         return "Некого разыгрывать: за месяц никто не писал."
@@ -359,13 +379,20 @@ async def _run_all(bot: Bot, cfg: dict, by_id: int) -> str:
 async def _run_opt(bot: Bot, cfg: dict, by_id: int) -> str:
     """Режим «по кнопке»: сначала сбор добровольцев, потом розыгрыш."""
     chat_id, timer = cfg["chat_id"], cfg["timer"]
+    if chat_id in _rolling:
+        return BUSY_NOTE
+    _rolling.add(chat_id)          # снимет _collect, когда розыгрыш кончится
     b = InlineKeyboardBuilder()
     b.button(text="🎰 Участвовать", callback_data="f:join")
     head = ("🎯 <b>Бан-рулетка!</b>\n\nЖми кнопку, если чувствуешь удачу.\n"
             f"Приз — <b>{KIND_LABEL[cfg['kind']]}</b>.")
-    msg = await bot.send_message(chat_id, f"{head}\n\n⏳ Сбор: {countdown.label(timer)}"
-                                          "\n👥 Смельчаков: 0",
-                                 reply_markup=b.as_markup())
+    try:
+        msg = await bot.send_message(
+            chat_id, f"{head}\n\n⏳ Сбор: {countdown.label(timer)}\n👥 Смельчаков: 0",
+            reply_markup=b.as_markup())
+    except BaseException:
+        _rolling.discard(chat_id)
+        raise
     key = (chat_id, msg.message_id)
     _joined[key] = set()
     runtime.spawn(_collect(bot, key, cfg, by_id, head))
@@ -375,6 +402,15 @@ async def _run_opt(bot: Bot, cfg: dict, by_id: int) -> str:
 async def _collect(bot: Bot, key: tuple[int, int], cfg: dict, by_id: int,
                    head: str) -> None:
     """Обратный отсчёт, затем розыгрыш среди нажавших."""
+    try:
+        await _collect_and_spin(bot, key, cfg, by_id, head)
+    finally:
+        _rolling.discard(key[0])
+        _joined.pop(key, None)
+
+
+async def _collect_and_spin(bot: Bot, key: tuple[int, int], cfg: dict, by_id: int,
+                            head: str) -> None:
     chat_id, msg_id = key
     b = InlineKeyboardBuilder()
     b.button(text="🎰 Участвовать", callback_data="f:join")
@@ -436,6 +472,9 @@ async def cb_go(cb: CallbackQuery, bot: Bot) -> None:
     cfg = await _cfg(cb.from_user.id)
     if not cfg["chat_id"]:
         await cb.answer("Сначала выберите чат.", show_alert=True)
+        return
+    if rolling(cfg["chat_id"]):
+        await cb.answer(BUSY_NOTE, show_alert=True)
         return
     await cb.answer("Поехали!")
     try:

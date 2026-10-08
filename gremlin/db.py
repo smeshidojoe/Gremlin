@@ -56,6 +56,17 @@ CREATE TABLE IF NOT EXISTS forgiven(
     UNIQUE(chat_id, user_id, scope)
 );
 CREATE INDEX IF NOT EXISTS idx_forgiven_chat ON forgiven(chat_id);
+-- Кому отказали в заявке кнопкой «Отказать». Пишем всегда, а применяем —
+-- только при включённом sub_refused_skip: включили позже, и прошлые отказы
+-- сразу в деле.
+CREATE TABLE IF NOT EXISTS sub_refused(
+    chat_id  INTEGER NOT NULL,
+    user_id  INTEGER NOT NULL,
+    name     TEXT,
+    by_id    INTEGER,
+    created  INTEGER NOT NULL,
+    PRIMARY KEY(chat_id, user_id)
+);
 -- Разбор решений единой оценки. Нужен не для показа, а для калибровки:
 -- через месяц по этим строкам вместе с кнопками на карточках («снять» или
 -- «подтвердить») можно подобрать веса по настоящим исходам, а не на глаз.
@@ -220,6 +231,7 @@ CREATE TABLE IF NOT EXISTS settings(
     sub_action      TEXT    NOT NULL DEFAULT 'decline',
     sub_pass        TEXT    NOT NULL DEFAULT 'approve',
     sub_dm          INTEGER NOT NULL DEFAULT 1,
+    sub_refused_skip INTEGER NOT NULL DEFAULT 0,
     cas_on          INTEGER NOT NULL DEFAULT 0,
     cas_join        INTEGER NOT NULL DEFAULT 1,
     cas_suspect     INTEGER NOT NULL DEFAULT 1,
@@ -577,6 +589,7 @@ class Settings:
     sub_action: str = "decline"
     sub_pass: str = "approve"
     sub_dm: int = 1
+    sub_refused_skip: int = 0
     cas_on: int = 0
     cas_join: int = 1
     cas_suspect: int = 1
@@ -678,6 +691,7 @@ _SETTINGS_MIGRATIONS = {
     "sub_action": "TEXT NOT NULL DEFAULT 'decline'",
     "sub_pass": "TEXT NOT NULL DEFAULT 'approve'",
     "sub_dm": "INTEGER NOT NULL DEFAULT 1",
+    "sub_refused_skip": "INTEGER NOT NULL DEFAULT 0",
     "cas_on": "INTEGER NOT NULL DEFAULT 0",
     "cas_join": "INTEGER NOT NULL DEFAULT 1",
     "cas_suspect": "INTEGER NOT NULL DEFAULT 1",
@@ -933,6 +947,9 @@ async def _migrate() -> None:
         """DELETE FROM samples WHERE origin = 'profile' AND label = 'spam'
              AND labeled_by IS NOT NULL AND case_id IS NULL AND chat_id != ?""",
         (SEED_CHAT,))
+    # ручной вечный мут в Telegram записывался сроком 0 (1970 год), а не
+    # «навсегда»: список считал его истёкшим и прятал
+    await _db.execute("UPDATE punishments SET until_ts = NULL WHERE until_ts = 0")
     await _db.commit()
 
 
@@ -1255,6 +1272,24 @@ async def chats_for(user_id: int) -> list[aiosqlite.Row]:
     mine = set(await admin_of_chats(user_id))
     return [c for c in chats
             if c["owner_id"] == user_id or c["chat_id"] in mine]
+
+
+async def owner_scope(chat_id: int) -> list[aiosqlite.Row]:
+    """Чаты владельца этого чата — для профиля прямо в карточке.
+
+    Карточку видят все в лог-чате, поэтому список не зависит от того, кто
+    нажал: только свои чаты владельца и те, куда его пустили админом. Без
+    поблажки владельцу бота — иначе в лог чужого чата уехали бы все чаты бота.
+    """
+    chats = await moderated_chats()
+    ch = await get_chat(chat_id)
+    owner = ch["owner_id"] if ch is not None else None
+    mine = set(await admin_of_chats(owner)) if owner else set()
+    out = [c for c in chats if c["chat_id"] == chat_id
+           or (owner and (c["owner_id"] == owner or c["chat_id"] in mine))]
+    if ch is not None and not any(c["chat_id"] == chat_id for c in out):
+        out.insert(0, ch)
+    return out
 
 
 # ---------- админы чата в боте ----------
@@ -1625,6 +1660,43 @@ async def forgiven_remove(row_id: int) -> None:
     await _db.commit()
 
 
+# ---------- отказанные в заявке ----------
+
+async def refused_add(chat_id: int, user_id: int, name: str | None,
+                      by_id: int | None) -> None:
+    """Запомнить отказ кнопкой. Повторный отказ освежает дату и кто."""
+    await _db.execute(
+        """INSERT INTO sub_refused (chat_id, user_id, name, by_id, created)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(chat_id, user_id) DO UPDATE SET
+             name = COALESCE(excluded.name, name), by_id = excluded.by_id,
+             created = excluded.created""",
+        (chat_id, user_id, name, by_id, _now()))
+    await _db.commit()
+
+
+async def refused_has(chat_id: int, user_id: int) -> bool:
+    cur = await _db.execute(
+        "SELECT 1 FROM sub_refused WHERE chat_id = ? AND user_id = ?",
+        (chat_id, user_id))
+    return await cur.fetchone() is not None
+
+
+async def refused_list(chat_id: int) -> list[aiosqlite.Row]:
+    cur = await _db.execute(
+        "SELECT * FROM sub_refused WHERE chat_id = ? ORDER BY created DESC",
+        (chat_id,))
+    return await cur.fetchall()
+
+
+async def refused_remove(chat_id: int, user_id: int) -> bool:
+    cur = await _db.execute(
+        "DELETE FROM sub_refused WHERE chat_id = ? AND user_id = ?",
+        (chat_id, user_id))
+    await _db.commit()
+    return cur.rowcount > 0
+
+
 async def wl_scopes_for(chat_id: int, user_id: int, username: str | None) -> set[str]:
     """Все scope, под которые попадает юзер (или канал) в этом чате."""
     uname = (username or "").lower()
@@ -1887,6 +1959,7 @@ NSFW_RAISE_KEY = "mig_nsfw_97"
 # чаты, заведённые после первой правки, снова получали старые значения из
 # схемы таблицы — чиним их ещё раз, теперь уже вместе с причиной
 STALE_DEFAULTS_KEY = "mig_stale_defaults"
+TEST_JOIN_CARD_KEY = "once_test_join_card"
 
 
 async def raise_photo_min(floor: int = 97) -> int:
@@ -3049,6 +3122,41 @@ async def msg_total(chat_id: int, user_id: int) -> int:
         "SELECT SUM(cnt) FROM msg_stats WHERE chat_id = ? AND user_id = ?",
         (chat_id, user_id))
     return (await cur.fetchone())[0] or 0
+
+
+async def past_visit(chat_id: int, user_id: int) -> dict:
+    """Что бот помнит о прошлом человека в чате: сообщения, кики, баны.
+
+    Кик лежит в трёх местах. Кик бота — запись в наказаниях. Кик руками в
+    Telegram и кик за капчу — только строки лога. Строка «kick: …» с
+    причиной от команды кика дублирует запись в наказаниях, её не считаем.
+    Бан, подменённый мутом не-участнику, — не бан. Наказание, выданное
+    не-участнику (по сетке), не говорит, что человек был в чате.
+    """
+    msgs = await msg_total(chat_id, user_id)
+    cur = await _db.execute(
+        "SELECT kind, reason, created, was_member FROM punishments"
+        " WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+    rows = await cur.fetchall()
+    kicks = [r["created"] for r in rows if r["kind"] == "kick"]
+    bans = sum(1 for r in rows if r["kind"] == "ban"
+               and "мут не-участнику невозможен" not in (r["reason"] or ""))
+    was = bool(msgs) or any(r["was_member"] for r in rows)
+    cur = await _db.execute(
+        """SELECT ts, kind, text FROM events WHERE chat_id = ?
+           AND kind IN ('admin_action', 'captcha', 'join') AND text LIKE ?""",
+        (chat_id, f"%{user_id}%"))
+    exact = re.compile(rf"(?<!\d){user_id}(?!\d)")
+    for r in await cur.fetchall():
+        text = r["text"] or ""
+        if not exact.search(text):
+            continue
+        if r["kind"] == "join":
+            was = True
+        elif text.startswith("kick:") or text.startswith("не прошёл капчу, кик"):
+            kicks.append(r["ts"])
+    return {"was": was or bool(kicks), "msgs": msgs, "kicks": len(kicks),
+            "last_kick": max(kicks, default=None), "bans": bans}
 
 
 # ---------- лорбук ----------

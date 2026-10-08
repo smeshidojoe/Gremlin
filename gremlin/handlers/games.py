@@ -96,6 +96,26 @@ _battles: dict[tuple[int, int], set] = {}
 
 CLICK_ONLY_PLAYERS = "Это не твоя партия."
 
+# Чаты, где идёт битва или суд: вторую такую игру поверх первой не начинаем.
+# Две битвы — два наказания за раз, два суда над одним — двойной приговор.
+# Флаг живёт от команды до итога, в памяти: перезапуск и так обрывает игры
+_battle_on: set[int] = set()
+_court_on: set[int] = set()
+
+
+def _claim(busy: set, chat_id: int) -> bool:
+    """Занять чат под игру. False — там уже идёт такая же."""
+    if chat_id in busy:
+        return False
+    busy.add(chat_id)
+    return True
+
+
+async def _drop_repeat(message: Message) -> None:
+    """Повторный вызов, пока игра идёт, — просто убираем, без ответа."""
+    from ..services import deleting
+    await deleting.one(message.delete, message.chat.id)
+
 
 # ---------- общее ----------
 
@@ -500,19 +520,30 @@ def _death(used: set[str]) -> str:
 async def cmd_battle(message: Message, bot: Bot) -> None:
     if not await _allowed(bot, message, config.GAME_BATTLE):
         return
+    if not _claim(_battle_on, message.chat.id):
+        await _drop_repeat(message)
+        return
+    try:
+        sent = await _battle_open(message)
+    except BaseException:
+        _battle_on.discard(message.chat.id)
+        raise
+    key = (message.chat.id, sent.message_id)
+    _battles[key] = set()
+    runtime.spawn(_battle_run(bot, key))
+
+
+async def _battle_open(message: Message):
     s = await db.get_settings(message.chat.id)
     kind, minutes = await prize(s, config.GAME_BATTLE)
     b = InlineKeyboardBuilder()
     b.button(text="🏝 Вписаться", callback_data="g:battle")
-    sent = await message.answer(
+    return await message.answer(
         f"🏝 <b>Королевская битва!</b>\n\nВыживет один. Первый выбывший получает "
         f"{prize_label(kind, minutes)}, последний — славу.\n\n"
         f"👥 Бойцов: 0\n⏳ До начала матча: {countdown.label(config.BATTLE_JOIN)}",
         reply_markup=b.as_markup(),
     )
-    key = (message.chat.id, sent.message_id)
-    _battles[key] = set()
-    runtime.spawn(_battle_run(bot, key))
 
 
 @router.callback_query(F.data == "g:battle")
@@ -547,6 +578,13 @@ async def _battle_draw(bot: Bot, chat_id: int, msg_id: int, log: list,
 
 
 async def _battle_run(bot: Bot, key: tuple[int, int]) -> None:
+    try:
+        await _battle_match(bot, key)
+    finally:
+        _battle_on.discard(key[0])        # чат свободен, даже если матч упал
+
+
+async def _battle_match(bot: Bot, key: tuple[int, int]) -> None:
     chat_id, msg_id = key
     s = await db.get_settings(chat_id)
     kind, minutes = await prize(s, config.GAME_BATTLE)
@@ -614,6 +652,9 @@ async def _battle_run(bot: Bot, key: tuple[int, int]) -> None:
 async def cmd_court(message: Message, bot: Bot) -> None:
     if not await _allowed(bot, message, config.GAME_COURT):
         return
+    if message.chat.id in _court_on:
+        await _drop_repeat(message)
+        return
     if _replied(message) is None:
         sent = await message.reply("⚖️ Судить надо ответом на сообщение обвиняемого.")
         _later(bot, message.chat.id, sent.message_id, 60)
@@ -632,8 +673,16 @@ async def cmd_court(message: Message, bot: Bot) -> None:
     head = (f"⚖️ <b>Народный суд</b>\n\n"
             f"Подсудимый: {utils.mention(accused.id, accused.full_name, accused.username)}\n"
             f"Обвинение: {utils.esc(charge)}\n\n")
-    sent = await message.answer(head + _court_tail(config.COURT_VOTE, {}),
-                                reply_markup=b.as_markup())
+    # проверка выше была до запросов к Telegram — за это время суд мог начаться
+    if not _claim(_court_on, message.chat.id):
+        await _drop_repeat(message)
+        return
+    try:
+        sent = await message.answer(head + _court_tail(config.COURT_VOTE, {}),
+                                    reply_markup=b.as_markup())
+    except BaseException:
+        _court_on.discard(message.chat.id)
+        raise
     key = (message.chat.id, sent.message_id)
     _courts[key] = {"accused": accused.id, "charge": charge, "votes": {}}
     runtime.spawn(_court_run(bot, key, head, b.as_markup()))
@@ -683,6 +732,13 @@ async def _punish_by_court(bot: Bot, chat_id: int, court: dict) -> str | None:
 
 
 async def _court_run(bot: Bot, key: tuple[int, int], head: str, markup) -> None:
+    try:
+        await _court_session(bot, key, head, markup)
+    finally:
+        _court_on.discard(key[0])
+
+
+async def _court_session(bot: Bot, key: tuple[int, int], head: str, markup) -> None:
     chat_id, msg_id = key
 
     async def draw(left: int) -> None:

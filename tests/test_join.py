@@ -10,7 +10,7 @@ from gremlin import db
 from gremlin.handlers import events, group
 from gremlin.services import moderation
 
-from conftest import FakeBot, Msg, make_chat, make_user
+from conftest import OWNER, FakeBot, Msg, make_chat, make_user
 
 NEW = 8201
 
@@ -55,3 +55,24 @@ async def test_quiet_join_is_greeted_once(chat, greeting):
     service.delete = delete
     await group.on_join(service, bot)
     assert len(bot.sent) == 1
+
+
+async def test_manual_forever_mute_stays_in_list(chat, greeting, monkeypatch):
+    """Вечный мут руками в Telegram: aiogram отдаёт 1970 год, а не None."""
+    from datetime import datetime, timezone
+    from gremlin.services import net
+
+    async def nothing(*a, **kw):
+        return None
+    monkeypatch.setattr(net, "spread_and_note", nothing)
+    user = make_user(NEW)
+    upd = types.SimpleNamespace(
+        chat=make_chat(), from_user=make_user(OWNER), date=time.time(),
+        via_join_request=False,
+        old_chat_member=types.SimpleNamespace(status="member", user=user),
+        new_chat_member=types.SimpleNamespace(
+            status="restricted", user=user, is_member=True, can_send_messages=False,
+            until_date=datetime(1970, 1, 1, tzinfo=timezone.utc)))
+    await events.member_updated(upd, FakeBot())
+    [row] = await db.active_punishments(chat)
+    assert row["user_id"] == NEW and row["until_ts"] is None

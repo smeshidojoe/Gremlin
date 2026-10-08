@@ -335,7 +335,8 @@ async def member_updated(update: ChatMemberUpdated, bot: Bot) -> None:
     elif new_muted and not old_muted:
         kind = "mute"
         ud = getattr(new, "until_date", None)
-        until = int(ud.timestamp()) if ud else None
+        # «навсегда» aiogram отдаёт датой 1970 года, то есть нулём
+        until = int(ud.timestamp()) if ud and ud.timestamp() > 0 else None
     elif (old_banned or old_muted) and not (new_banned or new_muted):
         waiting = _deciding.get((chat.id, target.id))
         if waiting is not None:
@@ -576,6 +577,18 @@ async def _sub_join_request(update: ChatJoinRequest, bot: Bot) -> None:
         return
 
     from ..services import subscribe as sub
+    if s.sub_refused_skip and await db.refused_has(chat.id, user.id):
+        # Админ уже отказал ему кнопкой — карточку второй раз не шлём, а
+        # заявку отклоняем: иначе она висела бы в списке Telegram вечно
+        try:
+            await bot.decline_chat_join_request(chat.id, user.id)
+        except Exception as e:
+            logger.warning("заявку %s в %s не отклонить: %s", user.id, chat.id, e)
+            return
+        await db.add_event(chat.id, "sub",
+                           f"отклонён по списку отказанных: {user.full_name} ({user.id})")
+        return
+
     target = await sub.target_channel(bot, chat.id, s)
     if not target:
         logger.warning("подписка: в чате %s канал не задан и не привязан", chat.id)
@@ -786,10 +799,51 @@ async def _sub_ask_card(bot: Bot, chat, user, s) -> None:
     неудобно, а лишний запрос тут не в тягость — заявки редки.
     """
     from ..services import moderation
+    text = "\n".join(await ask_card_lines(bot, chat, user, s))
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="✅ Принять",
+                               callback_data=f"sub:ok:{chat.id}:{user.id}"),
+          InlineKeyboardButton(text="🚫 Отказать",
+                               callback_data=f"sub:no:{chat.id}:{user.id}"))
+    b.row(InlineKeyboardButton(text="⛔ Забанить",
+                               callback_data=f"sub:ban:{chat.id}:{user.id}"))
+    sent = await moderation.send_card(bot, chat.id, config.BIT_SUB, text,
+                                      markup=b.as_markup(), profile=user.id)
+    if sent:
+        # повторная заявка шлёт новую карточку — старые тоже закроем потом
+        key = _sub_key(chat.id, user.id)
+        cards = json.loads(await db.kv_get(key) or "[]")
+        cards += [[target, msg_id, text] for target, msg_id in sent]
+        await db.kv_set(key, json.dumps(cards[-10:], ensure_ascii=False))
+
+
+def _past_line(past: dict) -> str | None:
+    """Пометка «уже был»: вернулся тот, кого выгоняли, — админу это важно."""
+    if not past["was"]:
+        return None
+    bits = ["↩️ Уже был в чате"]
+    if past["msgs"]:
+        n = past["msgs"]
+        bits.append(f"{n} {utils.plural(n, 'сообщение', 'сообщения', 'сообщений')}")
+    if past["kicks"]:
+        n = past["kicks"]
+        bits.append(f"👢 кикали {n} {utils.plural(n, 'раз', 'раза', 'раз')}"
+                    f" (последний {utils.fmt_ts(past['last_kick'])})")
+    if past["bans"]:
+        n = past["bans"]
+        bits.append(f"⛔ банили {n} {utils.plural(n, 'раз', 'раза', 'раз')}")
+    return " · ".join(bits)
+
+
+async def ask_card_lines(bot: Bot, chat, user, s) -> list[str]:
+    """Текст карточки «решайте сами» — без кнопок, его же шлёт и разовый тест."""
     who = utils.mention(user.id, user.full_name, user.username)
     lines = [f"🙋 <b>Заявка на вступление</b> · {utils.esc(chat.title or chat.id)}",
-             f"👤 {who} (<code>{user.id}</code>)",
-             "📎 Подписан на канал — решение за вами"]
+             f"👤 {who} (<code>{user.id}</code>)"]
+    past = _past_line(await db.past_visit(chat.id, user.id))
+    if past:
+        lines.append(past)
+    lines.append("📎 Подписан на канал — решение за вами")
     if s.prof_on:
         try:
             from ..services import profile as prof_svc
@@ -800,22 +854,7 @@ async def _sub_ask_card(bot: Bot, chat, user, s) -> None:
                          exc_info=True)
         if about:
             lines.append(utils.esc(about))
-    b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text="✅ Принять",
-                               callback_data=f"sub:ok:{chat.id}:{user.id}"),
-          InlineKeyboardButton(text="🚫 Отказать",
-                               callback_data=f"sub:no:{chat.id}:{user.id}"))
-    b.row(InlineKeyboardButton(text="⛔ Забанить",
-                               callback_data=f"sub:ban:{chat.id}:{user.id}"))
-    text = "\n".join(lines)
-    sent = await moderation.send_card(bot, chat.id, config.BIT_SUB, text,
-                                      markup=b.as_markup())
-    if sent:
-        # повторная заявка шлёт новую карточку — старые тоже закроем потом
-        key = _sub_key(chat.id, user.id)
-        cards = json.loads(await db.kv_get(key) or "[]")
-        cards += [[target, msg_id, text] for target, msg_id in sent]
-        await db.kv_set(key, json.dumps(cards[-10:], ensure_ascii=False))
+    return lines
 
 
 @router.callback_query(F.data.startswith("sub:ok:"))
@@ -852,6 +891,12 @@ async def sub_drop(cb: CallbackQuery, bot: Bot) -> None:
             await cb.answer(f"Не вышло: {e}", show_alert=True)
         return
     await db.add_event(cid, "sub", f"заявка отклонена админом: {uid}")
+    # в список отказанных — всегда; применять его или нет, решает настройка
+    # имя — только настоящее: заглушка без имени подставляет ник или id
+    name = (await _user_stub(uid, bot, cid)).full_name
+    if name.startswith("@") or name == str(uid):
+        name = None
+    await db.refused_add(cid, uid, name, cb.from_user.id)
     await _sub_done(cb, "🚫 <b>Отказано</b>")
 
 

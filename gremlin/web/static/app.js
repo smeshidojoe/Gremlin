@@ -649,6 +649,14 @@ function widgetHtml(name, w, cid, d) {
           бессмысленно: человек не узнает, чего от него хотят.</div>`}
       </div>`;
 
+    case 'sub_refused':
+      return `<div class="card">${linkRow(`#/chat/${cid}/refused`,
+        '🚫 Отказанные кнопкой', w.count)}
+        <div class="intro" style="margin-top:8px">${w.on
+          ? 'Их заявки бот молча отклоняет, без карточки.'
+          : 'Список копится всегда, но сейчас не применяется — включите «Отказанных не показывать».'}</div>
+      </div>`;
+
     case 'nn_shadow':
       return `<div class="card">
         <div class="row"><div class="label">📄 Теневой журнал
@@ -1300,6 +1308,31 @@ async function answersView(cid, owner, oid) {
   };
 }
 
+/* отказанные в заявке: поиск фильтрует уже загруженный список, без запросов */
+async function refusedView(cid) {
+  const d = await api(`/chat/${cid}/refused`);
+  return {
+    title: 'Отказанные',
+    back: `#/chat/${cid}/s/sub`,
+    html: `<div class="card">
+      <div class="intro">Им вы отказали кнопкой «Отказать» в карточке заявки.
+        ${d.on ? 'Их новые заявки бот молча отклоняет.'
+               : 'Сейчас список не применяется: настройка «Отказанных не показывать» выключена.'}
+        Уберёте человека — его следующая заявка снова придёт карточкой.</div>
+      ${d.items.length ? `<input type="text" data-filter="refused" placeholder="Поиск: имя или id"
+        style="margin-top:10px">` : ''}
+      <div style="margin-top:8px">
+        ${d.items.map((r) => `<div class="item" data-find="${esc((r.who + ' ' + r.user_id).toLowerCase())}">
+            <div class="body"><a href="${esc(r.link)}">${esc(r.who)}</a>
+              <small><span class="mono">${esc(r.user_id)}</span> · ${esc(r.since)}</small></div>
+            <button class="btn small ghost" data-act="refused-del" data-uid="${esc(r.user_id)}">Убрать</button>
+          </div>`).join('') || '<div class="empty">Пока никому не отказывали.</div>'}
+        <div class="empty" data-none hidden>Никого не нашлось.</div>
+      </div>
+    </div>`,
+  };
+}
+
 async function warnedView(cid) {
   const d = await api(`/chat/${cid}/warned`);
   return {
@@ -1906,6 +1939,7 @@ const ROUTES = [
   [/^chat\/(-?\d+)\/cmd\/(\d+)$/, cmdView],
   [/^chat\/(-?\d+)\/answers\/(\w+)\/(-?\d+)$/, answersView],
   [/^chat\/(-?\d+)\/warned$/, warnedView],
+  [/^chat\/(-?\d+)\/refused$/, refusedView],
   [/^chat\/(-?\d+)\/active$/, activeView],
   [/^chat\/(-?\d+)\/status$/, statusView],
   [/^chat\/(-?\d+)\/games$/, gamesView],
@@ -1998,7 +2032,7 @@ function skeletonFor(path) {
     return skelCard(skelHead + skelLine(95) + skelLine(88) + skelLine(60) + skelRows(4))
       + skelCard(skelHead + skelRows(2));
   }
-  const lists = /^(chat\/-?\d+\/(active|events|trigs|cmds|words|profwords|warned|answers|linkwl|admins)|access|knocks|seed|admin\/log)/;
+  const lists = /^(chat\/-?\d+\/(active|events|trigs|cmds|words|profwords|warned|answers|linkwl|admins|refused)|access|knocks|seed|admin\/log)/;
   if (lists.test(path)) return skelCard(skelHead + skelItems(6));
   return skelCard(skelHead + skelRows(3));
 }
@@ -2405,6 +2439,12 @@ const ACT = {
     render();
   },
 
+  async 'refused-del'(el) {
+    await api(`/chat/${curChat()}/refused/${el.dataset.uid}`, { method: 'DELETE' });
+    toast('Убран — следующая заявка придёт карточкой');
+    render();
+  },
+
   async unforgive(el) {
     await api(`/chat/${curChat()}/forgiven/${el.dataset.id}`, { method: 'DELETE' });
     toast('Правило снова работает');
@@ -2761,6 +2801,22 @@ document.addEventListener('click', async (e) => {
     delete actEl.dataset.busy;
     actEl.disabled = false;
   }
+});
+
+// поиск по списку на странице: прячем строки, где искомого нет
+document.addEventListener('input', (e) => {
+  const el = e.target;
+  if (el.dataset.filter === undefined) return;
+  const q = el.value.trim().toLowerCase();
+  const box = el.closest('.card');
+  let shown = 0;
+  box.querySelectorAll('[data-find]').forEach((row) => {
+    const hit = !q || row.dataset.find.includes(q);
+    row.hidden = !hit;
+    if (hit) shown += 1;
+  });
+  const none = box.querySelector('[data-none]');
+  if (none) none.hidden = shown > 0;
 });
 
 document.addEventListener('change', async (e) => {
